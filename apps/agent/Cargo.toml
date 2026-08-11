@@ -1,0 +1,21 @@
+[package]
+name = "remotex-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+remotex-capture.workspace = true
+remotex-crypto.workspace = true
+remotex-file-transfer.workspace = true
+remotex-input.workspace = true
+remotex-protocol.workspace = true
+remotex-transport.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+

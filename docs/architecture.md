@@ -145,7 +145,30 @@ The Control Server derives `online` from `last_seen_ms`; no background flag can
 leave a stale device permanently online. Manual Relay Session configuration is
 retained only as a local development fallback.
 
-## Implemented data paths (M8)
+## M9 authorization boundary
+
+Managed Sessions begin in `pending` state. A signed Agent poll returns only a
+sanitized incoming request, never the Agent Relay credential. By default the
+Windows Agent displays a foreground native consent dialog naming the Controller
+and each requested capability. Rejecting makes the Session terminal; accepting
+atomically records the final permission subset before the wrapped Agent token is
+released.
+
+Unattended access is disabled by default. Enabling it requires both
+`REMOTEX_UNATTENDED_ACCESS=true` and a 12–128 byte local secret. The Controller
+must present the same secret; it is transported only over the Control API,
+encrypted at rest with the Control Server master key, delivered only to the
+signed Agent poll, and compared through fixed-length hashes. A missing or wrong
+secret falls back to the visible local prompt rather than granting access.
+
+The Agent enforces the final permissions at the subsystem boundary: screen
+capture, input execution, clipboard, upload, and download are independent. An
+active Session prints a prominent local banner and Ctrl+C disconnects it. The
+Control Server audit trail contains request, accept/reject, start/end, Controller
+name, permissions, connection type, result, timestamps, and aggregate bytes; it
+never contains tokens, private keys, clipboard text, paths, input, or file data.
+
+## Implemented data paths (M9)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope

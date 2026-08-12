@@ -30,6 +30,7 @@ type ConnectRequest = {
   controlServerUrl: string;
   deviceId: string;
   controllerName: string;
+  unattendedSecret: string;
   relayAddress: string;
   serverName: string;
   caCertificatePath: string;
@@ -157,6 +158,7 @@ const initialRequest: ConnectRequest = {
   controlServerUrl: "http://127.0.0.1:8080",
   deviceId: "",
   controllerName: "RemoteX Desktop",
+  unattendedSecret: "",
   relayAddress: "127.0.0.1:7443",
   serverName: "localhost",
   caCertificatePath: "",
@@ -529,6 +531,10 @@ function App() {
           <label>
             Controller name
             <input value={request.controllerName} onChange={(e) => update("controllerName", e.target.value)} required={Boolean(request.controlServerUrl.trim())} />
+          </label>
+          <label>
+            Unattended access secret (optional)
+            <input type="password" value={request.unattendedSecret} onChange={(e) => update("unattendedSecret", e.target.value)} minLength={12} maxLength={128} />
           </label>
           <label>
             CA certificate path

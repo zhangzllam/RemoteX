@@ -11,9 +11,12 @@ use axum::{
 use rand::Rng;
 use remotex_crypto::{ServerSecretBox, device_auth_message, secret_hash, verify_device_signature};
 use remotex_protocol::{
-    ClaimAgentSessionRequest, ClaimAgentSessionResponse, CreateSessionRequest, DeviceAuthProof,
-    DeviceHeartbeatRequest, DeviceId, DevicePlatform, DeviceRecord, DeviceRegistrationRequest,
-    DeviceRegistrationResponse, SessionCredentials, SessionId, SessionPermissions,
+    AuthorizationDecision, ClaimAgentSessionRequest, ClaimAgentSessionResponse, ConnectionType,
+    CreateSessionRequest, DeviceAuthProof, DeviceHeartbeatRequest, DeviceId, DevicePlatform,
+    DeviceRecord, DeviceRegistrationRequest, DeviceRegistrationResponse, IncomingSessionRequest,
+    ReportSessionEventRequest, ResolveSessionAuthorizationRequest,
+    ResolveSessionAuthorizationResponse, SessionAuditEventKind, SessionCredentials, SessionId,
+    SessionPermissions,
 };
 use serde::Serialize;
 use sqlx::{PgPool, Row};
@@ -50,6 +53,7 @@ pub struct NewSession {
     pub agent_token_hash: [u8; 32],
     pub agent_token_wrapped: Vec<u8>,
     pub e2e_key_wrapped: Vec<u8>,
+    pub unattended_secret_wrapped: Option<Vec<u8>>,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -57,10 +61,21 @@ pub struct NewSession {
 #[derive(Clone, Debug)]
 pub struct ClaimableSession {
     pub session_id: SessionId,
+    pub controller_name: String,
     pub permissions: SessionPermissions,
     pub agent_token_wrapped: Vec<u8>,
     pub e2e_key_wrapped: Vec<u8>,
+    pub unattended_secret_wrapped: Option<Vec<u8>>,
     pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditEvent {
+    pub session_id: SessionId,
+    pub device_id: DeviceId,
+    pub event_type: &'static str,
+    pub occurred_at_ms: u64,
+    pub metadata: serde_json::Value,
 }
 
 #[async_trait]
@@ -80,11 +95,26 @@ pub trait ControlRepository: Send + Sync {
     ) -> Result<(), ControlError>;
     async fn advance_nonce(&self, device_id: &DeviceId, nonce: u64) -> Result<bool, ControlError>;
     async fn create_session(&self, session: NewSession) -> Result<(), ControlError>;
-    async fn claim_agent_session(
+    async fn pending_session(
         &self,
         device_id: &DeviceId,
         now_ms: u64,
     ) -> Result<Option<ClaimableSession>, ControlError>;
+    async fn resolve_authorization(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        granted_permissions: Option<SessionPermissions>,
+        now_ms: u64,
+    ) -> Result<Option<ClaimableSession>, ControlError>;
+    async fn record_session_event(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        event: &ReportSessionEventRequest,
+        now_ms: u64,
+    ) -> Result<(), ControlError>;
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), ControlError>;
 }
 
 #[derive(Clone)]
@@ -157,6 +187,13 @@ impl ControlService {
         now_ms: u64,
     ) -> Result<SessionCredentials, ControlError> {
         validate_name(&request.controller_name)?;
+        if request
+            .unattended_secret
+            .as_ref()
+            .is_some_and(|secret| !(12..=128).contains(&secret.len()))
+        {
+            return Err(ControlError::InvalidSecret);
+        }
         let device = self
             .repository
             .get_device(&request.device_id)
@@ -165,8 +202,9 @@ impl ControlService {
         if now_ms.saturating_sub(device.record.last_seen_ms) > self.config.device_offline_after_ms {
             return Err(ControlError::DeviceOffline);
         }
-        let permissions =
-            intersect_permissions(request.requested_permissions, device.record.capabilities);
+        let permissions = request
+            .requested_permissions
+            .intersect(device.record.capabilities);
         let controller_token: [u8; 32] = rand::random();
         let agent_token: [u8; 32] = rand::random();
         let end_to_end_key: [u8; 32] = rand::random();
@@ -174,18 +212,34 @@ impl ControlService {
         let expires_at_ms = now_ms
             .checked_add(self.config.session_lifetime_ms)
             .ok_or(ControlError::ClockOverflow)?;
+        let new_session = NewSession {
+            session_id,
+            device_id: request.device_id.clone(),
+            controller_name: request.controller_name.clone(),
+            permissions,
+            controller_token_hash: secret_hash(&controller_token),
+            agent_token_hash: secret_hash(&agent_token),
+            agent_token_wrapped: self.secrets.seal(&agent_token)?,
+            e2e_key_wrapped: self.secrets.seal(&end_to_end_key)?,
+            unattended_secret_wrapped: request
+                .unattended_secret
+                .as_ref()
+                .map(|secret| self.secrets.seal(secret.as_bytes()))
+                .transpose()?,
+            created_at_ms: now_ms,
+            expires_at_ms,
+        };
+        self.repository.create_session(new_session).await?;
         self.repository
-            .create_session(NewSession {
+            .record_audit(AuditEvent {
                 session_id,
                 device_id: request.device_id,
-                controller_name: request.controller_name,
-                permissions,
-                controller_token_hash: secret_hash(&controller_token),
-                agent_token_hash: secret_hash(&agent_token),
-                agent_token_wrapped: self.secrets.seal(&agent_token)?,
-                e2e_key_wrapped: self.secrets.seal(&end_to_end_key)?,
-                created_at_ms: now_ms,
-                expires_at_ms,
+                event_type: "session_requested",
+                occurred_at_ms: now_ms,
+                metadata: serde_json::json!({
+                    "controller_name": request.controller_name,
+                    "permissions": permissions,
+                }),
             })
             .await?;
         Ok(self.credentials(
@@ -205,24 +259,120 @@ impl ControlService {
     ) -> Result<ClaimAgentSessionResponse, ControlError> {
         self.authenticate_device(device_id, "claim_session", &request.proof, now_ms)
             .await?;
-        let Some(session) = self
-            .repository
-            .claim_agent_session(device_id, now_ms)
-            .await?
-        else {
-            return Ok(ClaimAgentSessionResponse { credentials: None });
+        let Some(session) = self.repository.pending_session(device_id, now_ms).await? else {
+            return Ok(ClaimAgentSessionResponse {
+                authorization_request: None,
+            });
         };
-        let agent_token = fixed_secret(self.secrets.open(&session.agent_token_wrapped)?)?;
-        let e2e_key = fixed_secret(self.secrets.open(&session.e2e_key_wrapped)?)?;
         Ok(ClaimAgentSessionResponse {
-            credentials: Some(self.credentials(
-                session.session_id,
+            authorization_request: Some(IncomingSessionRequest {
+                session_id: session.session_id,
+                controller_name: session.controller_name,
+                requested_permissions: session.permissions,
+                expires_at_ms: session.expires_at_ms,
+                unattended_secret: session
+                    .unattended_secret_wrapped
+                    .map(|wrapped| self.secrets.open(&wrapped))
+                    .transpose()?
+                    .map(|secret| String::from_utf8(secret).map_err(|_| ControlError::Crypto))
+                    .transpose()?,
+            }),
+        })
+    }
+
+    pub async fn resolve_session_authorization(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        request: ResolveSessionAuthorizationRequest,
+        now_ms: u64,
+    ) -> Result<ResolveSessionAuthorizationResponse, ControlError> {
+        let action = format!("authorize_session:{session_id}");
+        self.authenticate_device(device_id, &action, &request.proof, now_ms)
+            .await?;
+        let pending = self
+            .repository
+            .pending_session(device_id, now_ms)
+            .await?
+            .filter(|session| session.session_id == session_id)
+            .ok_or(ControlError::Conflict)?;
+        let granted_permissions = match request.decision {
+            AuthorizationDecision::Accept => {
+                Some(request.granted_permissions.intersect(pending.permissions))
+            }
+            AuthorizationDecision::Reject => None,
+        };
+        let resolved = self
+            .repository
+            .resolve_authorization(device_id, session_id, granted_permissions, now_ms)
+            .await?
+            .ok_or(ControlError::Conflict)?;
+        let accepted = granted_permissions.is_some();
+        self.repository
+            .record_audit(AuditEvent {
+                session_id,
+                device_id: device_id.clone(),
+                event_type: if accepted {
+                    "session_accepted"
+                } else {
+                    "session_rejected"
+                },
+                occurred_at_ms: now_ms,
+                metadata: serde_json::json!({ "permissions": granted_permissions }),
+            })
+            .await?;
+        let credentials = if let Some(permissions) = granted_permissions {
+            let agent_token = fixed_secret(self.secrets.open(&resolved.agent_token_wrapped)?)?;
+            let e2e_key = fixed_secret(self.secrets.open(&resolved.e2e_key_wrapped)?)?;
+            Some(self.credentials(
+                session_id,
                 agent_token,
                 e2e_key,
-                session.expires_at_ms,
-                session.permissions,
-            )),
-        })
+                resolved.expires_at_ms,
+                permissions,
+            ))
+        } else {
+            None
+        };
+        Ok(ResolveSessionAuthorizationResponse { credentials })
+    }
+
+    pub async fn report_session_event(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        request: ReportSessionEventRequest,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        if request.result.len() > 64 || request.result.chars().any(char::is_control) {
+            return Err(ControlError::InvalidResult);
+        }
+        let action = format!(
+            "session_event:{session_id}:{}",
+            audit_kind_text(request.kind)
+        );
+        self.authenticate_device(device_id, &action, &request.proof, now_ms)
+            .await?;
+        self.repository
+            .record_session_event(device_id, session_id, &request, now_ms)
+            .await?;
+        let event_type = match request.kind {
+            SessionAuditEventKind::Started => "session_started",
+            SessionAuditEventKind::Ended => "session_ended",
+        };
+        self.repository
+            .record_audit(AuditEvent {
+                session_id,
+                device_id: device_id.clone(),
+                event_type,
+                occurred_at_ms: now_ms,
+                metadata: serde_json::json!({
+                    "connection_type": request.connection_type,
+                    "bytes_transferred": request.bytes_transferred,
+                    "result": request.result,
+                }),
+            })
+            .await
     }
 
     async fn authenticate_device(
@@ -292,6 +442,14 @@ pub fn router(state: ApiState) -> Router {
             "/api/devices/{device_id}/sessions/claim",
             post(claim_agent_session),
         )
+        .route(
+            "/api/devices/{device_id}/sessions/{session_id}/authorize",
+            post(resolve_session_authorization),
+        )
+        .route(
+            "/api/devices/{device_id}/sessions/{session_id}/events",
+            post(report_session_event),
+        )
         .route("/api/sessions", post(create_session))
         .with_state(state)
 }
@@ -355,6 +513,39 @@ async fn claim_agent_session(
     ))
 }
 
+async fn resolve_session_authorization(
+    State(state): State<ApiState>,
+    Path((device_id, session_id)): Path<(String, String)>,
+    Json(request): Json<ResolveSessionAuthorizationRequest>,
+) -> Result<Json<ResolveSessionAuthorizationResponse>, ControlError> {
+    let device_id = DeviceId::new(device_id).map_err(|_| ControlError::InvalidDeviceId)?;
+    let session_id = session_id
+        .parse()
+        .map_err(|_| ControlError::InvalidSessionId)?;
+    Ok(Json(
+        state
+            .service
+            .resolve_session_authorization(&device_id, session_id, request, now_ms()?)
+            .await?,
+    ))
+}
+
+async fn report_session_event(
+    State(state): State<ApiState>,
+    Path((device_id, session_id)): Path<(String, String)>,
+    Json(request): Json<ReportSessionEventRequest>,
+) -> Result<StatusCode, ControlError> {
+    let device_id = DeviceId::new(device_id).map_err(|_| ControlError::InvalidDeviceId)?;
+    let session_id = session_id
+        .parse()
+        .map_err(|_| ControlError::InvalidSessionId)?;
+    state
+        .service
+        .report_session_event(&device_id, session_id, request, now_ms()?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -369,9 +560,12 @@ struct ErrorResponse {
 impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let (status, code) = match self {
-            Self::InvalidDeviceId | Self::InvalidRegistration | Self::InvalidName => {
-                (StatusCode::BAD_REQUEST, "invalid_request")
-            }
+            Self::InvalidDeviceId
+            | Self::InvalidSessionId
+            | Self::InvalidRegistration
+            | Self::InvalidName
+            | Self::InvalidResult
+            | Self::InvalidSecret => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::DeviceNotFound => (StatusCode::NOT_FOUND, "device_not_found"),
             Self::DeviceOffline => (StatusCode::CONFLICT, "device_offline"),
             Self::StaleProof | Self::ReplayedProof | Self::Authentication => {
@@ -395,10 +589,16 @@ impl IntoResponse for ControlError {
 pub enum ControlError {
     #[error("device ID is invalid")]
     InvalidDeviceId,
+    #[error("session ID is invalid")]
+    InvalidSessionId,
     #[error("device registration is invalid")]
     InvalidRegistration,
     #[error("name is invalid")]
     InvalidName,
+    #[error("session result is invalid")]
+    InvalidResult,
+    #[error("unattended-access secret is invalid")]
+    InvalidSecret,
     #[error("device was not found")]
     DeviceNotFound,
     #[error("device is offline")]
@@ -423,8 +623,11 @@ impl ControlError {
     const fn public_message(&self) -> &'static str {
         match self {
             Self::InvalidDeviceId => "device ID is invalid",
+            Self::InvalidSessionId => "session ID is invalid",
             Self::InvalidRegistration => "device registration is invalid",
             Self::InvalidName => "name is invalid",
+            Self::InvalidResult => "session result is invalid",
+            Self::InvalidSecret => "unattended-access secret is invalid",
             Self::DeviceNotFound => "device was not found",
             Self::DeviceOffline => "device is offline",
             Self::StaleProof | Self::ReplayedProof | Self::Authentication => {
@@ -531,7 +734,7 @@ impl ControlRepository for PostgresRepository {
     }
 
     async fn create_session(&self, session: NewSession) -> Result<(), ControlError> {
-        sqlx::query("INSERT INTO sessions (session_id, device_id, controller_name, permissions_json, controller_token_hash, agent_token_hash, agent_token_wrapped, e2e_key_wrapped, created_at_ms, expires_at_ms) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+        sqlx::query("INSERT INTO sessions (session_id, device_id, controller_name, permissions_json, controller_token_hash, agent_token_hash, agent_token_wrapped, e2e_key_wrapped, created_at_ms, expires_at_ms, unattended_secret_wrapped) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
             .bind(session.session_id.to_string())
             .bind(session.device_id.as_str())
             .bind(session.controller_name)
@@ -542,15 +745,32 @@ impl ControlRepository for PostgresRepository {
             .bind(session.e2e_key_wrapped)
             .bind(i64_value(session.created_at_ms)?)
             .bind(i64_value(session.expires_at_ms)?)
+            .bind(session.unattended_secret_wrapped)
             .execute(&self.pool)
             .await
             .map_err(|_| ControlError::Persistence)?;
         Ok(())
     }
 
-    async fn claim_agent_session(
+    async fn pending_session(
         &self,
         device_id: &DeviceId,
+        now_ms: u64,
+    ) -> Result<Option<ClaimableSession>, ControlError> {
+        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped FROM sessions WHERE device_id=$1 AND authorization_status='pending' AND expires_at_ms >= $2 ORDER BY created_at_ms LIMIT 1")
+            .bind(device_id.as_str())
+            .bind(i64_value(now_ms)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        row.as_ref().map(claimable_session_from_row).transpose()
+    }
+
+    async fn resolve_authorization(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        granted_permissions: Option<SessionPermissions>,
         now_ms: u64,
     ) -> Result<Option<ClaimableSession>, ControlError> {
         let mut transaction = self
@@ -558,7 +778,8 @@ impl ControlRepository for PostgresRepository {
             .begin()
             .await
             .map_err(|_| ControlError::Persistence)?;
-        let row = sqlx::query("SELECT session_id::text, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms FROM sessions WHERE device_id=$1 AND agent_claimed=FALSE AND expires_at_ms >= $2 ORDER BY created_at_ms LIMIT 1 FOR UPDATE SKIP LOCKED")
+        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped FROM sessions WHERE session_id=$1::uuid AND device_id=$2 AND authorization_status='pending' AND expires_at_ms >= $3 FOR UPDATE")
+            .bind(session_id.to_string())
             .bind(device_id.as_str())
             .bind(i64_value(now_ms)?)
             .fetch_optional(&mut *transaction)
@@ -571,9 +792,20 @@ impl ControlRepository for PostgresRepository {
                 .map_err(|_| ControlError::Persistence)?;
             return Ok(None);
         };
-        let session_id_text: String = row.try_get(0).map_err(|_| ControlError::Persistence)?;
-        sqlx::query("UPDATE sessions SET agent_claimed=TRUE WHERE session_id=$1::uuid")
-            .bind(&session_id_text)
+        let (status, serialized, claimed) = match granted_permissions {
+            Some(permissions) => (
+                "accepted",
+                Some(serde_json::to_string(&permissions).map_err(|_| ControlError::Persistence)?),
+                true,
+            ),
+            None => ("rejected", None, false),
+        };
+        sqlx::query("UPDATE sessions SET authorization_status=$2, authorized_permissions_json=$3, authorized_at_ms=$4, agent_claimed=$5 WHERE session_id=$1::uuid")
+            .bind(session_id.to_string())
+            .bind(status)
+            .bind(serialized)
+            .bind(i64_value(now_ms)?)
+            .bind(claimed)
             .execute(&mut *transaction)
             .await
             .map_err(|_| ControlError::Persistence)?;
@@ -581,20 +813,77 @@ impl ControlRepository for PostgresRepository {
             .commit()
             .await
             .map_err(|_| ControlError::Persistence)?;
-        Ok(Some(ClaimableSession {
-            session_id: session_id_text
-                .parse()
-                .map_err(|_| ControlError::Persistence)?,
-            permissions: serde_json::from_str(
-                row.try_get::<&str, _>(1)
-                    .map_err(|_| ControlError::Persistence)?,
-            )
-            .map_err(|_| ControlError::Persistence)?,
-            agent_token_wrapped: row.try_get(2).map_err(|_| ControlError::Persistence)?,
-            e2e_key_wrapped: row.try_get(3).map_err(|_| ControlError::Persistence)?,
-            expires_at_ms: u64_value(row.try_get(4).map_err(|_| ControlError::Persistence)?)?,
-        }))
+        Ok(Some(claimable_session_from_row(&row)?))
     }
+
+    async fn record_session_event(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        event: &ReportSessionEventRequest,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let connection_type = connection_type_text(event.connection_type);
+        let result = match event.kind {
+            SessionAuditEventKind::Started => sqlx::query("UPDATE sessions SET started_at_ms=$3, connection_type=$4, result=$5 WHERE session_id=$1::uuid AND device_id=$2 AND authorization_status='accepted'")
+                .bind(session_id.to_string())
+                .bind(device_id.as_str())
+                .bind(i64_value(now_ms)?)
+                .bind(connection_type)
+                .bind(&event.result)
+                .execute(&self.pool)
+                .await,
+            SessionAuditEventKind::Ended => sqlx::query("UPDATE sessions SET ended_at_ms=$3, connection_type=$4, bytes_transferred=$5, result=$6, authorization_status='ended' WHERE session_id=$1::uuid AND device_id=$2 AND authorization_status='accepted'")
+                .bind(session_id.to_string())
+                .bind(device_id.as_str())
+                .bind(i64_value(now_ms)?)
+                .bind(connection_type)
+                .bind(i64_value(event.bytes_transferred)?)
+                .bind(&event.result)
+                .execute(&self.pool)
+                .await,
+        }
+        .map_err(|_| ControlError::Persistence)?;
+        if result.rows_affected() != 1 {
+            return Err(ControlError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), ControlError> {
+        sqlx::query("INSERT INTO audit_events (session_id, device_id, event_type, occurred_at_ms, metadata_json) VALUES ($1::uuid,$2,$3,$4,$5)")
+            .bind(event.session_id.to_string())
+            .bind(event.device_id.as_str())
+            .bind(event.event_type)
+            .bind(i64_value(event.occurred_at_ms)?)
+            .bind(event.metadata.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        Ok(())
+    }
+}
+
+fn claimable_session_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ClaimableSession, ControlError> {
+    Ok(ClaimableSession {
+        session_id: row
+            .try_get::<String, _>(0)
+            .map_err(|_| ControlError::Persistence)?
+            .parse()
+            .map_err(|_| ControlError::Persistence)?,
+        controller_name: row.try_get(1).map_err(|_| ControlError::Persistence)?,
+        permissions: serde_json::from_str(
+            row.try_get::<&str, _>(2)
+                .map_err(|_| ControlError::Persistence)?,
+        )
+        .map_err(|_| ControlError::Persistence)?,
+        agent_token_wrapped: row.try_get(3).map_err(|_| ControlError::Persistence)?,
+        e2e_key_wrapped: row.try_get(4).map_err(|_| ControlError::Persistence)?,
+        expires_at_ms: u64_value(row.try_get(5).map_err(|_| ControlError::Persistence)?)?,
+        unattended_secret_wrapped: row.try_get(6).map_err(|_| ControlError::Persistence)?,
+    })
 }
 
 fn stored_device_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredDevice, ControlError> {
@@ -641,11 +930,31 @@ fn stored_device_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredDevice, C
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryAuthorization {
+    Pending,
+    Accepted,
+    Rejected,
+    Ended,
+}
+
+struct MemorySession {
+    session: NewSession,
+    authorization: MemoryAuthorization,
+}
+
 #[derive(Default)]
 pub struct MemoryRepository {
     devices: Mutex<HashMap<DeviceId, StoredDevice>>,
     public_keys: Mutex<HashMap<[u8; 32], DeviceId>>,
-    sessions: Mutex<Vec<(NewSession, bool)>>,
+    sessions: Mutex<Vec<MemorySession>>,
+    audit_events: Mutex<Vec<AuditEvent>>,
+}
+
+impl MemoryRepository {
+    pub async fn audit_event_count(&self) -> usize {
+        self.audit_events.lock().await.len()
+    }
 }
 
 #[async_trait]
@@ -736,29 +1045,99 @@ impl ControlRepository for MemoryRepository {
     }
 
     async fn create_session(&self, session: NewSession) -> Result<(), ControlError> {
-        self.sessions.lock().await.push((session, false));
+        self.sessions.lock().await.push(MemorySession {
+            session,
+            authorization: MemoryAuthorization::Pending,
+        });
         Ok(())
     }
 
-    async fn claim_agent_session(
+    async fn pending_session(
         &self,
         device_id: &DeviceId,
         now_ms: u64,
     ) -> Result<Option<ClaimableSession>, ControlError> {
-        let mut sessions = self.sessions.lock().await;
-        let Some((session, claimed)) = sessions.iter_mut().find(|(session, claimed)| {
-            &session.device_id == device_id && !*claimed && session.expires_at_ms >= now_ms
+        let sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.iter().find(|entry| {
+            &entry.session.device_id == device_id
+                && entry.authorization == MemoryAuthorization::Pending
+                && entry.session.expires_at_ms >= now_ms
         }) else {
             return Ok(None);
         };
-        *claimed = true;
         Ok(Some(ClaimableSession {
-            session_id: session.session_id,
-            permissions: session.permissions,
-            agent_token_wrapped: session.agent_token_wrapped.clone(),
-            e2e_key_wrapped: session.e2e_key_wrapped.clone(),
-            expires_at_ms: session.expires_at_ms,
+            session_id: entry.session.session_id,
+            controller_name: entry.session.controller_name.clone(),
+            permissions: entry.session.permissions,
+            agent_token_wrapped: entry.session.agent_token_wrapped.clone(),
+            e2e_key_wrapped: entry.session.e2e_key_wrapped.clone(),
+            expires_at_ms: entry.session.expires_at_ms,
+            unattended_secret_wrapped: entry.session.unattended_secret_wrapped.clone(),
         }))
+    }
+
+    async fn resolve_authorization(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        granted_permissions: Option<SessionPermissions>,
+        now_ms: u64,
+    ) -> Result<Option<ClaimableSession>, ControlError> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.iter_mut().find(|entry| {
+            entry.session.device_id == *device_id
+                && entry.session.session_id == session_id
+                && entry.authorization == MemoryAuthorization::Pending
+                && entry.session.expires_at_ms >= now_ms
+        }) else {
+            return Ok(None);
+        };
+        entry.authorization = if granted_permissions.is_some() {
+            MemoryAuthorization::Accepted
+        } else {
+            MemoryAuthorization::Rejected
+        };
+        Ok(Some(ClaimableSession {
+            session_id,
+            controller_name: entry.session.controller_name.clone(),
+            permissions: granted_permissions.unwrap_or_default(),
+            agent_token_wrapped: entry.session.agent_token_wrapped.clone(),
+            e2e_key_wrapped: entry.session.e2e_key_wrapped.clone(),
+            expires_at_ms: entry.session.expires_at_ms,
+            unattended_secret_wrapped: entry.session.unattended_secret_wrapped.clone(),
+        }))
+    }
+
+    async fn record_session_event(
+        &self,
+        device_id: &DeviceId,
+        session_id: SessionId,
+        event: &ReportSessionEventRequest,
+        _now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let mut sessions = self.sessions.lock().await;
+        let entry = sessions
+            .iter_mut()
+            .find(|entry| {
+                entry.session.device_id == *device_id && entry.session.session_id == session_id
+            })
+            .ok_or(ControlError::Conflict)?;
+        match event.kind {
+            SessionAuditEventKind::Started
+                if entry.authorization == MemoryAuthorization::Accepted => {}
+            SessionAuditEventKind::Ended
+                if entry.authorization == MemoryAuthorization::Accepted =>
+            {
+                entry.authorization = MemoryAuthorization::Ended;
+            }
+            _ => return Err(ControlError::Conflict),
+        }
+        Ok(())
+    }
+
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), ControlError> {
+        self.audit_events.lock().await.push(event);
+        Ok(())
     }
 }
 
@@ -784,16 +1163,18 @@ fn random_device_id() -> Result<DeviceId, ControlError> {
     DeviceId::new(value.to_string()).map_err(|_| ControlError::InvalidDeviceId)
 }
 
-const fn intersect_permissions(
-    requested: SessionPermissions,
-    available: SessionPermissions,
-) -> SessionPermissions {
-    SessionPermissions {
-        view_desktop: requested.view_desktop && available.view_desktop,
-        control_input: requested.control_input && available.control_input,
-        clipboard: requested.clipboard && available.clipboard,
-        file_upload: requested.file_upload && available.file_upload,
-        file_download: requested.file_download && available.file_download,
+const fn audit_kind_text(kind: SessionAuditEventKind) -> &'static str {
+    match kind {
+        SessionAuditEventKind::Started => "started",
+        SessionAuditEventKind::Ended => "ended",
+    }
+}
+
+const fn connection_type_text(connection_type: ConnectionType) -> &'static str {
+    match connection_type {
+        ConnectionType::Relay => "relay",
+        ConnectionType::Direct => "direct",
+        ConnectionType::Lan => "lan",
     }
 }
 
@@ -859,7 +1240,18 @@ mod tests {
     }
 
     async fn enrolled() -> (ControlService, Ed25519DeviceIdentity, DeviceId) {
-        let service = ControlService::new(Arc::new(MemoryRepository::default()), [4; 32], config());
+        let (service, identity, device_id, _) = enrolled_with_repository().await;
+        (service, identity, device_id)
+    }
+
+    async fn enrolled_with_repository() -> (
+        ControlService,
+        Ed25519DeviceIdentity,
+        DeviceId,
+        Arc<MemoryRepository>,
+    ) {
+        let repository = Arc::new(MemoryRepository::default());
+        let service = ControlService::new(repository.clone(), [4; 32], config());
         let identity = Ed25519DeviceIdentity::from_secret_bytes([5; 32]);
         let response = service
             .register(
@@ -874,7 +1266,7 @@ mod tests {
             )
             .await
             .expect("register device");
-        (service, identity, response.device_id)
+        (service, identity, response.device_id, repository)
     }
 
     fn proof(
@@ -959,12 +1351,13 @@ mod tests {
                     device_id: device_id.clone(),
                     controller_name: "Controller".into(),
                     requested_permissions: capabilities(),
+                    unattended_secret: Some("correct horse".into()),
                 },
                 1_050,
             )
             .await
             .expect("create session");
-        let agent = service
+        let incoming = service
             .claim_agent_session(
                 &device_id,
                 ClaimAgentSessionRequest {
@@ -974,6 +1367,24 @@ mod tests {
             )
             .await
             .expect("claim session")
+            .authorization_request
+            .expect("authorization request");
+        assert_eq!(incoming.session_id, controller.session_id);
+        assert_eq!(incoming.unattended_secret.as_deref(), Some("correct horse"));
+        let action = format!("authorize_session:{}", controller.session_id);
+        let agent = service
+            .resolve_session_authorization(
+                &device_id,
+                controller.session_id,
+                ResolveSessionAuthorizationRequest {
+                    proof: proof(&identity, &action, &device_id, 1_070, 3),
+                    decision: AuthorizationDecision::Accept,
+                    granted_permissions: capabilities(),
+                },
+                1_070,
+            )
+            .await
+            .expect("accept session")
             .credentials
             .expect("agent credentials");
         assert_eq!(agent.session_id, controller.session_id);
@@ -983,13 +1394,13 @@ mod tests {
             .claim_agent_session(
                 &device_id,
                 ClaimAgentSessionRequest {
-                    proof: proof(&identity, "claim_session", &device_id, 1_070, 3),
+                    proof: proof(&identity, "claim_session", &device_id, 1_080, 4),
                 },
-                1_070,
+                1_080,
             )
             .await
             .expect("second claim");
-        assert!(second.credentials.is_none());
+        assert!(second.authorization_request.is_none());
     }
 
     #[tokio::test]
@@ -999,6 +1410,7 @@ mod tests {
             device_id,
             controller_name: "Controller".into(),
             requested_permissions: capabilities(),
+            unattended_secret: None,
         };
         assert!(matches!(
             service.create_session(request, 1_101).await,
@@ -1016,6 +1428,7 @@ mod tests {
                     device_id: device_id.clone(),
                     controller_name: "Controller".into(),
                     requested_permissions: capabilities(),
+                    unattended_secret: None,
                 },
                 1_050,
             )
@@ -1031,6 +1444,127 @@ mod tests {
             )
             .await
             .expect("claim expired session");
-        assert!(claimed.credentials.is_none());
+        assert!(claimed.authorization_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_session_cannot_be_claimed_or_accepted_again() {
+        let (service, identity, device_id) = enrolled().await;
+        let controller = service
+            .create_session(
+                CreateSessionRequest {
+                    device_id: device_id.clone(),
+                    controller_name: "Rejected Controller".into(),
+                    requested_permissions: capabilities(),
+                    unattended_secret: None,
+                },
+                1_050,
+            )
+            .await
+            .expect("create session");
+        let action = format!("authorize_session:{}", controller.session_id);
+        let rejected = service
+            .resolve_session_authorization(
+                &device_id,
+                controller.session_id,
+                ResolveSessionAuthorizationRequest {
+                    proof: proof(&identity, &action, &device_id, 1_060, 2),
+                    decision: AuthorizationDecision::Reject,
+                    granted_permissions: capabilities(),
+                },
+                1_060,
+            )
+            .await
+            .expect("reject session");
+        assert!(rejected.credentials.is_none());
+        assert!(matches!(
+            service
+                .resolve_session_authorization(
+                    &device_id,
+                    controller.session_id,
+                    ResolveSessionAuthorizationRequest {
+                        proof: proof(&identity, &action, &device_id, 1_070, 3),
+                        decision: AuthorizationDecision::Accept,
+                        granted_permissions: capabilities(),
+                    },
+                    1_070,
+                )
+                .await,
+            Err(ControlError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_permissions_and_lifecycle_are_audited() {
+        let (service, identity, device_id, repository) = enrolled_with_repository().await;
+        let controller = service
+            .create_session(
+                CreateSessionRequest {
+                    device_id: device_id.clone(),
+                    controller_name: "Audited Controller".into(),
+                    requested_permissions: capabilities(),
+                    unattended_secret: None,
+                },
+                1_050,
+            )
+            .await
+            .expect("create session");
+        let granted = SessionPermissions {
+            view_desktop: true,
+            control_input: false,
+            clipboard: true,
+            file_upload: false,
+            file_download: false,
+        };
+        let action = format!("authorize_session:{}", controller.session_id);
+        let response = service
+            .resolve_session_authorization(
+                &device_id,
+                controller.session_id,
+                ResolveSessionAuthorizationRequest {
+                    proof: proof(&identity, &action, &device_id, 1_060, 2),
+                    decision: AuthorizationDecision::Accept,
+                    granted_permissions: granted,
+                },
+                1_060,
+            )
+            .await
+            .expect("accept session");
+        assert_eq!(
+            response.credentials.expect("credentials").permissions,
+            granted
+        );
+        for (kind, timestamp, nonce, bytes, result) in [
+            (SessionAuditEventKind::Started, 1_070, 3, 0, "active"),
+            (
+                SessionAuditEventKind::Ended,
+                1_080,
+                4,
+                12_345,
+                "disconnected",
+            ),
+        ] {
+            let action = format!(
+                "session_event:{}:{}",
+                controller.session_id,
+                audit_kind_text(kind)
+            );
+            service
+                .report_session_event(
+                    &device_id,
+                    controller.session_id,
+                    ReportSessionEventRequest {
+                        proof: proof(&identity, &action, &device_id, timestamp, nonce),
+                        kind,
+                        connection_type: ConnectionType::Relay,
+                        bytes_transferred: bytes,
+                        result: result.into(),
+                    },
+                    timestamp,
+                )
+                .await
+                .expect("record lifecycle event");
+        }
+        assert_eq!(repository.audit_event_count().await, 4);
     }
 }

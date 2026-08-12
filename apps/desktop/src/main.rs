@@ -57,6 +57,8 @@ struct ConnectRequest {
     device_id: String,
     #[serde(default)]
     controller_name: String,
+    #[serde(default)]
+    unattended_secret: String,
     relay_address: String,
     server_name: String,
     ca_certificate_path: String,
@@ -503,6 +505,13 @@ async fn run_remote_session(
     mut input_receiver: mpsc::Receiver<InputEvent>,
     file_commands: mpsc::Receiver<ControllerFileCommand>,
 ) -> anyhow::Result<()> {
+    if !request.control_server_url.trim().is_empty() {
+        emit_status(
+            &app,
+            "authorizing",
+            "Waiting for authorization on the remote device",
+        );
+    }
     let resolved = resolve_session(&request).await?;
     let relay_address: SocketAddr = resolved
         .relay_address
@@ -662,6 +671,8 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
             device_id,
             controller_name: controller_name.to_owned(),
             requested_permissions,
+            unattended_secret: (!request.unattended_secret.is_empty())
+                .then(|| request.unattended_secret.clone()),
         })
         .send()
         .await

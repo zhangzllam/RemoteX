@@ -6,6 +6,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -203,11 +204,17 @@ pub fn secret_hash(secret: &[u8]) -> [u8; 32] {
     Sha256::digest(secret).into()
 }
 
+#[must_use]
+pub fn secrets_equal(left: &[u8], right: &[u8]) -> bool {
+    bool::from(secret_hash(left).ct_eq(&secret_hash(right)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DeviceIdentity, Ed25519DeviceIdentity, ServerSecretBox, SessionCipher, SessionDirection,
-        XChaChaSessionCipher, device_auth_message, secret_hash, verify_device_signature,
+        XChaChaSessionCipher, device_auth_message, secret_hash, secrets_equal,
+        verify_device_signature,
     };
 
     #[test]
@@ -273,5 +280,11 @@ mod tests {
             b"session secret"
         );
         assert_eq!(secret_hash(b"token"), secret_hash(b"token"));
+    }
+
+    #[test]
+    fn unattended_secrets_compare_after_fixed_length_hashing() {
+        assert!(secrets_equal(b"correct horse", b"correct horse"));
+        assert!(!secrets_equal(b"correct horse", b"wrong secret"));
     }
 }

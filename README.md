@@ -21,9 +21,11 @@ The repository currently implements **Milestones 0–7**:
   explicit resume, progress, and SHA-256 verification.
 - a PostgreSQL-backed Control Server with persistent device identity, nine-digit
   Device IDs, signed presence, and short-lived one-time Relay credentials.
+- foreground Agent authorization, independently enforced Session permissions,
+  secret-gated opt-in unattended access, visible active state, and lifecycle
+  audit records.
 
-Interactive authorization, unattended-access policy, and P2P are intentionally
-not implemented yet.
+H.264 optimization and P2P are intentionally not implemented yet.
 
 ## Workspace
 
@@ -54,7 +56,7 @@ pnpm --dir apps/desktop/ui build
 See [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), and
 [Roadmap](docs/roadmap.md) for design boundaries and planned work. See
 [Relay M1](docs/relay.md) for the mock transport workflow and
-[Running M8](docs/running-m8.md) for the PostgreSQL-backed control, relay, agent,
+[Running M9](docs/running-m9.md) for the authorized control, relay, agent,
 and controller workflow.
 
 ## Security posture

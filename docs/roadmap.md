@@ -27,11 +27,12 @@ tests all pass.
 - **M8 — Control server:** Ed25519 device enrollment, nine-digit Device IDs,
   signed heartbeat and claims, PostgreSQL presence and Session records,
   wrapped pending secrets, and short-lived one-time Relay credentials.
+- **M9 — Authorization:** foreground local accept/reject, Agent-enforced
+  per-capability grants, secret-gated opt-in unattended access, visible active
+  state with local disconnect, and signed lifecycle audit records.
 
 ## Next
 
-- **M9 — Authorization:** visible accept/reject UI, per-capability permissions,
-  opt-in unattended access, active-Session controls, and audit records.
 - **M10 — Video optimization:** codec abstraction and negotiation, H.264 with
   JPEG/WebP fallback, adaptive quality, and latency telemetry.
 - **M11 — Direct connectivity:** authenticated LAN/P2P attempts, bounded NAT

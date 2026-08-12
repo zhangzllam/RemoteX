@@ -39,7 +39,11 @@ Session creation, and signed Agent Session claim. The HTTP API is:
 - `POST /api/sessions` creates short-lived, role-bound credentials for an
   online device;
 - `POST /api/devices/{device_id}/sessions/claim` verifies the Agent and returns
-  at most one pending Agent credential.
+  at most one pending authorization request;
+- `POST /api/devices/{device_id}/sessions/{session_id}/authorize` accepts or
+  rejects the request with an Agent-selected permission subset;
+- `POST /api/devices/{device_id}/sessions/{session_id}/events` records signed
+  start/end lifecycle events and aggregate transfer counts.
 
 `DeviceAuthProof` contains a millisecond timestamp, monotonic nonce, and Ed25519
 signature. The signed bytes include a RemoteX domain, action, Device ID,
@@ -51,6 +55,18 @@ one role's 256-bit token, the 256-bit E2EE Session key, expiry, and intersected
 permissions. Controller and Agent tokens differ and are consumed independently.
 Raw credentials are never returned by device status endpoints or written to
 logs.
+
+An M9 Session moves through `pending` to `accepted` or `rejected`; an accepted
+Session moves to `ended` after the Agent's signed lifecycle event. A rejected or
+expired Session can never be accepted later. Authorization and lifecycle proofs
+include the Session ID and action in their Ed25519 domain, so a heartbeat or one
+Session's decision cannot be replayed for another operation.
+
+`ResolveSessionAuthorizationRequest` carries accept/reject plus final granted
+permissions. The Control Server intersects these with the originally requested
+and registered capabilities. `ReportSessionEventRequest` contains only event
+kind, `Relay`/`Direct`/`Lan` connection type, aggregate bytes, and a short result
+code. It contains no payload content.
 
 ## Logical channels
 

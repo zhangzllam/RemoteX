@@ -316,6 +316,28 @@ pub struct SessionPermissions {
     pub file_download: bool,
 }
 
+impl SessionPermissions {
+    #[must_use]
+    pub const fn intersect(self, available: Self) -> Self {
+        Self {
+            view_desktop: self.view_desktop && available.view_desktop,
+            control_input: self.control_input && available.control_input,
+            clipboard: self.clipboard && available.clipboard,
+            file_upload: self.file_upload && available.file_upload,
+            file_download: self.file_download && available.file_download,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_subset_of(self, available: Self) -> bool {
+        (!self.view_desktop || available.view_desktop)
+            && (!self.control_input || available.control_input)
+            && (!self.clipboard || available.clipboard)
+            && (!self.file_upload || available.file_upload)
+            && (!self.file_download || available.file_download)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevicePlatform {
@@ -368,6 +390,8 @@ pub struct CreateSessionRequest {
     pub device_id: DeviceId,
     pub controller_name: String,
     pub requested_permissions: SessionPermissions,
+    #[serde(default)]
+    pub unattended_secret: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -388,7 +412,59 @@ pub struct ClaimAgentSessionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClaimAgentSessionResponse {
+    pub authorization_request: Option<IncomingSessionRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncomingSessionRequest {
+    pub session_id: SessionId,
+    pub controller_name: String,
+    pub requested_permissions: SessionPermissions,
+    pub expires_at_ms: u64,
+    pub unattended_secret: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationDecision {
+    Accept,
+    Reject,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolveSessionAuthorizationRequest {
+    pub proof: DeviceAuthProof,
+    pub decision: AuthorizationDecision,
+    pub granted_permissions: SessionPermissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolveSessionAuthorizationResponse {
     pub credentials: Option<SessionCredentials>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionType {
+    Relay,
+    Direct,
+    Lan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAuditEventKind {
+    Started,
+    Ended,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReportSessionEventRequest {
+    pub proof: DeviceAuthProof,
+    pub kind: SessionAuditEventKind,
+    pub connection_type: ConnectionType,
+    pub bytes_transferred: u64,
+    pub result: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

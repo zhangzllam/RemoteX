@@ -1,6 +1,9 @@
 //! `RemoteX` M7 Windows Agent with remote screen, input, clipboard, and files.
 
 #[cfg(windows)]
+mod windows_authorization;
+
+#[cfg(windows)]
 use anyhow::Context;
 #[cfg(windows)]
 use bytes::Bytes;
@@ -13,7 +16,7 @@ use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardB
 #[cfg(windows)]
 use remotex_crypto::{
     DeviceIdentity, Ed25519DeviceIdentity, SessionCipher, SessionDirection, XChaChaSessionCipher,
-    device_auth_message,
+    device_auth_message, secrets_equal,
 };
 #[cfg(windows)]
 use remotex_file_transfer::{
@@ -26,11 +29,13 @@ use remotex_input::{
 };
 #[cfg(windows)]
 use remotex_protocol::{
-    ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin, DeviceAuthProof,
-    DeviceHeartbeatRequest, DeviceId, DevicePlatform, DeviceRegistrationRequest,
-    DeviceRegistrationResponse, DisplayId, FileTransferDirection, FileTransferErrorCode,
-    FileTransferMessage, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage,
-    RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
+    AuthorizationDecision, ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin,
+    ConnectionType, DeviceAuthProof, DeviceHeartbeatRequest, DeviceId, DevicePlatform,
+    DeviceRegistrationRequest, DeviceRegistrationResponse, DisplayId, FileTransferDirection,
+    FileTransferErrorCode, FileTransferMessage, IncomingSessionRequest, MAX_FILE_CHUNK_SIZE,
+    Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, ReportSessionEventRequest,
+    ResolveSessionAuthorizationRequest, ResolveSessionAuthorizationResponse, Role,
+    SessionAuditEventKind, SessionCredentials, SessionId, SessionPermissions, SessionToken,
     TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
@@ -74,6 +79,8 @@ struct ManagedAgentConfig {
     device_name: String,
     frames_per_second: u32,
     local_permissions: SessionPermissions,
+    unattended_access: bool,
+    unattended_secret: Option<String>,
     file_roots: Vec<AllowedRoot>,
 }
 
@@ -87,6 +94,7 @@ struct AgentConfig {
     token: SessionToken,
     end_to_end_key: [u8; 32],
     frames_per_second: u32,
+    view_permission: bool,
     input_permission: bool,
     clipboard_permission: bool,
     file_upload_permission: bool,
@@ -113,6 +121,7 @@ struct AgentFileService {
 struct AgentSessionContext<'a> {
     session_id: SessionId,
     frames_per_second: u32,
+    view_permission: bool,
     outbound_cipher: &'a XChaChaSessionCipher,
     inbound_cipher: &'a XChaChaSessionCipher,
 }
@@ -129,12 +138,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(config) = load_managed_config()? {
         return run_managed_agent(config).await;
     }
-    run_agent_session(load_config()?).await
+    run_agent_session(load_config()?).await.map(|_| ())
 }
 
 #[cfg(windows)]
 #[allow(clippy::too_many_lines)]
-async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
+async fn run_agent_session(config: AgentConfig) -> anyhow::Result<u64> {
     let AgentConfig {
         relay_address,
         server_name,
@@ -143,6 +152,7 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
         token,
         end_to_end_key,
         frames_per_second,
+        view_permission,
         input_permission,
         clipboard_permission,
         file_upload_permission,
@@ -171,6 +181,7 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
     );
     info!(
         event = "session_permissions_configured",
+        view_desktop = view_permission,
         control_input = input_permission,
         clipboard = clipboard_permission,
         file_upload = file_upload_permission,
@@ -211,8 +222,9 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
     transport.send(Bytes::from(encode_wire(&hello)?)).await?;
     wait_for_peer(&mut transport, session_id).await?;
     info!(%session_id, %relay_address, "remote session active");
+    windows_authorization::set_active_session_title(Some(session_id));
 
-    run_active_session(
+    let session_result = run_active_session(
         &mut transport,
         &mut capture,
         &mut input,
@@ -221,19 +233,25 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
         AgentSessionContext {
             session_id,
             frames_per_second,
+            view_permission,
             outbound_cipher: &outbound_cipher,
             inbound_cipher: &inbound_cipher,
         },
     )
-    .await?;
-    input.release_all()?;
+    .await;
+    windows_authorization::set_active_session_title(None);
+    let release_result = input.release_all();
     let _result = transport
         .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
         .await;
-    capture.stop()?;
-    transport.close().await?;
+    let capture_result = capture.stop();
+    let close_result = transport.close().await;
     client_endpoint.close(0_u32.into(), b"agent stopped");
-    Ok(())
+    let bytes_transferred = session_result?;
+    release_result?;
+    capture_result?;
+    close_result?;
+    Ok(bytes_transferred)
 }
 
 #[cfg(windows)]
@@ -302,17 +320,104 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
                     .json::<ClaimAgentSessionResponse>()
                     .await
                     .context("decode claimed Session")?;
-                if let Some(credentials) = claimed.credentials {
-                    let session = managed_session_config(&config, credentials)?;
-                    if let Err(error) = run_agent_session(session).await {
-                        warn!(event = "managed_session_ended_with_error", %error);
-                    }
+                if let Some(incoming) = claimed.authorization_request {
+                    handle_incoming_session(
+                        &config,
+                        &client,
+                        &device_id,
+                        &identity,
+                        &nonce,
+                        incoming,
+                    )
+                    .await?;
                 }
             }
         }
     }
     heartbeat_task.abort();
     Ok(())
+}
+
+#[cfg(windows)]
+async fn handle_incoming_session(
+    config: &ManagedAgentConfig,
+    client: &reqwest::Client,
+    device_id: &DeviceId,
+    identity: &Ed25519DeviceIdentity,
+    nonce: &AtomicU64,
+    incoming: IncomingSessionRequest,
+) -> anyhow::Result<()> {
+    let granted_permissions = incoming
+        .requested_permissions
+        .intersect(config.local_permissions);
+    let accepted = authorize_incoming_session(
+        config.unattended_access,
+        config.unattended_secret.as_deref(),
+        incoming.clone(),
+        granted_permissions,
+    )
+    .await?;
+    let action = format!("authorize_session:{}", incoming.session_id);
+    let proof = signed_proof(identity, &action, device_id, nonce)?;
+    let authorization = client
+        .post(format!(
+            "{}/api/devices/{device_id}/sessions/{}/authorize",
+            config.control_url, incoming.session_id,
+        ))
+        .json(&ResolveSessionAuthorizationRequest {
+            proof,
+            decision: if accepted {
+                AuthorizationDecision::Accept
+            } else {
+                AuthorizationDecision::Reject
+            },
+            granted_permissions,
+        })
+        .send()
+        .await
+        .context("resolve incoming Session authorization")?
+        .error_for_status()
+        .context("control server rejected Session authorization")?
+        .json::<ResolveSessionAuthorizationResponse>()
+        .await
+        .context("decode Session authorization response")?;
+    let Some(credentials) = authorization.credentials else {
+        info!(session_id = %incoming.session_id, "incoming remote Session rejected");
+        return Ok(());
+    };
+    let session_id = credentials.session_id;
+    report_managed_session_event(
+        client,
+        &config.control_url,
+        device_id,
+        identity,
+        nonce,
+        session_id,
+        SessionAuditEventKind::Started,
+        0,
+        "active",
+    )
+    .await?;
+    let session = managed_session_config(config, credentials)?;
+    let (bytes_transferred, result) = match run_agent_session(session).await {
+        Ok(bytes_transferred) => (bytes_transferred, "disconnected"),
+        Err(error) => {
+            warn!(event = "managed_session_ended_with_error", %error);
+            (0, "error")
+        }
+    };
+    report_managed_session_event(
+        client,
+        &config.control_url,
+        device_id,
+        identity,
+        nonce,
+        session_id,
+        SessionAuditEventKind::Ended,
+        bytes_transferred,
+        result,
+    )
+    .await
 }
 
 #[cfg(windows)]
@@ -358,6 +463,91 @@ async fn run_managed_heartbeats(
 }
 
 #[cfg(windows)]
+async fn authorize_incoming_session(
+    unattended_access: bool,
+    unattended_secret: Option<&str>,
+    incoming: IncomingSessionRequest,
+    granted_permissions: SessionPermissions,
+) -> anyhow::Result<bool> {
+    if unattended_authorization(
+        unattended_access,
+        unattended_secret,
+        incoming.unattended_secret.as_deref(),
+    )
+    .is_some()
+    {
+        info!(
+            session_id = %incoming.session_id,
+            controller = %incoming.controller_name,
+            "incoming Session accepted by explicitly enabled unattended access"
+        );
+        return Ok(true);
+    }
+    tokio::task::spawn_blocking(move || {
+        windows_authorization::confirm_incoming_session(&incoming, granted_permissions)
+    })
+    .await
+    .context("join local authorization prompt")
+}
+
+#[cfg(windows)]
+fn unattended_authorization(
+    enabled: bool,
+    configured_secret: Option<&str>,
+    presented_secret: Option<&str>,
+) -> Option<bool> {
+    if enabled
+        && configured_secret
+            .zip(presented_secret)
+            .is_some_and(|(configured, presented)| {
+                secrets_equal(configured.as_bytes(), presented.as_bytes())
+            })
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn report_managed_session_event(
+    client: &reqwest::Client,
+    control_url: &str,
+    device_id: &DeviceId,
+    identity: &Ed25519DeviceIdentity,
+    nonce: &AtomicU64,
+    session_id: SessionId,
+    kind: SessionAuditEventKind,
+    bytes_transferred: u64,
+    result: &str,
+) -> anyhow::Result<()> {
+    let kind_text = match kind {
+        SessionAuditEventKind::Started => "started",
+        SessionAuditEventKind::Ended => "ended",
+    };
+    let action = format!("session_event:{session_id}:{kind_text}");
+    let request = ReportSessionEventRequest {
+        proof: signed_proof(identity, &action, device_id, nonce)?,
+        kind,
+        connection_type: ConnectionType::Relay,
+        bytes_transferred,
+        result: result.to_owned(),
+    };
+    client
+        .post(format!(
+            "{control_url}/api/devices/{device_id}/sessions/{session_id}/events"
+        ))
+        .json(&request)
+        .send()
+        .await
+        .context("report managed Session event")?
+        .error_for_status()
+        .context("control server rejected Session event")?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn managed_session_config(
     config: &ManagedAgentConfig,
     credentials: SessionCredentials,
@@ -376,6 +566,8 @@ fn managed_session_config(
         token: parse_token(&credentials.role_token_hex)?,
         end_to_end_key: parse_key(&credentials.end_to_end_key_hex)?,
         frames_per_second: config.frames_per_second,
+        view_permission: credentials.permissions.view_desktop
+            && config.local_permissions.view_desktop,
         input_permission: credentials.permissions.control_input
             && config.local_permissions.control_input,
         clipboard_permission: credentials.permissions.clipboard
@@ -459,7 +651,7 @@ async fn run_active_session(
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
     file_service: AgentFileService,
     context: AgentSessionContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let codec = SoftwareEncoder::new(EncoderConfig::default())?;
     let mut outbound_sequence = 0_u64;
     let mut expected_inbound_sequence = 0_u64;
@@ -473,36 +665,37 @@ async fn run_active_session(
     let (file_response_sender, mut file_response_receiver) =
         mpsc::channel(FILE_RESPONSE_QUEUE_CAPACITY);
     let file_worker = tokio::spawn(file_service.run(file_command_receiver, file_response_sender));
+    let mut bytes_transferred = 0_u64;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = capture_interval.tick() => {
+            _ = capture_interval.tick(), if context.view_permission => {
                 let frame = match capture.next_frame() {
                     Ok(frame) => frame,
                     Err(CaptureError::Timeout) => continue,
                     Err(error) => return Err(error.into()),
                 };
                 let video = codec.encode(&frame)?;
-                send_agent_message(
+                bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
                     transport,
                     context.session_id,
                     context.outbound_cipher,
                     &mut outbound_sequence,
                     frame.timestamp_ms,
                     Message::Video(video),
-                ).await?;
+                ).await?);
             }
             _ = clipboard_interval.tick(), if clipboard.is_enabled() => {
                 match clipboard.poll() {
                     Ok(Some(message)) => {
-                        send_agent_message(
+                        bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
                             transport,
                             context.session_id,
                             context.outbound_cipher,
                             &mut outbound_sequence,
                             now_ms()?,
                             Message::Clipboard(message),
-                        ).await?;
+                        ).await?);
                     }
                     Ok(None) => {}
                     Err(error) => warn!(event = "clipboard_poll_failed", %error),
@@ -512,19 +705,23 @@ async fn run_active_session(
                 let Some(response) = response else {
                     anyhow::bail!("file service stopped unexpectedly");
                 };
-                send_agent_message(
+                bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
                     transport,
                     context.session_id,
                     context.outbound_cipher,
                     &mut outbound_sequence,
                     now_ms()?,
                     Message::FileTransfer(response),
-                ).await?;
+                ).await?);
             }
             incoming = transport.receive() => {
+                let incoming = incoming?;
+                bytes_transferred = bytes_transferred.saturating_add(
+                    u64::try_from(incoming.len()).unwrap_or(u64::MAX)
+                );
                 handle_relay_message(
                     transport,
-                    decode_wire(&incoming?)?,
+                    decode_wire(&incoming)?,
                     context.session_id,
                     context.inbound_cipher,
                     &mut expected_inbound_sequence,
@@ -537,7 +734,7 @@ async fn run_active_session(
     }
     drop(file_command_sender);
     file_worker.abort();
-    Ok(())
+    Ok(bytes_transferred)
 }
 
 #[cfg(windows)]
@@ -548,7 +745,7 @@ async fn send_agent_message(
     sequence: &mut u64,
     timestamp_ms: u64,
     message: Message,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let envelope = MessageEnvelope::new(session_id, *sequence, timestamp_ms, message);
     let plaintext = encode_wire(&envelope).context("encode Agent envelope")?;
     let ciphertext = cipher
@@ -557,15 +754,13 @@ async fn send_agent_message(
     let mut payload = Vec::with_capacity(8 + ciphertext.len());
     payload.extend_from_slice(&(*sequence).to_be_bytes());
     payload.extend_from_slice(&ciphertext);
-    transport
-        .send(Bytes::from(encode_wire(&RelayClientMessage::Payload(
-            payload,
-        ))?))
-        .await?;
+    let encoded = encode_wire(&RelayClientMessage::Payload(payload))?;
+    let byte_count = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    transport.send(Bytes::from(encoded)).await?;
     *sequence = sequence
         .checked_add(1)
         .context("Agent outbound sequence space exhausted")?;
-    Ok(())
+    Ok(byte_count)
 }
 
 #[cfg(windows)]
@@ -599,6 +794,7 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         token: parse_token(&required("REMOTEX_AGENT_TOKEN_HEX")?)?,
         end_to_end_key: parse_key(&required("REMOTEX_E2E_KEY_HEX")?)?,
         frames_per_second,
+        view_permission: true,
         input_permission: parse_switch("REMOTEX_ALLOW_INPUT", false)?,
         clipboard_permission: parse_switch("REMOTEX_ALLOW_CLIPBOARD", false)?,
         file_upload_permission,
@@ -637,6 +833,16 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
             "REMOTEX_FILE_ROOTS must configure at least one Name=Path root when file access is enabled"
         );
     }
+    let unattended_access = parse_switch("REMOTEX_UNATTENDED_ACCESS", false)?;
+    let unattended_secret = if unattended_access {
+        let secret = required("REMOTEX_UNATTENDED_SECRET")?;
+        if !(12..=128).contains(&secret.len()) {
+            anyhow::bail!("REMOTEX_UNATTENDED_SECRET must contain 12 to 128 bytes");
+        }
+        Some(secret)
+    } else {
+        None
+    };
     Ok(Some(ManagedAgentConfig {
         control_url,
         identity_path: PathBuf::from(required("REMOTEX_IDENTITY_PATH")?),
@@ -645,6 +851,8 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
             .unwrap_or_else(|_| "Windows PC".to_owned()),
         frames_per_second,
         local_permissions,
+        unattended_access,
+        unattended_secret,
         file_roots,
     }))
 }
@@ -1295,5 +1503,50 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].name, "Documents");
         assert_eq!(roots[1].path, PathBuf::from("D:\\Data"));
+    }
+
+    #[test]
+    fn unattended_access_is_disabled_unless_explicitly_enabled() {
+        assert_eq!(
+            unattended_authorization(false, Some("correct secret"), Some("correct secret")),
+            None
+        );
+        assert_eq!(unattended_authorization(true, None, None), None);
+        assert_eq!(
+            unattended_authorization(true, Some("correct secret"), Some("wrong secret")),
+            None
+        );
+        assert_eq!(
+            unattended_authorization(true, Some("correct secret"), Some("correct secret")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn local_capabilities_can_revoke_individual_requested_permissions() {
+        let requested = SessionPermissions {
+            view_desktop: true,
+            control_input: true,
+            clipboard: true,
+            file_upload: true,
+            file_download: true,
+        };
+        let local = SessionPermissions {
+            view_desktop: true,
+            control_input: false,
+            clipboard: true,
+            file_upload: false,
+            file_download: true,
+        };
+        assert_eq!(
+            requested.intersect(local),
+            SessionPermissions {
+                view_desktop: true,
+                control_input: false,
+                clipboard: true,
+                file_upload: false,
+                file_download: true,
+            }
+        );
     }
 }

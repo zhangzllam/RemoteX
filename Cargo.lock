@@ -2859,6 +2859,7 @@ dependencies = [
  "hex",
  "quinn",
  "remotex-crypto",
+ "remotex-input",
  "remotex-protocol",
  "remotex-transport",
  "rustls",
@@ -2884,6 +2885,7 @@ version = "0.1.0"
 dependencies = [
  "remotex-protocol",
  "thiserror 2.0.20",
+ "windows 0.62.2",
 ]
 
 [[package]]

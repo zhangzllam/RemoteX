@@ -129,6 +129,8 @@ impl DxgiCapture {
                             name,
                             width,
                             height,
+                            origin_x: desc.DesktopCoordinates.left,
+                            origin_y: desc.DesktopCoordinates.top,
                             is_primary: desc.DesktopCoordinates.left == 0
                                 && desc.DesktopCoordinates.top == 0,
                         };

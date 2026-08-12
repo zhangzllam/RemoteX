@@ -3,9 +3,9 @@ use rcgen::generate_simple_self_signed;
 use remotex_capture::{Frame, PixelFormat};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_protocol::{
-    ClientHello, Message, MessageEnvelope, RelayClientMessage, RelayProtocolErrorCode,
-    RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken, decode_wire,
-    encode_wire,
+    ClientHello, InputEvent, Message, MessageEnvelope, MouseButton, RelayClientMessage,
+    RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken,
+    decode_wire, encode_wire,
 };
 use remotex_relay::{InMemorySessionAuthenticator, RelayLimits, RelayServer};
 use remotex_transport::{read_frame, write_frame};
@@ -557,5 +557,50 @@ async fn encrypted_video_crosses_relay_as_opaque_payload() -> TestResult {
     let decoded = decode(&received_video)?;
     assert_eq!((decoded.width, decoded.height), (64, 36));
     assert_eq!(decoded.rgba.len(), 64 * 36 * 4);
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn encrypted_mouse_input_crosses_relay_as_opaque_payload() -> TestResult {
+    let harness = Harness::start(Harness::limits())?;
+    let session_id = SessionId::new();
+    let (mut controller, mut agent) = harness
+        .pair(
+            session_id,
+            SessionToken::from_bytes([21; 32]),
+            SessionToken::from_bytes([22; 32]),
+        )
+        .await?;
+    let envelope = MessageEnvelope::new(
+        session_id,
+        0,
+        1_234,
+        Message::Input(InputEvent::MouseButtonDown {
+            button: MouseButton::Left,
+        }),
+    );
+    let encoded_input = encode_wire(&envelope)?;
+    let cipher = XChaChaSessionCipher::new(
+        [23; 32],
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::ControllerToAgent,
+    );
+    let encrypted_input = cipher.seal(envelope.sequence, &encoded_input)?;
+    let mut wire_payload = envelope.sequence.to_be_bytes().to_vec();
+    wire_payload.extend_from_slice(&encrypted_input);
+
+    controller
+        .send(&RelayClientMessage::Payload(wire_payload.clone()))
+        .await?;
+    let RelayServerMessage::Payload(relayed_input) = agent.receive_significant().await? else {
+        return Err("expected relayed input payload".into());
+    };
+    assert_eq!(relayed_input, wire_payload);
+    assert_ne!(relayed_input, encoded_input);
+    let sequence = u64::from_be_bytes(relayed_input[..8].try_into()?);
+    let plaintext = cipher.open(sequence, &relayed_input[8..])?;
+    let received: MessageEnvelope = decode_wire(&plaintext)?;
+    received.validate()?;
+    assert_eq!(received, envelope);
     harness.stop().await
 }

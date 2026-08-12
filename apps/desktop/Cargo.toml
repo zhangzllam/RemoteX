@@ -13,6 +13,7 @@ bytes.workspace = true
 hex.workspace = true
 quinn.workspace = true
 remotex-crypto.workspace = true
+remotex-input.workspace = true
 remotex-protocol.workspace = true
 remotex-transport.workspace = true
 rustls.workspace = true

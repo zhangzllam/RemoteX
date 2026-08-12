@@ -1,7 +1,8 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestones 0–3 establish
-the module boundaries and a working, relay-only Windows remote-video path.
+RemoteX is a self-hosted remote administration system. Milestones 0–4 establish
+the module boundaries and a working, relay-only Windows remote-video and mouse
+control path.
 
 ## System boundaries
 
@@ -22,17 +23,17 @@ file-transfer data later travel through QUIC, initially via the relay.
 
 ## Workspace modules
 
-| Crate | Responsibility | Still excluded through M3 |
+| Crate | Responsibility | Still excluded through M4 |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
 | `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
 | `remotex-crypto` | XChaCha20-Poly1305 session encryption and identity abstractions | Custom cryptography and key persistence |
 | `remotex-capture` | Platform-neutral capture model and Windows DXGI implementation | Networking and video encoding |
-| `remotex-input` | Platform-neutral input execution contract | Windows `SendInput` |
+| `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse adapter | Keyboard injection |
 | `remotex-file-transfer` | Chunk planning and resumable-transfer state model | Filesystem I/O and networking |
 | `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows capture → encode → QUIC composition root | Device enrollment and remote input |
-| `remotex-desktop` | Tauri/React controller and QUIC video receiver | Remote input and file transfer |
+| `remotex-agent` | Windows capture/video send and authorized mouse receive/execution composition root | Device enrollment and keyboard input |
+| `remotex-desktop` | Tauri/React video display and normalized mouse-event sender | Keyboard and file transfer |
 | `remotex-control` | Control-server composition root | HTTP APIs and database |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
@@ -108,11 +109,12 @@ The M1 transport uses QUIC/TLS through Quinn and rustls. Session credentials are
 and consumed once before expiry. M3 adds XChaCha20-Poly1305 authenticated
 encryption above relay TLS. Its direction-separated nonce is derived from the
 Session ID and monotonically increasing sequence, so the relay forwards only
-ciphertext. The temporary development key is provisioned out of band until the
-M7/M8 control plane distributes session keys. No home-grown cryptographic
-algorithm is used.
+ciphertext. M4 uses the opposite cryptographic direction for Controller-to-Agent
+input and enforces an independent monotonically increasing input sequence. The
+temporary development key is provisioned out of band until the M8/M9 control
+plane distributes session keys. No home-grown cryptographic algorithm is used.
 
-## Implemented data path (M3)
+## Implemented data paths (M4)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
@@ -120,8 +122,24 @@ Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
              → Tauri backend → data URL → React remote display
 ```
 
+```text
+React pointer/wheel event → displayed-image coordinate normalization
+    → InputEvent → XChaCha20-Poly1305 → QUIC/TLS → Relay (ciphertext only)
+    → Agent sequence/authentication check → permission gate → InputState
+    → Windows SendInput
+```
+
 The default video rate is 12 FPS and can be configured from 1–30 FPS. The M3
 target remains stability at 10–15 FPS rather than high frame rate.
+
+The React client accounts for `object-fit: contain` letterboxing and sends
+coordinates in the full 0–65535 protocol range. The Agent maps them first to the
+selected monitor and then to the Windows virtual-desktop absolute range. The
+protocol carries an optional validated display ID for later multi-monitor UI.
+M4 defaults `control_input` to false; the local Agent user must set
+`REMOTEX_ALLOW_INPUT=true`. Duplicate button transitions are ignored and all
+buttons injected by a Session are released on normal shutdown, error, network
+disconnect, or controller drop.
 
 ## Error handling and observability
 
@@ -130,7 +148,7 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0–M3 acceptance criteria
+## M0–M4 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;
@@ -143,4 +161,8 @@ identifiers, never secrets or payload contents.
 - the Windows demo captures 100 frames and writes a valid PNG;
 - a 1080p BGRA test frame scales to 720p, crosses the relay, and decodes;
 - relayed video remains authenticated end-to-end ciphertext until the controller;
+- relayed input remains authenticated end-to-end ciphertext until the Agent;
+- normalized coordinates map to the selected Windows monitor;
+- unauthorized input is rejected before Windows execution;
+- pressed mouse buttons are released during Session cleanup;
 - the React production frontend and Tauri backend build successfully.

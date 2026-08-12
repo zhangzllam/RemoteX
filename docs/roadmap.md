@@ -1,72 +1,47 @@
 # RemoteX Roadmap
 
-Work proceeds milestone by milestone. A milestone is complete only after its
+Work proceeds one milestone at a time. A milestone is complete only after its
 design, implementation, tests, documentation, formatting, linting, and existing
 tests all pass.
 
-## M0 — Foundation (completed)
+## Completed
 
-- Cargo workspace and low-coupling crate boundaries
-- versioned protocol domain types
-- transport, crypto, capture, input, and file-transfer abstractions
-- executable composition-root placeholders
-- unit tests and architecture documentation
+- **M0 — Foundation:** workspace boundaries, protocol, capability contracts,
+  and tests.
+- **M1 — Relay transport:** authenticated QUIC pairing, role-bound one-time
+  credentials, heartbeat, bounded opaque forwarding, and cleanup.
+- **M2 — Windows capture:** DXGI monitor enumeration, cursor composition, mode
+  recovery, and capture demo.
+- **M3 — Remote screen:** 720p JPEG stream, end-to-end encryption, relay path,
+  and Tauri/React display.
+- **M4 — Remote mouse:** normalized movement, left/right/middle buttons, wheel,
+  future display identifier, explicit local input permission, Windows
+  `SendInput`, input-state cleanup, and encrypted relay integration tests.
 
-No operational remote-control functionality is included.
+## Next
 
-## M1 — Relay path (completed)
+- **M5 — Remote keyboard:** platform-neutral keys and modifiers, Windows
+  injection, pressed-key tracking, and release on disconnect.
+- **M6 — Clipboard:** bounded bidirectional UTF-8 text with independent
+  permission and revision-based loop prevention.
+- **M7 — Files:** safe rooted directory browsing plus chunked, resumable,
+  checksummed upload and download without blocking interactive traffic.
+- **M8 — Control server:** PostgreSQL-backed device registration, identity,
+  presence, Session creation, and short-lived Relay credentials.
+- **M9 — Authorization:** visible accept/reject UI, per-capability permissions,
+  opt-in unattended access, active-Session controls, and audit records.
+- **M10 — Video optimization:** codec abstraction and negotiation, H.264 with
+  JPEG/WebP fallback, adaptive quality, and latency telemetry.
+- **M11 — Direct connectivity:** authenticated LAN/P2P attempts, bounded NAT
+  traversal, and reliable Relay fallback.
+- **M12 — Linux server Agent:** authorized PTY terminal, M7 Files reuse, system
+  information, and documented visible service operation.
+- **M13 — Self-hosting:** Docker images, Compose stack, PostgreSQL isolation,
+  reverse-proxy TLS, health checks, and deployment documentation.
+- **M14 — Windows usability:** Tauri installer, Agent packaging, opt-in startup,
+  settings, visible tray state, and secure update preparation.
+- **M15 — Final review:** systematic security/resource review, malformed-input
+  coverage, lifecycle cleanup tests, end-to-end validation, and V1 checklists.
 
-- Controller → relay → agent mock data path
-- replaceable `SessionAuthenticator` with one-time session/role token verification
-- explicit waiting/`PeerReady` states and duplicate-role rejection
-- bounded bidirectional opaque forwarding and defensive connection/Session limits
-- application heartbeat, timeout, disconnect notification, and deterministic cleanup
-- structured logging without tokens or payload contents
-- runnable mock Controller/Agent and development certificate generator
-- integration coverage for all ten M1 acceptance scenarios
-
-## M2 — Windows capture demo (completed)
-
-- DXGI monitor enumeration and capture behind `ScreenCapture`
-- cursor handling and display-mode recovery
-- capture 100 frames and save one PNG in a standalone demo
-
-## M3 — Remote screen (completed)
-
-- DXGI capture frames with cursor composition
-- software resize to no more than 1280×720
-- independently decodable JPEG frames at a configurable 10–15 FPS target
-- relay-only Agent → Controller video flow
-- Tauri 2 + React remote display
-
-## M4–M5 — Interactive input (next)
-
-- **M4:** mouse movement, buttons, and wheel through Windows `SendInput`
-- **M5:** keyboard down/up and modifiers through Windows `SendInput`
-
-## M6 — File transfer
-
-- directory browsing, upload, and download
-- 4 MiB chunks, SHA-256 verification, progress, pause, cancel, and resume
-- bounded memory usage for large files
-
-## M7–M8 — Control and authorization
-
-- **M7:** device registration, identity proof, heartbeat/presence, session
-  creation, and scoped one-time tokens
-- **M8:** visible accept/reject UI, opt-in unattended mode, independent
-  permissions, source-device details, and session audit logs
-
-## M9 — Video optimization
-
-- tune JPEG/WebP first
-- then evaluate H.264, hardware encoders, adaptive bitrate/FPS, and dirty rects
-
-## M10 — Direct connectivity
-
-- endpoint discovery, NAT traversal, and UDP hole punching
-- attempt direct connection and always retain relay fallback
-
-Audio, mobile clients, macOS, Linux desktop, remote camera/printing, and
-multi-user collaboration remain outside the MVP. Linux terminal and file
-management are future agent capabilities after the Windows MVP is stable.
+Mobile clients, macOS, audio, remote camera/printing, and unrelated V2 features
+remain outside the V1 plan.

@@ -86,6 +86,54 @@ impl FromStr for DeviceId {
     }
 }
 
+/// Stable display identifier carried by input events for future multi-monitor UI.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct DisplayId(String);
+
+impl DisplayId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidDisplayId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for DisplayId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<DisplayId> for String {
+    fn from(value: DisplayId) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for DisplayId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for DisplayId {
+    type Err = ProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TransferId(Uuid);
@@ -255,7 +303,7 @@ pub enum ControlMessage {
     Pong { nonce: u64 },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
@@ -276,15 +324,18 @@ pub enum WheelAxis {
     Horizontal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     MouseMove {
+        display_id: Option<DisplayId>,
         normalized_x: u16,
         normalized_y: u16,
     },
-    MouseButton {
+    MouseButtonDown {
         button: MouseButton,
-        state: ButtonState,
+    },
+    MouseButtonUp {
+        button: MouseButton,
     },
     MouseWheel {
         axis: WheelAxis,
@@ -418,6 +469,8 @@ impl MessageEnvelope {
 pub enum ProtocolError {
     #[error("device ID must contain exactly nine ASCII digits")]
     InvalidDeviceId,
+    #[error("display ID must be 1-128 characters without control characters")]
+    InvalidDisplayId,
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u16),
     #[error("message type does not match envelope channel")]
@@ -455,6 +508,7 @@ mod tests {
             7,
             1_700_000_000_000,
             Message::Input(InputEvent::MouseMove {
+                display_id: None,
                 normalized_x: 10,
                 normalized_y: 20,
             }),
@@ -506,5 +560,37 @@ mod tests {
         let decoded: RelayServerMessage = decode_wire(&bytes).expect("decode relay message");
 
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn mouse_button_and_wheel_events_round_trip() {
+        let events = [
+            InputEvent::MouseButtonDown {
+                button: MouseButton::Left,
+            },
+            InputEvent::MouseButtonUp {
+                button: MouseButton::Right,
+            },
+            InputEvent::MouseWheel {
+                axis: WheelAxis::Vertical,
+                delta: -120,
+            },
+        ];
+
+        for event in events {
+            let bytes = encode_wire(&event).expect("encode input event");
+            let decoded: InputEvent = decode_wire(&bytes).expect("decode input event");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn display_id_rejects_empty_and_control_text() {
+        assert!(DisplayId::new("0:1").is_ok());
+        assert_eq!(DisplayId::new(""), Err(ProtocolError::InvalidDisplayId));
+        assert_eq!(
+            DisplayId::new("display\n1"),
+            Err(ProtocolError::InvalidDisplayId)
+        );
     }
 }

@@ -1,6 +1,6 @@
-# RemoteX Protocol (M0–M5)
+# RemoteX Protocol (M0–M6)
 
-This document describes the versioned data model and M1–M5 relay framing.
+This document describes the versioned data model and M1–M6 relay framing.
 
 ## Compatibility
 
@@ -38,9 +38,8 @@ their contents.
 | 5 | Audio | Reserved |
 | 6 | Telemetry | Reserved |
 
-M5 implements Control handshakes outside the envelope plus Video and mouse/
-keyboard Input envelopes. Clipboard and File types remain modeled but are not
-executed.
+M6 implements Control handshakes outside the envelope plus Video, mouse/keyboard
+Input, and Clipboard envelopes. File types remain modeled but are not executed.
 
 ## Envelope
 
@@ -55,7 +54,11 @@ MessageEnvelope {
 }
 ```
 
-`sequence` is monotonically increasing within a logical channel and direction.
+`sequence` is monotonically increasing across all encrypted logical channels in
+one direction. Video and Clipboard therefore share the Agent-to-Controller
+sequence; Input and Clipboard share the Controller-to-Agent sequence. A sequence
+must never repeat with the same directional Session key.
+
 `timestamp_ms` is milliseconds since the Unix epoch and is informational; it is
 not used alone for authentication or ordering.
 
@@ -105,10 +108,10 @@ codec enum also reserves WebP; the controller decoder accepts it, while the M3
 agent emits JPEG. Frames are scaled within 1280×720 while preserving aspect
 ratio before encoding.
 
-Before Relay `Payload` wrapping and transport framing, serialized video and input
-envelopes are encrypted with XChaCha20-Poly1305. The wire payload is an
-eight-byte big-endian sequence number followed by authenticated ciphertext. The
-sequence is also present inside the encrypted envelope and the receiver requires
+Before Relay `Payload` wrapping and transport framing, serialized video, input,
+and clipboard envelopes are encrypted with XChaCha20-Poly1305. The wire payload
+is an eight-byte big-endian sequence number followed by authenticated
+ciphertext. The sequence is also present inside the encrypted envelope and the receiver requires
 both values to match. Nonces are direction-separated and derived from the
 Session ID plus sequence; sequences must never repeat for a session key and
 direction.
@@ -130,7 +133,7 @@ Input events describe intent and do not contain Windows-specific values:
 
 - `MouseMove { display_id, normalized_x, normalized_y }`;
 - `MouseButtonDown { button }` and `MouseButtonUp { button }`;
-- `MouseWheel { axis, delta }` for vertical or horizontal movement.
+- `MouseWheel { axis, delta }` for vertical or horizontal movement;
 - `KeyDown { key }` and `KeyUp { key }` using `KeyCode`.
 
 Normalized pointer coordinates are unsigned 16-bit values covering the selected
@@ -139,9 +142,9 @@ optional `display_id` prepares the wire format for future multi-monitor UI; when
 it is absent, M4 targets the Agent's selected capture monitor. Concrete platform
 adapters perform coordinate translation.
 
-The Controller-to-Agent input direction has an independent sequence starting at
-zero. The Agent rejects missing, repeated, skipped, unauthenticated, wrong-
-Session, and non-input payloads. Decryption does not grant execution permission:
+The Controller-to-Agent direction has a shared sequence starting at zero. The
+Agent rejects missing, repeated, skipped, unauthenticated, wrong-Session, and
+directionally invalid payloads. Decryption does not grant execution permission:
 the Agent separately requires its active Session's `control_input` permission.
 M4 obtains that permission from a local, in-memory configuration flag that is
 off by default.
@@ -157,6 +160,28 @@ matching press do not reach the OS. Cleanup sends `KeyUp` for every key and
 mouse-button release for every injected button, attempting all releases even if
 one fails. This protocol is one-way authorized input, not a local Agent keyboard
 capture or keylogging channel.
+
+## Clipboard messages
+
+M6 supports only `ClipboardMessage::Text { origin, revision, text }`:
+
+- `origin` is `Controller` or `Agent` and must differ from the receiver;
+- `revision` is nonzero and increases for changes created by that origin;
+- `text` is UTF-8 and at most `MAX_CLIPBOARD_TEXT_SIZE` (1 MiB), including the
+  empty string.
+
+The receiver tracks the last peer revision and ignores stale repeats. Applying
+remote text updates the local observation state before the next poll, so the
+same content is not echoed. Receiving a newer revision advances the local
+Lamport revision. If both sides create a value at the same revision,
+`Controller` is the deterministic tie-break winner; this makes both peers
+converge instead of swapping initial values forever.
+
+Clipboard permission is distinct from `control_input`. M6 requires the Agent's
+local `REMOTEX_ALLOW_CLIPBOARD=true` and the Controller's explicit clipboard
+checkbox. Decryption, input permission, or screen-view permission alone never
+authorizes clipboard access. Image, HTML, and file clipboard formats are not
+accepted.
 
 ## File-transfer messages
 

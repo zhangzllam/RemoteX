@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub const MAX_RELAY_HANDSHAKE_SIZE: usize = 4 * 1024;
+pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -426,9 +427,19 @@ pub enum InputEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ClipboardOrigin {
+    Controller,
+    Agent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClipboardMessage {
-    Text { content: String },
+    Text {
+        origin: ClipboardOrigin,
+        revision: u64,
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -621,7 +632,9 @@ mod tests {
             1,
             123,
             Message::Clipboard(ClipboardMessage::Text {
-                content: "hello".into(),
+                origin: ClipboardOrigin::Controller,
+                revision: 1,
+                text: "hello".into(),
             }),
         );
         let bytes = encode_wire(&original).expect("encode test value");
@@ -691,5 +704,17 @@ mod tests {
             let decoded: InputEvent = decode_wire(&bytes).expect("decode keyboard event");
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn utf8_clipboard_message_round_trips() {
+        let original = ClipboardMessage::Text {
+            origin: ClipboardOrigin::Agent,
+            revision: 42,
+            text: "中文と日本語".to_owned(),
+        };
+        let bytes = encode_wire(&original).expect("encode clipboard message");
+        let decoded: ClipboardMessage = decode_wire(&bytes).expect("decode clipboard message");
+        assert_eq!(decoded, original);
     }
 }

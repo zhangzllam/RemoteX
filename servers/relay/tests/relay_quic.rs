@@ -3,9 +3,9 @@ use rcgen::generate_simple_self_signed;
 use remotex_capture::{Frame, PixelFormat};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_protocol::{
-    ClientHello, InputEvent, KeyCode, Message, MessageEnvelope, MouseButton, RelayClientMessage,
-    RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken,
-    decode_wire, encode_wire,
+    ClientHello, ClipboardMessage, ClipboardOrigin, InputEvent, KeyCode, Message, MessageEnvelope,
+    MouseButton, RelayClientMessage, RelayProtocolErrorCode, RelayServerMessage, Role,
+    SessionCloseReason, SessionId, SessionToken, decode_wire, encode_wire,
 };
 use remotex_relay::{InMemorySessionAuthenticator, RelayLimits, RelayServer};
 use remotex_transport::{read_frame, write_frame};
@@ -647,4 +647,73 @@ async fn encrypted_keyboard_combination_crosses_relay_in_order() -> TestResult {
         assert_eq!(received, envelope);
     }
     harness.stop().await
+}
+
+#[tokio::test]
+async fn encrypted_clipboard_crosses_relay_bidirectionally() -> TestResult {
+    let harness = Harness::start(Harness::limits())?;
+    let session_id = SessionId::new();
+    let (mut controller, mut agent) = harness
+        .pair(
+            session_id,
+            SessionToken::from_bytes([27; 32]),
+            SessionToken::from_bytes([28; 32]),
+        )
+        .await?;
+    let key = [29; 32];
+    relay_encrypted_clipboard(
+        &mut controller,
+        &mut agent,
+        session_id,
+        key,
+        SessionDirection::ControllerToAgent,
+        ClipboardOrigin::Controller,
+        "控制器剪贴板",
+    )
+    .await?;
+    relay_encrypted_clipboard(
+        &mut agent,
+        &mut controller,
+        session_id,
+        key,
+        SessionDirection::AgentToController,
+        ClipboardOrigin::Agent,
+        "エージェント",
+    )
+    .await?;
+    harness.stop().await
+}
+
+async fn relay_encrypted_clipboard(
+    sender: &mut TestPeer,
+    receiver: &mut TestPeer,
+    session_id: SessionId,
+    key: [u8; 32],
+    direction: SessionDirection,
+    origin: ClipboardOrigin,
+    text: &str,
+) -> TestResult {
+    let envelope = MessageEnvelope::new(
+        session_id,
+        0,
+        1_234,
+        Message::Clipboard(ClipboardMessage::Text {
+            origin,
+            revision: 1,
+            text: text.to_owned(),
+        }),
+    );
+    let plaintext = encode_wire(&envelope)?;
+    let cipher = XChaChaSessionCipher::new(key, *session_id.as_uuid().as_bytes(), direction);
+    let ciphertext = cipher.seal(0, &plaintext)?;
+    let mut payload = 0_u64.to_be_bytes().to_vec();
+    payload.extend_from_slice(&ciphertext);
+    sender.send(&RelayClientMessage::Payload(payload)).await?;
+    let RelayServerMessage::Payload(relayed) = receiver.receive_significant().await? else {
+        return Err("expected relayed clipboard payload".into());
+    };
+    assert_ne!(&relayed[8..], plaintext);
+    let decoded: MessageEnvelope = decode_wire(&cipher.open(0, &relayed[8..])?)?;
+    assert_eq!(decoded, envelope);
+    Ok(())
 }

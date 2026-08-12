@@ -1,8 +1,8 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestones 0–5 establish
+RemoteX is a self-hosted remote administration system. Milestones 0–6 establish
 the module boundaries and a working, relay-only Windows remote-video, mouse,
-and keyboard control path.
+keyboard control, and plain-text clipboard path.
 
 ## System boundaries
 
@@ -23,17 +23,18 @@ file-transfer data later travel through QUIC, initially via the relay.
 
 ## Workspace modules
 
-| Crate | Responsibility | Still excluded through M5 |
+| Crate | Responsibility | Still excluded through M6 |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
 | `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
 | `remotex-crypto` | XChaCha20-Poly1305 session encryption and identity abstractions | Custom cryptography and key persistence |
 | `remotex-capture` | Platform-neutral capture model and Windows DXGI implementation | Networking and video encoding |
-| `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Clipboard and local input capture |
+| `remotex-clipboard` | Permissioned text revisions, size limits, loop/conflict prevention, and Windows clipboard adapter | Images, HTML, and files |
+| `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Local input capture |
 | `remotex-file-transfer` | Chunk planning and resumable-transfer state model | Filesystem I/O and networking |
 | `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows capture/video send and authorized mouse/keyboard receive/execution composition root | Device enrollment and clipboard |
-| `remotex-desktop` | Tauri/React video display and focused mouse/keyboard sender | Clipboard and file transfer |
+| `remotex-agent` | Windows video/input plus authorized clipboard composition root | Device enrollment and file transfer |
+| `remotex-desktop` | Tauri/React video/input plus opt-in local clipboard composition root | File transfer |
 | `remotex-control` | Control-server composition root | HTTP APIs and database |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
@@ -49,10 +50,10 @@ apps/*, servers/*
         +--> protocol
         +--> transport
         +--> crypto
-        +--> capture / input / file-transfer (where relevant)
+        +--> capture / input / clipboard / file-transfer (where relevant)
 
-transport, crypto, capture, input, file-transfer --> protocol (only if shared
-identifiers or protocol data are required)
+transport, crypto, capture, input, clipboard, file-transfer --> protocol
+    (only if shared identifiers or protocol data are required)
 ```
 
 No library crate depends on an executable crate. Capture and input crates do not
@@ -110,11 +111,13 @@ and consumed once before expiry. M3 adds XChaCha20-Poly1305 authenticated
 encryption above relay TLS. Its direction-separated nonce is derived from the
 Session ID and monotonically increasing sequence, so the relay forwards only
 ciphertext. M4 uses the opposite cryptographic direction for Controller-to-Agent
-input and enforces an independent monotonically increasing input sequence. The
-temporary development key is provisioned out of band until the M8/M9 control
-plane distributes session keys. No home-grown cryptographic algorithm is used.
+input. M6 uses one monotonically increasing envelope/nonce sequence per
+direction across video, input, and clipboard, preventing nonce reuse when a new
+logical channel is added. The temporary development key is provisioned out of
+band until the M8/M9 control plane distributes session keys. No home-grown
+cryptographic algorithm is used.
 
-## Implemented data paths (M5)
+## Implemented data paths (M6)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
@@ -127,6 +130,11 @@ Focused React pointer/wheel/keyboard event → platform-neutral InputEvent
     → XChaCha20-Poly1305 → QUIC/TLS → Relay (ciphertext only)
     → Agent sequence/authentication check → permission gate → InputState
     → Windows SendInput
+```
+
+```text
+Windows UTF-16 clipboard ↔ bounded UTF-8 text ↔ ClipboardMessage(origin, revision)
+    ↔ XChaCha20-Poly1305 ↔ QUIC/TLS ↔ Relay (ciphertext only) ↔ peer clipboard
 ```
 
 The default video rate is 12 FPS and can be configured from 1–30 FPS. The M3
@@ -143,6 +151,15 @@ network disconnect, focus loss, or controller drop. Keyboard events originate
 only from the explicitly focused remote surface; the Agent never captures local
 keystrokes.
 
+M6 clipboard synchronization is disabled independently through
+`REMOTEX_ALLOW_CLIPBOARD=false` by default and a Controller checkbox. Each side
+polls plain text every 500 ms. A 1 MiB UTF-8 cap is enforced before sending and
+again before applying. Each origin owns monotonically increasing revisions;
+applied remote text is recorded as local state so it is not echoed. A Lamport-
+style total order resolves simultaneous initial values deterministically and
+both peers converge. Images, HTML, file clipboard formats, and clipboard content
+logging are excluded.
+
 ## Error handling and observability
 
 Library crates expose typed errors with `thiserror`. Executables may add context
@@ -150,7 +167,7 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0–M5 acceptance criteria
+## M0–M6 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;
@@ -171,4 +188,9 @@ identifiers, never secrets or payload contents.
   to Windows virtual keys without exposing Windows codes in the protocol;
 - duplicate key transitions are ignored and pressed keys are released during
   focus and Session cleanup;
+- Controller and Agent synchronize empty and multilingual UTF-8 text in both
+  directions without echo loops;
+- clipboard text is capped at 1 MiB and independently permission-gated;
+- all encrypted logical channels share one sequence per direction, preventing
+  nonce reuse;
 - the React production frontend and Tauri backend build successfully.

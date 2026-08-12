@@ -20,11 +20,12 @@ tests all pass.
 - **M5 — Remote keyboard:** platform-neutral common keys and modifiers, focused
   Controller capture, Windows `SendInput`, ordered combinations, duplicate
   suppression, and release on focus loss or Session cleanup.
+- **M6 — Clipboard:** opt-in bidirectional UTF-8 text, 1 MiB limit, independent
+  permission, origin/revision loop prevention, simultaneous-change convergence,
+  and encrypted Relay integration coverage.
 
 ## Next
 
-- **M6 — Clipboard:** bounded bidirectional UTF-8 text with independent
-  permission and revision-based loop prevention.
 - **M7 — Files:** safe rooted directory browsing plus chunked, resumable,
   checksummed upload and download without blocking interactive traffic.
 - **M8 — Control server:** PostgreSQL-backed device registration, identity,

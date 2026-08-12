@@ -12,6 +12,7 @@ bytes.workspace = true
 hex.workspace = true
 quinn.workspace = true
 remotex-capture.workspace = true
+remotex-clipboard.workspace = true
 remotex-crypto.workspace = true
 remotex-file-transfer.workspace = true
 remotex-input.workspace = true

@@ -33,6 +33,7 @@ type ConnectRequest = {
   sessionId: string;
   tokenHex: string;
   endToEndKeyHex: string;
+  clipboardEnabled: boolean;
 };
 
 type RemoteMouseButton = "left" | "right" | "middle";
@@ -132,6 +133,7 @@ const initialRequest: ConnectRequest = {
   sessionId: "",
   tokenHex: "",
   endToEndKeyHex: "",
+  clipboardEnabled: false,
 };
 
 function mouseButton(button: number): RemoteMouseButton | null {
@@ -403,6 +405,19 @@ function App() {
           <label>
             End-to-end session key
             <input type="password" value={request.endToEndKeyHex} onChange={(e) => update("endToEndKeyHex", e.target.value)} minLength={64} maxLength={64} required />
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={request.clipboardEnabled}
+              onChange={(event) =>
+                setRequest((current) => ({
+                  ...current,
+                  clipboardEnabled: event.target.checked,
+                }))
+              }
+            />
+            <span>Sync plain-text clipboard</span>
           </label>
           <div className="actions">
             <button type="submit" disabled={connected}>Connect</button>

@@ -2809,6 +2809,7 @@ dependencies = [
  "hex",
  "quinn",
  "remotex-capture",
+ "remotex-clipboard",
  "remotex-crypto",
  "remotex-file-transfer",
  "remotex-input",
@@ -2827,6 +2828,15 @@ name = "remotex-capture"
 version = "0.1.0"
 dependencies = [
  "image",
+ "thiserror 2.0.20",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "remotex-clipboard"
+version = "0.1.0"
+dependencies = [
+ "remotex-protocol",
  "thiserror 2.0.20",
  "windows 0.62.2",
 ]
@@ -2858,6 +2868,7 @@ dependencies = [
  "bytes",
  "hex",
  "quinn",
+ "remotex-clipboard",
  "remotex-crypto",
  "remotex-input",
  "remotex-protocol",

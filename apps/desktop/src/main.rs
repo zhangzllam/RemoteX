@@ -1,15 +1,16 @@
-//! `RemoteX` M5 Tauri Controller for remote video and permissioned mouse/keyboard input.
+//! `RemoteX` M6 Tauri Controller for remote video, input, and plain-text clipboard sync.
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use quinn::{ClientConfig, Endpoint};
+use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardBackend};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    DisplayId, InputEvent, KeyCode, Message, MessageEnvelope, MouseButton, RelayClientMessage,
-    RelayServerMessage, Role, SessionId, SessionToken, VideoCodec, WheelAxis, decode_wire,
-    encode_wire,
+    ClipboardOrigin, DisplayId, EncodedVideoFrame, InputEvent, KeyCode, Message, MessageEnvelope,
+    MouseButton, RelayClientMessage, RelayServerMessage, Role, SessionId, SessionToken, VideoCodec,
+    WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 use rustls::RootCertStore;
@@ -17,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs::File, io::BufReader, net::SocketAddr, path::Path, sync::Arc};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
+use tracing::warn;
 
 const INPUT_QUEUE_CAPACITY: usize = 128;
 
@@ -39,6 +42,7 @@ struct ConnectRequest {
     session_id: String,
     token_hex: String,
     end_to_end_key_hex: String,
+    clipboard_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -186,7 +190,8 @@ fn connect_remote(
 
     tauri::async_runtime::spawn(async move {
         emit_status(&app, "connecting", "Connecting to relay");
-        let result = receive_video(app.clone(), request, cancel_receiver, input_receiver).await;
+        let result =
+            run_remote_session(app.clone(), request, cancel_receiver, input_receiver).await;
         match result {
             Ok(()) => emit_status(&app, "disconnected", "Remote session ended"),
             Err(error) => emit_status(&app, "error", &error.to_string()),
@@ -248,7 +253,7 @@ async fn send_keyboard_input(
         .map_err(|_| "remote session input channel is closed".to_owned())
 }
 
-async fn receive_video(
+async fn run_remote_session(
     app: AppHandle,
     request: ConnectRequest,
     mut cancellation: oneshot::Receiver<()>,
@@ -261,12 +266,12 @@ async fn receive_video(
     let session_id: SessionId = request.session_id.parse().context("parse session ID")?;
     let token = parse_token(&request.token_hex)?;
     let end_to_end_key = parse_key(&request.end_to_end_key_hex)?;
-    let video_cipher = XChaChaSessionCipher::new(
+    let inbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
         *session_id.as_uuid().as_bytes(),
         SessionDirection::AgentToController,
     );
-    let input_cipher = XChaChaSessionCipher::new(
+    let outbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
         *session_id.as_uuid().as_bytes(),
         SessionDirection::ControllerToAgent,
@@ -288,46 +293,54 @@ async fn receive_video(
     wait_for_peer(&app, &mut transport).await?;
     emit_status(&app, "connected", "Remote peer ready");
 
-    let mut input_sequence = 0_u64;
+    let mut clipboard = PermissionedClipboard::new(
+        WindowsClipboardBackend,
+        ClipboardOrigin::Controller,
+        request.clipboard_enabled,
+    );
+    let mut outbound_sequence = 0_u64;
+    let mut expected_inbound_sequence = 0_u64;
+    let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        let relay_message = tokio::select! {
+        tokio::select! {
             _ = &mut cancellation => break,
-            result = transport.receive() => decode_wire::<RelayServerMessage>(&result?)?,
+            result = transport.receive() => {
+                let relay_message = decode_wire::<RelayServerMessage>(&result?)?;
+                handle_relay_message(
+                    &app,
+                    &mut transport,
+                    relay_message,
+                    session_id,
+                    &inbound_cipher,
+                    &mut expected_inbound_sequence,
+                    &mut clipboard,
+                ).await?;
+            }
             event = input_receiver.recv() => {
                 let Some(event) = event else { break; };
-                send_input_event(
+                send_controller_message(
                     &mut transport,
                     session_id,
-                    input_sequence,
-                    &input_cipher,
-                    event,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    Message::Input(event),
                 ).await?;
-                input_sequence = input_sequence
-                    .checked_add(1)
-                    .context("input sequence space exhausted")?;
-                continue;
             }
-        };
-        let bytes = match relay_message {
-            RelayServerMessage::Payload(payload) => payload,
-            RelayServerMessage::Heartbeat { nonce } => {
-                let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
-                transport
-                    .send(Bytes::from(encode_wire(&acknowledgement)?))
-                    .await?;
-                continue;
+            _ = clipboard_interval.tick(), if clipboard.is_enabled() => {
+                match clipboard.poll() {
+                    Ok(Some(message)) => send_controller_message(
+                        &mut transport,
+                        session_id,
+                        &outbound_cipher,
+                        &mut outbound_sequence,
+                        Message::Clipboard(message),
+                    ).await?,
+                    Ok(None) => {}
+                    Err(error) => warn!(event = "clipboard_poll_failed", %error),
+                }
             }
-            RelayServerMessage::HeartbeatAck { .. }
-            | RelayServerMessage::WaitingForPeer { .. }
-            | RelayServerMessage::PeerReady => continue,
-            RelayServerMessage::SessionClosed { reason } => {
-                anyhow::bail!("relay session closed: {reason:?}");
-            }
-            RelayServerMessage::ProtocolError { code, message } => {
-                anyhow::bail!("relay protocol error {code:?}: {message}");
-            }
-        };
-        emit_video_payload(&app, &bytes, session_id, &video_cipher)?;
+        }
     }
     let _result = transport
         .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
@@ -336,34 +349,98 @@ async fn receive_video(
     Ok(())
 }
 
-fn emit_video_payload(
+async fn handle_relay_message(
+    app: &AppHandle,
+    transport: &mut QuicFrameConnection,
+    message: RelayServerMessage,
+    session_id: SessionId,
+    inbound_cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+) -> anyhow::Result<()> {
+    match message {
+        RelayServerMessage::Payload(payload) => handle_agent_payload(
+            app,
+            &payload,
+            session_id,
+            inbound_cipher,
+            expected_sequence,
+            clipboard,
+        ),
+        RelayServerMessage::Heartbeat { nonce } => {
+            let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+            transport
+                .send(Bytes::from(encode_wire(&acknowledgement)?))
+                .await?;
+            Ok(())
+        }
+        RelayServerMessage::HeartbeatAck { .. }
+        | RelayServerMessage::WaitingForPeer { .. }
+        | RelayServerMessage::PeerReady => Ok(()),
+        RelayServerMessage::SessionClosed { reason } => {
+            anyhow::bail!("relay session closed: {reason:?}");
+        }
+        RelayServerMessage::ProtocolError { code, message } => {
+            anyhow::bail!("relay protocol error {code:?}: {message}");
+        }
+    }
+}
+
+fn handle_agent_payload(
     app: &AppHandle,
     bytes: &[u8],
     session_id: SessionId,
     cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
 ) -> anyhow::Result<()> {
     if bytes.len() < 8 {
-        anyhow::bail!("encrypted video frame is missing its sequence number");
+        anyhow::bail!("encrypted Agent payload is missing its sequence number");
     }
     let sequence = u64::from_be_bytes(
         bytes[..8]
             .try_into()
-            .context("read encrypted video sequence")?,
+            .context("read encrypted Agent sequence")?,
     );
+    if sequence != *expected_sequence {
+        anyhow::bail!(
+            "unexpected Agent sequence {sequence}; expected {}",
+            *expected_sequence
+        );
+    }
     let plaintext = cipher
         .open(sequence, &bytes[8..])
-        .context("authenticate and decrypt video envelope")?;
+        .context("authenticate and decrypt Agent envelope")?;
     let envelope: MessageEnvelope = decode_wire(&plaintext).context("decode protocol envelope")?;
     envelope.validate()?;
     if envelope.session_id != session_id {
-        anyhow::bail!("received a frame for a different session");
+        anyhow::bail!("received an Agent message for a different session");
     }
     if envelope.sequence != sequence {
-        anyhow::bail!("encrypted frame sequence does not match its envelope");
+        anyhow::bail!("encrypted Agent sequence does not match its envelope");
     }
-    let Message::Video(frame) = envelope.message else {
-        return Ok(());
-    };
+    match envelope.message {
+        Message::Video(frame) => emit_video_frame(app, sequence, frame)?,
+        Message::Clipboard(message) => match clipboard.apply(message) {
+            Ok(_) => {}
+            Err(ClipboardError::PermissionDenied) => {
+                warn!(event = "clipboard_permission_denied", %session_id);
+            }
+            Err(error) => return Err(error.into()),
+        },
+        _ => anyhow::bail!("Agent sent a message not allowed in its data direction"),
+    }
+    *expected_sequence = expected_sequence
+        .checked_add(1)
+        .context("Agent inbound sequence space exhausted")?;
+    Ok(())
+}
+
+fn emit_video_frame(
+    app: &AppHandle,
+    sequence: u64,
+    frame: EncodedVideoFrame,
+) -> anyhow::Result<()> {
     let mime_type = match frame.codec {
         VideoCodec::Jpeg => "image/jpeg",
         VideoCodec::WebP => "image/webp",
@@ -371,7 +448,7 @@ fn emit_video_payload(
     app.emit(
         "video-frame",
         VideoFrameEvent {
-            sequence: envelope.sequence,
+            sequence,
             width: frame.width,
             height: frame.height,
             source_timestamp_ms: frame.source_timestamp_ms,
@@ -382,25 +459,28 @@ fn emit_video_payload(
     Ok(())
 }
 
-async fn send_input_event(
+async fn send_controller_message(
     transport: &mut QuicFrameConnection,
     session_id: SessionId,
-    sequence: u64,
     cipher: &XChaChaSessionCipher,
-    event: InputEvent,
+    sequence: &mut u64,
+    message: Message,
 ) -> anyhow::Result<()> {
-    let envelope = MessageEnvelope::new(session_id, sequence, now_ms()?, Message::Input(event));
+    let envelope = MessageEnvelope::new(session_id, *sequence, now_ms()?, message);
     let plaintext = encode_wire(&envelope)?;
     let ciphertext = cipher
-        .seal(sequence, &plaintext)
-        .context("encrypt input envelope")?;
+        .seal(*sequence, &plaintext)
+        .context("encrypt Controller envelope")?;
     let mut payload = Vec::with_capacity(8 + ciphertext.len());
-    payload.extend_from_slice(&sequence.to_be_bytes());
+    payload.extend_from_slice(&(*sequence).to_be_bytes());
     payload.extend_from_slice(&ciphertext);
     let relay_message = RelayClientMessage::Payload(payload);
     transport
         .send(Bytes::from(encode_wire(&relay_message)?))
         .await?;
+    *sequence = sequence
+        .checked_add(1)
+        .context("Controller outbound sequence space exhausted")?;
     Ok(())
 }
 

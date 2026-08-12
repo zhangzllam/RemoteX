@@ -3,6 +3,7 @@ members = [
     "apps/agent",
     "apps/desktop",
     "crates/capture",
+    "crates/clipboard",
     "crates/crypto",
     "crates/file-transfer",
     "crates/input",
@@ -32,6 +33,7 @@ hex = "0.4.3"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls-pemfile = "2.2.0"
 remotex-capture = { path = "crates/capture" }
+remotex-clipboard = { path = "crates/clipboard" }
 remotex-crypto = { path = "crates/crypto" }
 remotex-file-transfer = { path = "crates/file-transfer" }
 remotex-input = { path = "crates/input" }

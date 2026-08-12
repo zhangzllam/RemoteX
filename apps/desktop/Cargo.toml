@@ -12,6 +12,7 @@ base64.workspace = true
 bytes.workspace = true
 hex.workspace = true
 quinn.workspace = true
+remotex-clipboard.workspace = true
 remotex-crypto.workspace = true
 remotex-input.workspace = true
 remotex-protocol.workspace = true

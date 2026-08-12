@@ -211,6 +211,24 @@ style total order resolves simultaneous initial values deterministically and
 both peers converge. Images, HTML, file clipboard formats, and clipboard content
 logging are excluded.
 
+## M11 direct data path
+
+The Control Server stores the bounded candidate set from signed Agent
+heartbeats and returns it with Controller credentials. Relay remains the
+authorization rendezvous. After both authorized roles pair, they attempt a
+three-second direct upgrade, preferring LAN over a configured public UDP mapping.
+
+```text
+Control authorization -> Relay pairing -> authenticated direct QUIC
+                                      \-> Relay fallback
+```
+
+Direct TLS uses a CA-trusted Agent certificate and an application handshake
+uses HMAC-SHA256 proofs derived from the E2EE Session key, role-separated and
+bound to fresh nonces and the Session ID. Direct and Relay paths expose the same
+bounded `Connection` interface, so video, input, clipboard, and files cannot
+bypass their existing permission or encryption boundaries.
+
 ## M10 video pipeline
 
 After the E2EE path is ready, the Controller advertises H.264, JPEG, and WebP.

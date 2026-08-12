@@ -8,7 +8,7 @@ use anyhow::Context;
 #[cfg(windows)]
 use bytes::Bytes;
 #[cfg(windows)]
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, ServerConfig};
 #[cfg(windows)]
 use remotex_capture::{CaptureError, DxgiCapture, MonitorId, MonitorInfo, ScreenCapture};
 #[cfg(windows)]
@@ -30,16 +30,20 @@ use remotex_input::{
 #[cfg(windows)]
 use remotex_protocol::{
     AuthorizationDecision, ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin,
-    ConnectionType, ControlMessage, DeviceAuthProof, DeviceHeartbeatRequest, DeviceId,
-    DevicePlatform, DeviceRegistrationRequest, DeviceRegistrationResponse, DisplayId,
-    FileTransferDirection, FileTransferErrorCode, FileTransferMessage, IncomingSessionRequest,
-    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage, RelayServerMessage,
-    ReportSessionEventRequest, ResolveSessionAuthorizationRequest,
-    ResolveSessionAuthorizationResponse, Role, SessionAuditEventKind, SessionCredentials,
-    SessionId, SessionPermissions, SessionToken, TransferId, decode_wire, encode_wire,
+    ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind, ControlMessage,
+    DeviceAuthProof, DeviceHeartbeatRequest, DeviceId, DevicePlatform, DeviceRegistrationRequest,
+    DeviceRegistrationResponse, DisplayId, FileTransferDirection, FileTransferErrorCode,
+    FileTransferMessage, IncomingSessionRequest, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope,
+    RelayClientMessage, RelayServerMessage, ReportSessionEventRequest,
+    ResolveSessionAuthorizationRequest, ResolveSessionAuthorizationResponse, Role,
+    SessionAuditEventKind, SessionCredentials, SessionId, SessionPermissions, SessionToken,
+    TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
-use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
+use remotex_transport::{
+    Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, DirectPeerConnection,
+    QuicFrameConnection, authenticate_direct_server,
+};
 #[cfg(windows)]
 use remotex_video::SessionVideoEncoder;
 #[cfg(windows)]
@@ -48,7 +52,7 @@ use rustls::RootCertStore;
 use std::{
     fs::{File, OpenOptions},
     io::BufReader,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -57,7 +61,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(windows)]
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 #[cfg(windows)]
 use tokio::time::MissedTickBehavior;
 #[cfg(windows)]
@@ -82,6 +86,16 @@ struct ManagedAgentConfig {
     unattended_access: bool,
     unattended_secret: Option<String>,
     file_roots: Vec<AllowedRoot>,
+    direct: Option<DirectServerSettings>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct DirectServerSettings {
+    bind: SocketAddr,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    candidates: Vec<ConnectivityCandidate>,
 }
 
 #[cfg(windows)]
@@ -100,6 +114,7 @@ struct AgentConfig {
     file_upload_permission: bool,
     file_download_permission: bool,
     file_roots: Vec<AllowedRoot>,
+    direct: Option<DirectServerSettings>,
 }
 
 #[cfg(windows)]
@@ -144,6 +159,15 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 #[allow(clippy::too_many_lines)]
 async fn run_agent_session(config: AgentConfig) -> anyhow::Result<u64> {
+    run_agent_session_with_report(config, None).await
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
+async fn run_agent_session_with_report(
+    config: AgentConfig,
+    connection_report: Option<oneshot::Sender<ConnectionType>>,
+) -> anyhow::Result<u64> {
     let AgentConfig {
         relay_address,
         server_name,
@@ -158,6 +182,7 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<u64> {
         file_upload_permission,
         file_download_permission,
         file_roots,
+        direct,
     } = config;
     let outbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
@@ -213,19 +238,40 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<u64> {
         .await
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
-    let mut transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut relay_transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
     let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
         session_id,
         Role::Agent,
         token,
     ));
-    transport.send(Bytes::from(encode_wire(&hello)?)).await?;
-    wait_for_peer(&mut transport, session_id).await?;
-    info!(%session_id, %relay_address, "remote session active");
+    relay_transport
+        .send(Bytes::from(encode_wire(&hello)?))
+        .await?;
+    wait_for_peer(&mut relay_transport, session_id).await?;
+    let mut direct_endpoint = None;
+    let (mut transport, connection_type): (Box<dyn Connection>, ConnectionType) =
+        if let Some(settings) = direct {
+            match accept_direct_connection(&settings, session_id, &end_to_end_key).await {
+                Ok((endpoint, connection, connection_type)) => {
+                    direct_endpoint = Some(endpoint);
+                    (Box::new(connection), connection_type)
+                }
+                Err(error) => {
+                    warn!(event = "direct_connection_failed", %session_id, %error);
+                    (Box::new(relay_transport), ConnectionType::Relay)
+                }
+            }
+        } else {
+            (Box::new(relay_transport), ConnectionType::Relay)
+        };
+    if let Some(report) = connection_report {
+        let _result = report.send(connection_type);
+    }
+    info!(%session_id, %relay_address, ?connection_type, "remote session active");
     windows_authorization::set_active_session_title(Some(session_id));
 
     let session_result = run_active_session(
-        &mut transport,
+        transport.as_mut(),
         &mut capture,
         &mut input,
         &mut clipboard,
@@ -247,6 +293,9 @@ async fn run_agent_session(config: AgentConfig) -> anyhow::Result<u64> {
     let capture_result = capture.stop();
     let close_result = transport.close().await;
     client_endpoint.close(0_u32.into(), b"agent stopped");
+    if let Some(endpoint) = direct_endpoint {
+        endpoint.close(0_u32.into(), b"direct Session stopped");
+    }
     let bytes_transferred = session_result?;
     release_result?;
     capture_result?;
@@ -283,6 +332,10 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
     info!(%device_id, "device registered with control server");
 
     let nonce = Arc::new(AtomicU64::new(now_ms()?));
+    let connectivity_candidates = config
+        .direct
+        .as_ref()
+        .map_or_else(Vec::new, |direct| direct.candidates.clone());
     let heartbeat_task = tokio::spawn(run_managed_heartbeats(
         client.clone(),
         config.control_url.clone(),
@@ -290,6 +343,7 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
         Arc::clone(&identity),
         Arc::clone(&nonce),
         config.local_permissions,
+        connectivity_candidates,
     ));
     loop {
         tokio::select! {
@@ -386,6 +440,16 @@ async fn handle_incoming_session(
         return Ok(());
     };
     let session_id = credentials.session_id;
+    let session = managed_session_config(config, credentials)?;
+    let (connection_sender, connection_receiver) = oneshot::channel();
+    let session_future = run_agent_session_with_report(session, Some(connection_sender));
+    tokio::pin!(session_future);
+    let connection_type = tokio::select! {
+        selected = connection_receiver => selected.context("Session ended before selecting a transport")?,
+        result = &mut session_future => {
+            return result.map(|_| ());
+        }
+    };
     report_managed_session_event(
         client,
         &config.control_url,
@@ -394,12 +458,12 @@ async fn handle_incoming_session(
         nonce,
         session_id,
         SessionAuditEventKind::Started,
+        connection_type,
         0,
         "active",
     )
     .await?;
-    let session = managed_session_config(config, credentials)?;
-    let (bytes_transferred, result) = match run_agent_session(session).await {
+    let (bytes_transferred, result) = match session_future.await {
         Ok(bytes_transferred) => (bytes_transferred, "disconnected"),
         Err(error) => {
             warn!(event = "managed_session_ended_with_error", %error);
@@ -414,6 +478,7 @@ async fn handle_incoming_session(
         nonce,
         session_id,
         SessionAuditEventKind::Ended,
+        connection_type,
         bytes_transferred,
         result,
     )
@@ -428,6 +493,7 @@ async fn run_managed_heartbeats(
     identity: Arc<Ed25519DeviceIdentity>,
     nonce: Arc<AtomicU64>,
     capabilities: SessionPermissions,
+    connectivity_candidates: Vec<ConnectivityCandidate>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -439,6 +505,7 @@ async fn run_managed_heartbeats(
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 platform: DevicePlatform::Windows,
                 capabilities,
+                connectivity_candidates: connectivity_candidates.clone(),
             },
             Err(error) => {
                 warn!(event = "heartbeat_sign_failed", %error);
@@ -519,6 +586,7 @@ async fn report_managed_session_event(
     nonce: &AtomicU64,
     session_id: SessionId,
     kind: SessionAuditEventKind,
+    connection_type: ConnectionType,
     bytes_transferred: u64,
     result: &str,
 ) -> anyhow::Result<()> {
@@ -530,7 +598,7 @@ async fn report_managed_session_event(
     let request = ReportSessionEventRequest {
         proof: signed_proof(identity, &action, device_id, nonce)?,
         kind,
-        connection_type: ConnectionType::Relay,
+        connection_type,
         bytes_transferred,
         result: result.to_owned(),
     };
@@ -577,6 +645,7 @@ fn managed_session_config(
         file_download_permission: credentials.permissions.file_download
             && config.local_permissions.file_download,
         file_roots: config.file_roots.clone(),
+        direct: config.direct.clone(),
     })
 }
 
@@ -645,7 +714,7 @@ fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity>
 
 #[cfg(windows)]
 async fn run_active_session(
-    transport: &mut QuicFrameConnection,
+    transport: &mut dyn Connection,
     capture: &mut DxgiCapture,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
@@ -746,7 +815,7 @@ async fn run_active_session(
 
 #[cfg(windows)]
 async fn send_agent_message(
-    transport: &mut QuicFrameConnection,
+    transport: &mut dyn Connection,
     session_id: SessionId,
     cipher: &XChaChaSessionCipher,
     sequence: &mut u64,
@@ -807,6 +876,7 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         file_upload_permission,
         file_download_permission,
         file_roots,
+        direct: None,
     })
 }
 
@@ -850,6 +920,7 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
     } else {
         None
     };
+    let direct = load_direct_settings()?;
     Ok(Some(ManagedAgentConfig {
         control_url,
         identity_path: PathBuf::from(required("REMOTEX_IDENTITY_PATH")?),
@@ -861,7 +932,83 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         unattended_access,
         unattended_secret,
         file_roots,
+        direct,
     }))
+}
+
+#[cfg(windows)]
+fn load_direct_settings() -> anyhow::Result<Option<DirectServerSettings>> {
+    let certificate = std::env::var("REMOTEX_DIRECT_CERT");
+    let private_key = std::env::var("REMOTEX_DIRECT_KEY");
+    let (certificate, private_key) = match (certificate, private_key) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            return Ok(None);
+        }
+        (Ok(certificate), Ok(private_key)) => (certificate, private_key),
+        _ => {
+            anyhow::bail!("REMOTEX_DIRECT_CERT and REMOTEX_DIRECT_KEY must be configured together")
+        }
+    };
+    let bind: SocketAddr = std::env::var("REMOTEX_DIRECT_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:7444".to_owned())
+        .parse()
+        .context("parse REMOTEX_DIRECT_BIND")?;
+    if bind.port() == 0 {
+        anyhow::bail!("REMOTEX_DIRECT_BIND must use a fixed nonzero port");
+    }
+    let server_name = required("REMOTEX_DIRECT_SERVER_NAME")?;
+    let mut candidates = Vec::new();
+    let lan_address = match std::env::var("REMOTEX_DIRECT_LAN_ADDRESS") {
+        Ok(value) => Some(value.parse().context("parse REMOTEX_DIRECT_LAN_ADDRESS")?),
+        Err(std::env::VarError::NotPresent) => discover_lan_address(bind.port()),
+        Err(error) => return Err(error).context("read REMOTEX_DIRECT_LAN_ADDRESS"),
+    };
+    if let Some(address) = lan_address {
+        candidates.push(ConnectivityCandidate {
+            kind: ConnectivityCandidateKind::Lan,
+            address: address.to_string(),
+            server_name: server_name.clone(),
+            priority: 200,
+        });
+    }
+    match std::env::var("REMOTEX_DIRECT_PUBLIC_ADDRESS") {
+        Ok(value) => {
+            let address: SocketAddr = value
+                .parse()
+                .context("parse REMOTEX_DIRECT_PUBLIC_ADDRESS")?;
+            candidates.push(ConnectivityCandidate {
+                kind: ConnectivityCandidateKind::ServerReflexive,
+                address: address.to_string(),
+                server_name,
+                priority: 100,
+            });
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(error).context("read REMOTEX_DIRECT_PUBLIC_ADDRESS"),
+    }
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "direct connectivity needs a discovered LAN address or REMOTEX_DIRECT_PUBLIC_ADDRESS"
+        );
+    }
+    for candidate in &candidates {
+        candidate.validate()?;
+    }
+    Ok(Some(DirectServerSettings {
+        bind,
+        certificate_path: PathBuf::from(certificate),
+        private_key_path: PathBuf::from(private_key),
+        candidates,
+    }))
+}
+
+#[cfg(windows)]
+fn discover_lan_address(port: u16) -> Option<SocketAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let address = socket.local_addr().ok()?;
+    (!address.ip().is_unspecified() && !address.ip().is_loopback())
+        .then(|| SocketAddr::new(address.ip(), port))
 }
 
 #[cfg(windows)]
@@ -921,7 +1068,7 @@ async fn wait_for_peer(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_relay_message(
-    transport: &mut QuicFrameConnection,
+    transport: &mut dyn Connection,
     message: RelayServerMessage,
     session_id: SessionId,
     inbound_cipher: &XChaChaSessionCipher,
@@ -1436,6 +1583,87 @@ fn client_endpoint(certificate_path: &Path) -> anyhow::Result<Endpoint> {
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
+}
+
+#[cfg(windows)]
+async fn accept_direct_connection(
+    settings: &DirectServerSettings,
+    session_id: SessionId,
+    session_key: &[u8; 32],
+) -> anyhow::Result<(Endpoint, DirectPeerConnection, ConnectionType)> {
+    let server_config =
+        direct_server_config(&settings.certificate_path, &settings.private_key_path)?;
+    let endpoint =
+        Endpoint::server(server_config, settings.bind).context("bind direct endpoint")?;
+    let (connection, remote_address) =
+        tokio::time::timeout(DEFAULT_DIRECT_ATTEMPT_TIMEOUT, async {
+            for _ in 0..8 {
+                let incoming = endpoint.accept().await.context("direct endpoint closed")?;
+                let connection = match incoming.await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        warn!(event = "direct_quic_handshake_failed", %error);
+                        continue;
+                    }
+                };
+                let remote_address = connection.remote_address();
+                let (send, receive) = match connection.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(error) => {
+                        warn!(event = "direct_stream_open_failed", %error);
+                        continue;
+                    }
+                };
+                let mut framed = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+                match authenticate_direct_server(&mut framed, session_id, session_key).await {
+                    Ok(()) => return Ok((framed, remote_address)),
+                    Err(error) => warn!(event = "direct_peer_authentication_failed", %error),
+                }
+            }
+            anyhow::bail!("direct authentication attempt limit reached")
+        })
+        .await
+        .context("direct connection attempt timed out")??;
+    let connection_type = if is_private_address(remote_address.ip()) {
+        ConnectionType::Lan
+    } else {
+        ConnectionType::Direct
+    };
+    Ok((
+        endpoint,
+        DirectPeerConnection::new(connection),
+        connection_type,
+    ))
+}
+
+#[cfg(windows)]
+fn direct_server_config(certificate: &Path, private_key: &Path) -> anyhow::Result<ServerConfig> {
+    let mut certificate_reader = BufReader::new(
+        File::open(certificate)
+            .with_context(|| format!("open direct certificate {}", certificate.display()))?,
+    );
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("read direct certificate chain")?;
+    if certificates.is_empty() {
+        anyhow::bail!("direct certificate file contains no certificates");
+    }
+    let mut key_reader = BufReader::new(
+        File::open(private_key)
+            .with_context(|| format!("open direct private key {}", private_key.display()))?,
+    );
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("read direct private key")?
+        .context("direct private-key file contains no supported key")?;
+    ServerConfig::with_single_cert(certificates, key).context("build direct TLS configuration")
+}
+
+#[cfg(windows)]
+const fn is_private_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_private() || address.is_loopback(),
+        IpAddr::V6(address) => address.is_unique_local() || address.is_loopback(),
+    }
 }
 
 #[cfg(windows)]

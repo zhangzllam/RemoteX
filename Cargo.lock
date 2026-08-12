@@ -3492,7 +3492,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "hmac",
  "quinn",
+ "rand 0.9.5",
+ "rcgen",
+ "remotex-protocol",
+ "rustls",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
 ]

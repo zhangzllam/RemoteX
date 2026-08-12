@@ -9,11 +9,17 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+hmac.workspace = true
 quinn.workspace = true
+rand.workspace = true
+remotex-protocol.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rcgen = "0.14.5"
+rustls.workspace = true
 
 [lints]
 workspace = true

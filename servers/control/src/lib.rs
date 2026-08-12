@@ -176,6 +176,7 @@ impl ControlService {
         request: DeviceHeartbeatRequest,
         now_ms: u64,
     ) -> Result<(), ControlError> {
+        validate_candidates(&request.connectivity_candidates)?;
         self.authenticate_device(device_id, "heartbeat", &request.proof, now_ms)
             .await?;
         self.repository.heartbeat(device_id, &request, now_ms).await
@@ -248,6 +249,7 @@ impl ControlService {
             end_to_end_key,
             expires_at_ms,
             permissions,
+            device.record.connectivity_candidates,
         ))
     }
 
@@ -330,6 +332,7 @@ impl ControlService {
                 e2e_key,
                 resolved.expires_at_ms,
                 permissions,
+                Vec::new(),
             ))
         } else {
             None
@@ -413,6 +416,7 @@ impl ControlService {
         end_to_end_key: [u8; 32],
         expires_at_ms: u64,
         permissions: SessionPermissions,
+        peer_candidates: Vec<remotex_protocol::ConnectivityCandidate>,
     ) -> SessionCredentials {
         SessionCredentials {
             session_id,
@@ -422,6 +426,7 @@ impl ControlService {
             end_to_end_key_hex: hex::encode(end_to_end_key),
             expires_at_ms,
             permissions,
+            peer_candidates,
         }
     }
 }
@@ -565,7 +570,8 @@ impl IntoResponse for ControlError {
             | Self::InvalidRegistration
             | Self::InvalidName
             | Self::InvalidResult
-            | Self::InvalidSecret => (StatusCode::BAD_REQUEST, "invalid_request"),
+            | Self::InvalidSecret
+            | Self::InvalidCandidate => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::DeviceNotFound => (StatusCode::NOT_FOUND, "device_not_found"),
             Self::DeviceOffline => (StatusCode::CONFLICT, "device_offline"),
             Self::StaleProof | Self::ReplayedProof | Self::Authentication => {
@@ -599,6 +605,8 @@ pub enum ControlError {
     InvalidResult,
     #[error("unattended-access secret is invalid")]
     InvalidSecret,
+    #[error("connectivity candidate is invalid")]
+    InvalidCandidate,
     #[error("device was not found")]
     DeviceNotFound,
     #[error("device is offline")]
@@ -628,6 +636,7 @@ impl ControlError {
             Self::InvalidName => "name is invalid",
             Self::InvalidResult => "session result is invalid",
             Self::InvalidSecret => "unattended-access secret is invalid",
+            Self::InvalidCandidate => "connectivity candidate is invalid",
             Self::DeviceNotFound => "device was not found",
             Self::DeviceOffline => "device is offline",
             Self::StaleProof | Self::ReplayedProof | Self::Authentication => {
@@ -681,7 +690,7 @@ impl ControlRepository for PostgresRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| ControlError::Persistence)?;
-        let row = sqlx::query("SELECT device_id, public_key, device_name, platform, agent_version, capabilities_json, last_seen_ms, last_auth_nonce FROM devices WHERE public_key=$1")
+        let row = sqlx::query("SELECT device_id, public_key, device_name, platform, agent_version, capabilities_json, connectivity_candidates_json, last_seen_ms, last_auth_nonce FROM devices WHERE public_key=$1")
             .bind(&request.public_key)
             .fetch_one(&self.pool)
             .await
@@ -690,7 +699,7 @@ impl ControlRepository for PostgresRepository {
     }
 
     async fn get_device(&self, device_id: &DeviceId) -> Result<Option<StoredDevice>, ControlError> {
-        let row = sqlx::query("SELECT device_id, public_key, device_name, platform, agent_version, capabilities_json, last_seen_ms, last_auth_nonce FROM devices WHERE device_id=$1")
+        let row = sqlx::query("SELECT device_id, public_key, device_name, platform, agent_version, capabilities_json, connectivity_candidates_json, last_seen_ms, last_auth_nonce FROM devices WHERE device_id=$1")
             .bind(device_id.as_str())
             .fetch_optional(&self.pool)
             .await
@@ -706,12 +715,15 @@ impl ControlRepository for PostgresRepository {
     ) -> Result<(), ControlError> {
         let capabilities =
             serde_json::to_string(&request.capabilities).map_err(|_| ControlError::Persistence)?;
-        let result = sqlx::query("UPDATE devices SET last_seen_ms=$2, agent_version=$3, platform=$4, capabilities_json=$5 WHERE device_id=$1")
+        let candidates = serde_json::to_string(&request.connectivity_candidates)
+            .map_err(|_| ControlError::Persistence)?;
+        let result = sqlx::query("UPDATE devices SET last_seen_ms=$2, agent_version=$3, platform=$4, capabilities_json=$5, connectivity_candidates_json=$6 WHERE device_id=$1")
             .bind(device_id.as_str())
             .bind(i64_value(now_ms)?)
             .bind(&request.agent_version)
             .bind(platform_text(request.platform))
             .bind(capabilities)
+            .bind(candidates)
             .execute(&self.pool)
             .await
             .map_err(|_| ControlError::Persistence)?;
@@ -899,6 +911,9 @@ fn stored_device_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredDevice, C
     let capabilities: String = row
         .try_get("capabilities_json")
         .map_err(|_| ControlError::Persistence)?;
+    let candidates: String = row
+        .try_get("connectivity_candidates_json")
+        .map_err(|_| ControlError::Persistence)?;
     Ok(StoredDevice {
         record: DeviceRecord {
             device_id: DeviceId::new(
@@ -915,6 +930,8 @@ fn stored_device_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredDevice, C
                 .try_get("agent_version")
                 .map_err(|_| ControlError::Persistence)?,
             capabilities: serde_json::from_str(&capabilities)
+                .map_err(|_| ControlError::Persistence)?,
+            connectivity_candidates: serde_json::from_str(&candidates)
                 .map_err(|_| ControlError::Persistence)?,
             last_seen_ms: u64_value(
                 row.try_get("last_seen_ms")
@@ -991,6 +1008,7 @@ impl ControlRepository for MemoryRepository {
                 platform: request.platform,
                 agent_version: request.agent_version.clone(),
                 capabilities: request.capabilities,
+                connectivity_candidates: Vec::new(),
                 last_seen_ms: now_ms,
                 online: true,
             },
@@ -1029,6 +1047,10 @@ impl ControlRepository for MemoryRepository {
             .clone_from(&request.agent_version);
         device.record.platform = request.platform;
         device.record.capabilities = request.capabilities;
+        device
+            .record
+            .connectivity_candidates
+            .clone_from(&request.connectivity_candidates);
         Ok(())
     }
 
@@ -1154,6 +1176,19 @@ fn validate_registration(request: &DeviceRegistrationRequest) -> Result<(), Cont
 fn validate_name(name: &str) -> Result<(), ControlError> {
     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
         return Err(ControlError::InvalidName);
+    }
+    Ok(())
+}
+
+fn validate_candidates(
+    candidates: &[remotex_protocol::ConnectivityCandidate],
+) -> Result<(), ControlError> {
+    if candidates.len() > remotex_protocol::MAX_CONNECTIVITY_CANDIDATES
+        || candidates
+            .iter()
+            .any(|candidate| candidate.validate().is_err())
+    {
+        return Err(ControlError::InvalidCandidate);
     }
     Ok(())
 }
@@ -1317,6 +1352,7 @@ mod tests {
             agent_version: "0.1.0".into(),
             platform: DevicePlatform::Windows,
             capabilities: capabilities(),
+            connectivity_candidates: Vec::new(),
         };
         service
             .heartbeat(&device_id, request.clone(), 1_050)
@@ -1340,6 +1376,44 @@ mod tests {
                 .expect("device")
                 .online
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_candidates_are_validated_and_issued_to_controller() {
+        let (service, identity, device_id) = enrolled().await;
+        let candidate = remotex_protocol::ConnectivityCandidate {
+            kind: remotex_protocol::ConnectivityCandidateKind::Lan,
+            address: "192.168.1.20:7444".to_owned(),
+            server_name: "direct.example.test".to_owned(),
+            priority: 200,
+        };
+        service
+            .heartbeat(
+                &device_id,
+                DeviceHeartbeatRequest {
+                    proof: proof(&identity, "heartbeat", &device_id, 1_020, 1),
+                    agent_version: "0.1.0".into(),
+                    platform: DevicePlatform::Windows,
+                    capabilities: capabilities(),
+                    connectivity_candidates: vec![candidate.clone()],
+                },
+                1_020,
+            )
+            .await
+            .expect("advertise direct candidate");
+        let credentials = service
+            .create_session(
+                CreateSessionRequest {
+                    device_id,
+                    controller_name: "Controller".into(),
+                    requested_permissions: capabilities(),
+                    unattended_secret: None,
+                },
+                1_030,
+            )
+            .await
+            .expect("create direct-capable Session");
+        assert_eq!(credentials.peer_candidates, vec![candidate]);
     }
 
     #[tokio::test]

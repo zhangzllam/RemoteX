@@ -159,6 +159,21 @@ both values to match. Nonces are direction-separated and derived from the
 Session ID plus sequence; sequences must never repeat for a session key and
 direction.
 
+## M11 connectivity extension
+
+`DeviceHeartbeatRequest` publishes at most 16 validated `Lan` or
+`ServerReflexive` candidates. `SessionCredentials.peer_candidates` returns the
+current Agent candidates only to the requesting Controller. Each candidate has
+a numeric socket address, TLS server name, and priority; LAN candidates are
+attempted first.
+
+After Relay authorization, `DirectClientHello` and `DirectServerHello` perform
+mutual HMAC-SHA256 authentication with fresh 256-bit nonces. Proofs bind the
+protocol version, role, Session ID, and both nonces to the E2EE Session key.
+Direct application frames retain the same encrypted envelope and outer payload
+semantics as Relay frames. The bounded attempt window always leaves Relay as a
+fallback.
+
 ## M10 video extension
 
 M10 extends `EncodedVideoFrame` with frame ID, FPS, bitrate, capture/encode

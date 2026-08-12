@@ -11,13 +11,17 @@ use remotex_file_transfer::{
 };
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    ClipboardOrigin, ControlMessage, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame,
-    FileEntry, FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
+    ClipboardOrigin, ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind,
+    ControlMessage, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame, FileEntry,
+    FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
     MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, MouseButton, RelayClientMessage,
     RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
     TransferId, VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
 };
-use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
+use remotex_transport::{
+    Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection,
+    connect_direct_candidates,
+};
 use remotex_video::{StreamDecoder, VideoDecoder};
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
@@ -78,6 +82,7 @@ struct ResolvedSession {
     token_hex: String,
     end_to_end_key_hex: String,
     permissions: SessionPermissions,
+    peer_candidates: Vec<ConnectivityCandidate>,
 }
 
 #[derive(Debug)]
@@ -553,15 +558,56 @@ async fn run_remote_session(
         .await
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
-    let mut transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut relay_transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
     let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
         session_id,
         Role::Controller,
         token,
     ));
-    transport.send(Bytes::from(encode_wire(&hello)?)).await?;
-    wait_for_peer(&app, &mut transport).await?;
-    emit_status(&app, "connected", "Remote peer ready");
+    relay_transport
+        .send(Bytes::from(encode_wire(&hello)?))
+        .await?;
+    wait_for_peer(&app, &mut relay_transport).await?;
+    let (mut transport, connection_type): (Box<dyn Connection>, ConnectionType) =
+        if resolved.peer_candidates.is_empty() {
+            (Box::new(relay_transport), ConnectionType::Relay)
+        } else {
+            emit_status(
+                &app,
+                "connecting",
+                "Relay ready · trying authenticated direct path",
+            );
+            match connect_direct_candidates(
+                &endpoint,
+                &resolved.peer_candidates,
+                session_id,
+                &end_to_end_key,
+                DEFAULT_DIRECT_ATTEMPT_TIMEOUT,
+            )
+            .await
+            {
+                Ok((connection, candidate_kind)) => {
+                    let connection_type = match candidate_kind {
+                        ConnectivityCandidateKind::Lan => ConnectionType::Lan,
+                        ConnectivityCandidateKind::ServerReflexive => ConnectionType::Direct,
+                    };
+                    (Box::new(connection), connection_type)
+                }
+                Err(error) => {
+                    warn!(event = "direct_connection_failed", %session_id, %error);
+                    (Box::new(relay_transport), ConnectionType::Relay)
+                }
+            }
+        };
+    emit_status(
+        &app,
+        "connected",
+        match connection_type {
+            ConnectionType::Lan => "Remote peer ready · Connection: LAN",
+            ConnectionType::Direct => "Remote peer ready · Connection: Direct",
+            ConnectionType::Relay => "Remote peer ready · Connection: Relay",
+        },
+    );
 
     let mut clipboard = PermissionedClipboard::new(
         WindowsClipboardBackend,
@@ -573,7 +619,7 @@ async fn run_remote_session(
     let mut video_decoder = StreamDecoder::new()?;
     let mut last_video_feedback_ms = 0_u64;
     send_controller_message(
-        &mut transport,
+        transport.as_mut(),
         session_id,
         &outbound_cipher,
         &mut outbound_sequence,
@@ -608,7 +654,7 @@ async fn run_remote_session(
                 let relay_message = decode_wire::<RelayServerMessage>(&result?)?;
                 let outcome = handle_relay_message(
                     &app,
-                    &mut transport,
+                    transport.as_mut(),
                     relay_message,
                     session_id,
                     &inbound_cipher,
@@ -625,7 +671,7 @@ async fn run_remote_session(
                     let current_ms = now_ms()?;
                     if current_ms.saturating_sub(last_video_feedback_ms) >= 1_000 {
                         send_controller_message(
-                            &mut transport,
+                            transport.as_mut(),
                             session_id,
                             &outbound_cipher,
                             &mut outbound_sequence,
@@ -638,7 +684,7 @@ async fn run_remote_session(
             event = input_receiver.recv(), if resolved.permissions.control_input => {
                 let Some(event) = event else { break; };
                 send_controller_message(
-                    &mut transport,
+                    transport.as_mut(),
                     session_id,
                     &outbound_cipher,
                     &mut outbound_sequence,
@@ -648,7 +694,7 @@ async fn run_remote_session(
             _ = clipboard_interval.tick(), if clipboard.is_enabled() => {
                 match clipboard.poll() {
                     Ok(Some(message)) => send_controller_message(
-                        &mut transport,
+                        transport.as_mut(),
                         session_id,
                         &outbound_cipher,
                         &mut outbound_sequence,
@@ -663,7 +709,7 @@ async fn run_remote_session(
                     anyhow::bail!("file service stopped unexpectedly");
                 };
                 send_controller_message(
-                    &mut transport,
+                    transport.as_mut(),
                     session_id,
                     &outbound_cipher,
                     &mut outbound_sequence,
@@ -696,6 +742,7 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
             token_hex: request.token_hex.clone(),
             end_to_end_key_hex: request.end_to_end_key_hex.clone(),
             permissions: requested_permissions,
+            peer_candidates: Vec::new(),
         });
     }
 
@@ -733,13 +780,14 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
         token_hex: response.role_token_hex,
         end_to_end_key_hex: response.end_to_end_key_hex,
         permissions: response.permissions,
+        peer_candidates: response.peer_candidates,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_relay_message(
     app: &AppHandle,
-    transport: &mut QuicFrameConnection,
+    transport: &mut dyn Connection,
     message: RelayServerMessage,
     session_id: SessionId,
     inbound_cipher: &XChaChaSessionCipher,
@@ -1311,7 +1359,7 @@ fn emit_file_error(app: &AppHandle, transfer_id: Option<TransferId>, message: &s
 }
 
 async fn send_controller_message(
-    transport: &mut QuicFrameConnection,
+    transport: &mut dyn Connection,
     session_id: SessionId,
     cipher: &XChaChaSessionCipher,
     sequence: &mut u64,

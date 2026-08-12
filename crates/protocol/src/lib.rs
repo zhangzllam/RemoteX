@@ -372,6 +372,8 @@ pub struct DeviceHeartbeatRequest {
     pub agent_version: String,
     pub platform: DevicePlatform,
     pub capabilities: SessionPermissions,
+    #[serde(default)]
+    pub connectivity_candidates: Vec<ConnectivityCandidate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -381,6 +383,8 @@ pub struct DeviceRecord {
     pub platform: DevicePlatform,
     pub agent_version: String,
     pub capabilities: SessionPermissions,
+    #[serde(default)]
+    pub connectivity_candidates: Vec<ConnectivityCandidate>,
     pub last_seen_ms: u64,
     pub online: bool,
 }
@@ -403,6 +407,56 @@ pub struct SessionCredentials {
     pub end_to_end_key_hex: String,
     pub expires_at_ms: u64,
     pub permissions: SessionPermissions,
+    #[serde(default)]
+    pub peer_candidates: Vec<ConnectivityCandidate>,
+}
+
+pub const MAX_CONNECTIVITY_CANDIDATES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityCandidateKind {
+    Lan,
+    ServerReflexive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectivityCandidate {
+    pub kind: ConnectivityCandidateKind,
+    pub address: String,
+    pub server_name: String,
+    pub priority: u16,
+}
+
+impl ConnectivityCandidate {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.address
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| ProtocolError::InvalidConnectivityCandidate)?;
+        if self.server_name.is_empty()
+            || self.server_name.len() > 253
+            || self.server_name.chars().any(char::is_control)
+        {
+            return Err(ProtocolError::InvalidConnectivityCandidate);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectClientHello {
+    pub version: u16,
+    pub session_id: SessionId,
+    pub client_nonce: [u8; 32],
+    pub proof: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectServerHello {
+    pub version: u16,
+    pub session_id: SessionId,
+    pub server_nonce: [u8; 32],
+    pub proof: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -816,6 +870,8 @@ pub enum ProtocolError {
     InvalidDeviceId,
     #[error("display ID must be 1-128 characters without control characters")]
     InvalidDisplayId,
+    #[error("connectivity candidate contains an invalid address or TLS server name")]
+    InvalidConnectivityCandidate,
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u16),
     #[error("message type does not match envelope channel")]

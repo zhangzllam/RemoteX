@@ -35,10 +35,11 @@ tests all pass.
 
 M10 is complete: negotiated OpenH264 software encoding, JPEG fallback,
 persistent decoding, bounded adaptive quality, frame telemetry, and a Controller
-debug overlay are implemented. The remaining milestones start at M11.
+debug overlay are implemented. M11 is also complete: validated LAN/public
+candidates, mutually authenticated direct QUIC, bounded upgrade attempts, audit
+telemetry, and automatic Relay fallback are implemented. The remaining
+milestones start at M12.
 
-- **M11 — Direct connectivity:** authenticated LAN/P2P attempts, bounded NAT
-  traversal, and reliable Relay fallback.
 - **M12 — Linux server Agent:** authorized PTY terminal, M7 Files reuse, system
   information, and documented visible service operation.
 - **M13 — Self-hosting:** Docker images, Compose stack, PostgreSQL isolation,

@@ -1,52 +1,30 @@
-# RemoteX Roadmap
+# RemoteX roadmap
 
-Work proceeds one milestone at a time. A milestone is complete only after its
-design, implementation, tests, documentation, formatting, linting, and existing
-tests all pass.
+RemoteX V1 is complete. Each milestone includes implementation, tests,
+documentation, formatting, linting, and integration into the final release.
 
-## Completed
+## Completed V1 milestones
 
-- **M0 — Foundation:** workspace boundaries, protocol, capability contracts,
-  and tests.
-- **M1 — Relay transport:** authenticated QUIC pairing, role-bound one-time
-  credentials, heartbeat, bounded opaque forwarding, and cleanup.
-- **M2 — Windows capture:** DXGI monitor enumeration, cursor composition, mode
-  recovery, and capture demo.
-- **M3 — Remote screen:** 720p JPEG stream, end-to-end encryption, relay path,
-  and Tauri/React display.
-- **M4 — Remote mouse:** normalized movement, buttons, wheel, future display ID,
-  explicit local input permission, `SendInput`, and input-state cleanup.
-- **M5 — Remote keyboard:** platform-neutral common keys and modifiers, focused
-  Controller capture, `SendInput`, ordered combinations, duplicate suppression,
-  and release on focus loss or Session cleanup.
-- **M6 — Clipboard:** opt-in bidirectional UTF-8 text, 1 MiB limit, independent
-  permission, loop prevention, simultaneous-change convergence, and tests.
-- **M7 — Files:** safe rooted directory browsing, directory creation, chunked
-  upload/download, bounded acknowledgement backpressure, cancellation, progress,
-  same-ID resume, and SHA-256 completion verification.
-- **M8 — Control server:** Ed25519 device enrollment, nine-digit Device IDs,
-  signed heartbeat and claims, PostgreSQL presence and Session records,
-  wrapped pending secrets, and short-lived one-time Relay credentials.
-- **M9 — Authorization:** foreground local accept/reject, Agent-enforced
-  per-capability grants, secret-gated opt-in unattended access, visible active
-  state with local disconnect, and signed lifecycle audit records.
-- **M10 — Adaptive video:** negotiated OpenH264 software encoding, JPEG
-  fallback, persistent decoding, bounded quality adaptation, and telemetry.
-- **M11 — Direct connectivity:** validated candidates, mutually authenticated
-  direct QUIC, bounded upgrade attempts, telemetry, and Relay fallback.
-- **M12 — Linux server Agent:** authorized bounded PTY terminals, M7 Files
-  reuse, read-only system information, visible operation, and opt-in systemd.
-- **M13 — Self-hosting:** unprivileged container images, isolated PostgreSQL,
-  Caddy TLS, secret files, health/readiness probes, JSON logs, and runbooks.
-- **M14 — Windows usability:** current-user NSIS packaging, bundled Agent,
-  opt-in autostart, settings, DPAPI secret storage, visible tray, and updater preparation.
+- **M0 — Foundation:** workspace, protocol, capability contracts, and tests.
+- **M1 — Relay:** authenticated QUIC pairing, bounded forwarding, and cleanup.
+- **M2 — Windows capture:** DXGI monitors, cursor, and mode recovery.
+- **M3 — Remote screen:** encrypted video through Relay and Tauri display.
+- **M4 — Mouse:** normalized input, permission enforcement, and state cleanup.
+- **M5 — Keyboard:** portable keys/modifiers, ordering, and release on cleanup.
+- **M6 — Clipboard:** opt-in bounded UTF-8 sync with loop prevention.
+- **M7 — Files:** rooted, resumable, checksummed upload and download.
+- **M8 — Control:** enrolled devices, signed presence, PostgreSQL, sessions.
+- **M9 — Authorization:** local consent, unattended opt-in, and audit records.
+- **M10 — Video:** adaptive OpenH264 with negotiated JPEG fallback.
+- **M11 — Direct:** authenticated candidate attempts and Relay fallback.
+- **M12 — Linux Agent:** PTY, rooted files, system information, and systemd.
+- **M13 — Self-hosting:** containers, PostgreSQL, Caddy, secrets, and runbooks.
+- **M14 — Windows usability:** NSIS, Agent sidecar, settings, tray, and DPAPI.
+- **M15 — Final review:** security/resource limits, malformed-input coverage,
+  dependency audit, lifecycle review, release automation, and V1 checklists.
 
-## Next
+## Possible V2 work
 
-The remaining milestone is M15.
-
-- **M15 — Final review:** systematic security/resource review, malformed-input
-  coverage, lifecycle cleanup tests, end-to-end validation, and V1 checklists.
-
-Mobile clients, macOS, audio, remote camera/printing, and unrelated V2 features
-remain outside the V1 plan.
+Mobile and macOS clients, audio, camera/printing, account management, full
+ICE/STUN/TURN traversal, signed auto-update infrastructure, and fleet policy are
+outside V1 and require separate design and threat review.

@@ -969,6 +969,7 @@ fn file_service_error(
         | FileTransferError::ChunkChecksumMismatch
         | FileTransferError::Incomplete { .. } => FileTransferErrorCode::InvalidChunk,
         FileTransferError::ChecksumMismatch => FileTransferErrorCode::ChecksumMismatch,
+        FileTransferError::TooManyTransfers => FileTransferErrorCode::Busy,
         FileTransferError::Io(_) => FileTransferErrorCode::Io,
         _ => FileTransferErrorCode::InvalidPath,
     };

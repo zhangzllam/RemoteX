@@ -2,6 +2,8 @@
 
 #[cfg(windows)]
 mod windows_authorization;
+#[cfg(windows)]
+mod windows_secrets;
 
 #[cfg(windows)]
 use anyhow::Context;
@@ -51,7 +53,7 @@ use rustls::RootCertStore;
 #[cfg(windows)]
 use std::{
     fs::{File, OpenOptions},
-    io::BufReader,
+    io::{BufReader, Read},
     net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::{
@@ -72,7 +74,10 @@ use tracing_subscriber::EnvFilter;
 #[cfg(windows)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredIdentity {
-    secret_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_secret_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_key_hex: Option<String>,
 }
 
 #[cfg(windows)]
@@ -706,15 +711,53 @@ fn signed_proof(
 
 #[cfg(windows)]
 fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
+    match File::open(path) {
+        Ok(file) => {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect device identity {}", path.display()))?;
+            anyhow::ensure!(
+                metadata.len() <= 64 * 1024,
+                "device identity file exceeds 64 KiB"
+            );
+            let capacity = usize::try_from(metadata.len()).context("identity size is invalid")?;
+            let mut bytes = Vec::with_capacity(capacity);
+            file.take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("read device identity {}", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() <= 64 * 1024,
+                "device identity file exceeds 64 KiB"
+            );
             let stored: StoredIdentity =
                 serde_json::from_slice(&bytes).context("decode device identity")?;
-            let secret: [u8; 32] = hex::decode(stored.secret_key_hex)
-                .context("decode device identity secret")?
+            let (secret_bytes, migrate) = if let Some(protected) = stored.protected_secret_key {
+                (windows_secrets::unprotect(&protected)?, false)
+            } else if let Some(legacy) = stored.secret_key_hex {
+                (
+                    hex::decode(legacy).context("decode legacy device identity secret")?,
+                    true,
+                )
+            } else {
+                anyhow::bail!("device identity does not contain a protected secret key");
+            };
+            let mut secret: [u8; 32] = secret_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("device identity secret must contain 32 bytes"))?;
-            Ok(Ed25519DeviceIdentity::from_secret_bytes(secret))
+            let identity = Ed25519DeviceIdentity::from_secret_bytes(secret);
+            if migrate {
+                let protected = windows_secrets::protect(&secret)?;
+                write_identity(
+                    path,
+                    &StoredIdentity {
+                        protected_secret_key: Some(protected),
+                        secret_key_hex: None,
+                    },
+                    false,
+                )?;
+            }
+            secret.fill(0);
+            Ok(identity)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
@@ -723,21 +766,40 @@ fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity>
                 })?;
             }
             let identity = Ed25519DeviceIdentity::generate();
-            let bytes = serde_json::to_vec(&StoredIdentity {
-                secret_key_hex: hex::encode(identity.secret_bytes()),
-            })?;
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)
-                .with_context(|| format!("create device identity {}", path.display()))?;
-            std::io::Write::write_all(&mut file, &bytes).context("write device identity")?;
+            let mut secret = identity.secret_bytes();
+            let protected = windows_secrets::protect(&secret)?;
+            secret.fill(0);
+            write_identity(
+                path,
+                &StoredIdentity {
+                    protected_secret_key: Some(protected),
+                    secret_key_hex: None,
+                },
+                true,
+            )?;
             Ok(identity)
         }
         Err(error) => {
             Err(error).with_context(|| format!("read device identity {}", path.display()))
         }
     }
+}
+
+#[cfg(windows)]
+fn write_identity(path: &Path, stored: &StoredIdentity, create_new: bool) -> anyhow::Result<()> {
+    let data = serde_json::to_vec(stored).context("encode device identity")?;
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open device identity {}", path.display()))?;
+    std::io::Write::write_all(&mut file, &data).context("write device identity")?;
+    file.sync_all().context("flush device identity")
 }
 
 #[cfg(windows)]
@@ -1591,6 +1653,7 @@ fn file_service_error(
         | FileTransferError::ChunkChecksumMismatch
         | FileTransferError::Incomplete { .. } => FileTransferErrorCode::InvalidChunk,
         FileTransferError::ChecksumMismatch => FileTransferErrorCode::ChecksumMismatch,
+        FileTransferError::TooManyTransfers => FileTransferErrorCode::Busy,
         FileTransferError::Io(_) => FileTransferErrorCode::Io,
         _ => FileTransferErrorCode::InvalidPath,
     };
@@ -1794,6 +1857,49 @@ fn main() {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    fn temporary_identity_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "remotex-{label}-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[test]
+    fn legacy_plaintext_identity_is_migrated_to_dpapi() {
+        let path = temporary_identity_path("legacy-identity");
+        let expected = Ed25519DeviceIdentity::from_secret_bytes([0x37; 32]);
+        let legacy = StoredIdentity {
+            protected_secret_key: None,
+            secret_key_hex: Some(hex::encode(expected.secret_bytes())),
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&legacy).expect("encode legacy identity"),
+        )
+        .expect("write legacy identity");
+
+        let loaded = load_or_create_identity(&path).expect("load and migrate identity");
+        assert_eq!(loaded.public_bytes(), expected.public_bytes());
+        let migrated: StoredIdentity =
+            serde_json::from_slice(&std::fs::read(&path).expect("read migrated device identity"))
+                .expect("decode migrated device identity");
+        assert!(migrated.secret_key_hex.is_none());
+        assert!(migrated.protected_secret_key.is_some());
+        std::fs::remove_file(path).expect("remove identity fixture");
+    }
+
+    #[test]
+    fn oversized_identity_file_is_rejected() {
+        let path = temporary_identity_path("oversized-identity");
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).expect("write oversized identity");
+        let Err(error) = load_or_create_identity(&path) else {
+            panic!("oversized identity was accepted");
+        };
+        assert!(error.to_string().contains("exceeds 64 KiB"));
+        std::fs::remove_file(path).expect("remove identity fixture");
+    }
 
     #[tokio::test]
     async fn file_browsing_requires_an_explicit_permission() {

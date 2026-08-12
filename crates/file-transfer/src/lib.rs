@@ -17,6 +17,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
 };
 
+/// Maximum open upload/download handles of one direction in one Session.
+pub const MAX_CONCURRENT_TRANSFERS_PER_SESSION: usize = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllowedRoot {
     pub name: String,
@@ -562,6 +565,8 @@ pub enum FileTransferError {
     NonUnicodeName,
     #[error("directory has too many entries")]
     TooManyDirectoryEntries,
+    #[error("too many concurrent file transfers")]
+    TooManyTransfers,
     #[error("chunk size must be between 1 and 4 MiB")]
     InvalidChunkSize,
     #[error("file chunk is empty or exceeds the negotiated limit")]
@@ -597,6 +602,9 @@ impl<T> TransferRegistry<T> {
     pub fn insert(&mut self, id: TransferId, transfer: T) -> Result<(), FileTransferError> {
         if self.entries.contains_key(&id) {
             return Err(FileTransferError::AlreadyExists);
+        }
+        if self.entries.len() >= MAX_CONCURRENT_TRANSFERS_PER_SESSION {
+            return Err(FileTransferError::TooManyTransfers);
         }
         self.entries.insert(id, transfer);
         Ok(())
@@ -635,6 +643,20 @@ mod tests {
         let path = std::env::temp_dir().join(format!("remotex-{label}-{}", TransferId::new()));
         fs::create_dir(&path).expect("create test directory");
         path
+    }
+
+    #[test]
+    fn transfer_registry_has_a_hard_session_limit() {
+        let mut registry = TransferRegistry::default();
+        for value in 0..MAX_CONCURRENT_TRANSFERS_PER_SESSION {
+            registry
+                .insert(TransferId::new(), value)
+                .expect("insert bounded transfer");
+        }
+        assert!(matches!(
+            registry.insert(TransferId::new(), usize::MAX),
+            Err(FileTransferError::TooManyTransfers)
+        ));
     }
 
     fn rooted(path: &Path) -> RootedFileSystem {

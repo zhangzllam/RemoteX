@@ -13,6 +13,8 @@ pub const MAX_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub const MAX_FILE_PATH_SIZE: usize = 4 * 1024;
 pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 pub const MAX_TERMINAL_DATA_SIZE: usize = 64 * 1024;
+/// Absolute allocation/codec budget for one decoded wire value.
+pub const MAX_WIRE_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -326,14 +328,23 @@ pub enum RelayServerMessage {
 
 /// Serializes a protocol value using the single workspace wire codec.
 pub fn encode_wire<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolCodecError> {
-    bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .map_err(|error| ProtocolCodecError::Encode(error.to_string()))
+    bincode::serde::encode_to_vec(
+        value,
+        bincode::config::standard().with_limit::<MAX_WIRE_MESSAGE_SIZE>(),
+    )
+    .map_err(|error| ProtocolCodecError::Encode(error.to_string()))
 }
 
 /// Deserializes one complete protocol value and rejects trailing bytes.
 pub fn decode_wire<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolCodecError> {
-    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-        .map_err(|error| ProtocolCodecError::Decode(error.to_string()))?;
+    if bytes.len() > MAX_WIRE_MESSAGE_SIZE {
+        return Err(ProtocolCodecError::LimitExceeded);
+    }
+    let (value, consumed) = bincode::serde::decode_from_slice(
+        bytes,
+        bincode::config::standard().with_limit::<MAX_WIRE_MESSAGE_SIZE>(),
+    )
+    .map_err(|error| ProtocolCodecError::Decode(error.to_string()))?;
     if consumed != bytes.len() {
         return Err(ProtocolCodecError::TrailingBytes);
     }
@@ -1015,6 +1026,8 @@ pub enum ProtocolCodecError {
     Decode(String),
     #[error("protocol message contains trailing bytes")]
     TrailingBytes,
+    #[error("protocol message exceeds the 8 MiB codec budget")]
+    LimitExceeded,
 }
 
 #[cfg(test)]
@@ -1080,6 +1093,51 @@ mod tests {
         let bytes = encode_wire(&original).expect("encode test value");
         let decoded: MessageEnvelope = decode_wire(&bytes).expect("decode test value");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn malformed_wire_values_are_rejected_without_panicking() {
+        let valid = encode_wire(&MessageEnvelope::new(
+            SessionId::new(),
+            0,
+            0,
+            Message::Control(ControlMessage::Ping { nonce: 7 }),
+        ))
+        .expect("encode fixture");
+        for length in 0..valid.len() {
+            assert!(decode_wire::<MessageEnvelope>(&valid[..length]).is_err());
+        }
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_wire::<MessageEnvelope>(&trailing),
+            Err(ProtocolCodecError::TrailingBytes)
+        );
+        assert!(decode_wire::<MessageEnvelope>(&[u8::MAX]).is_err());
+        assert!(decode_wire::<String>(&[1, u8::MAX]).is_err());
+        assert_eq!(
+            decode_wire::<Vec<u8>>(&vec![0; MAX_WIRE_MESSAGE_SIZE + 1]),
+            Err(ProtocolCodecError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn corrupted_envelopes_never_panic_the_decoder() {
+        let valid = encode_wire(&MessageEnvelope::new(
+            SessionId::new(),
+            3,
+            42,
+            Message::Input(InputEvent::KeyDown { key: KeyCode::KeyA }),
+        ))
+        .expect("encode fixture");
+        for index in 0..valid.len() {
+            let mut corrupted = valid.clone();
+            corrupted[index] ^= 0xff;
+            if let Ok(envelope) = decode_wire::<MessageEnvelope>(&corrupted) {
+                let _result = envelope.validate();
+            }
+        }
     }
 
     #[test]

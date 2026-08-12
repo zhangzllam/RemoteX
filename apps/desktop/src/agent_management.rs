@@ -49,7 +49,7 @@ impl VideoQuality {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentSettings {
@@ -91,7 +91,7 @@ impl Default for AgentSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StoredAgentSettings {
     #[serde(flatten)]

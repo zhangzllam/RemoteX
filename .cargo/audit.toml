@@ -1,0 +1,4 @@
+[advisories]
+# `rsa` is present only in Cargo.lock through sqlx-mysql. RemoteX disables SQLx defaults and
+# enables PostgreSQL only; `cargo tree -i rsa` confirms it is absent from every shipped build.
+ignore = ["RUSTSEC-2023-0071"]

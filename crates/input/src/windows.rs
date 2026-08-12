@@ -233,10 +233,10 @@ impl InputBackend for WindowsInputBackend {
                 normalized_x,
                 normalized_y,
             } => {
-                if let Some(display_id) = display_id {
-                    if display_id != &self.display.id {
-                        return Err(InputError::UnknownDisplay(display_id.clone()));
-                    }
+                if let Some(display_id) = display_id
+                    && display_id != &self.display.id
+                {
+                    return Err(InputError::UnknownDisplay(display_id.clone()));
                 }
                 let x = map_to_virtual_coordinate(
                     *normalized_x,

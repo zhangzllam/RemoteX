@@ -1,6 +1,8 @@
-# RemoteX Protocol (M0–M7)
+# RemoteX V1 protocol
 
-This document describes the versioned data model and M1–M7 relay framing.
+This document describes the V1 versioned data model, Control API DTOs, Relay
+framing, encrypted channels, video negotiation, direct candidates, and Linux
+server extensions delivered through M15.
 
 ## Compatibility
 
@@ -79,9 +81,12 @@ code. It contains no payload content.
 | 4 | File transfer | Bidirectional |
 | 5 | Audio | Reserved |
 | 6 | Telemetry | Reserved |
+| 7 | Terminal | Bidirectional |
+| 8 | System | Bidirectional |
 
-M7 implements Control handshakes outside the envelope plus Video, mouse/keyboard
-Input, Clipboard, and File Transfer envelopes.
+V1 implements Control handshakes outside the envelope plus Video, mouse/keyboard
+Input, Clipboard, File Transfer, Terminal, and System envelopes. Audio and the
+standalone Telemetry channel remain reserved.
 
 ## Envelope
 
@@ -296,7 +301,9 @@ count, outbound queue capacity, heartbeat interval, and peer timeout are also
 bounded and configurable.
 File chunks must never exceed the negotiated chunk size or 4 MiB. Strings and
 rejection reasons also need explicit encoded-length limits at the transport
-boundary.
+boundary. M15 additionally caps complete wire decoding at 8 MiB, Control API
+bodies at 64 KiB, Control requests at 20 seconds, pending Sessions at 32 per
+device, and concurrent file transfers at eight per Session.
 
 ## Linux terminal and system messages
 

@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/ui/pnpm-lock.yaml
+      - name: Build NSIS installer
+        shell: powershell
+        run: ./packaging/windows/build-installer.ps1
+      - name: Create installer checksum
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem target/release/bundle/nsis/RemoteX_*_x64-setup.exe -File
+          if ($installer.Count -ne 1) { throw "Expected exactly one RemoteX installer" }
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -Encoding ascii "$($installer.FullName).sha256"
+      - name: Upload Windows assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: |
+            target/release/bundle/nsis/RemoteX_*_x64-setup.exe
+            target/release/bundle/nsis/RemoteX_*_x64-setup.exe.sha256
+          if-no-files-found: error
+
+  linux:
+    name: Linux Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux Agent
+        run: cargo build --locked --release -p remotex-linux-agent
+      - name: Package Linux Agent
+        run: |
+          mkdir release-linux
+          cp target/release/remotex-linux-agent release-linux/
+          cp packaging/linux/remotex-agent.service packaging/linux/agent.env.example release-linux/
+          tar -C release-linux -czf RemoteX-linux-agent-x86_64.tar.gz .
+          sha256sum RemoteX-linux-agent-x86_64.tar.gz > RemoteX-linux-agent-x86_64.tar.gz.sha256
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: |
+            RemoteX-linux-agent-x86_64.tar.gz
+            RemoteX-linux-agent-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --title "RemoteX ${GITHUB_REF_NAME}"
+          --generate-notes
+          release-assets/*

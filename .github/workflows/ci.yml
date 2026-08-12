@@ -38,6 +38,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Audit production UI dependencies
+        run: pnpm --dir apps/desktop/ui audit --prod
 
   linux:
     name: Linux Agent and server images

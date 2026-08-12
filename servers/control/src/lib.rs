@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,13 +20,16 @@ use remotex_protocol::{
 };
 use serde::Serialize;
 use sqlx::{PgPool, Row};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 pub const DEFAULT_DEVICE_OFFLINE_AFTER_MS: u64 = 45_000;
 pub const DEFAULT_SESSION_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 pub const DEVICE_AUTH_CLOCK_SKEW_MS: u64 = 60_000;
+pub const MAX_CONTROL_REQUEST_SIZE: usize = 64 * 1024;
+pub const MAX_PENDING_SESSIONS_PER_DEVICE: usize = 32;
+pub const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct ControlConfig {
@@ -462,6 +465,11 @@ pub fn router(state: ApiState) -> Router {
             post(report_session_event),
         )
         .route("/api/sessions", post(create_session))
+        .layer(DefaultBodyLimit::max(MAX_CONTROL_REQUEST_SIZE))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            CONTROL_REQUEST_TIMEOUT,
+        ))
         .with_state(state)
 }
 
@@ -597,6 +605,7 @@ impl IntoResponse for ControlError {
                 (StatusCode::UNAUTHORIZED, "device_authentication_failed")
             }
             Self::Conflict => (StatusCode::CONFLICT, "conflict"),
+            Self::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "too_many_sessions"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         (
@@ -638,6 +647,8 @@ pub enum ControlError {
     Authentication,
     #[error("resource already exists")]
     Conflict,
+    #[error("device has too many pending sessions")]
+    TooManySessions,
     #[error("clock value overflowed")]
     ClockOverflow,
     #[error("persistence operation failed")]
@@ -662,6 +673,7 @@ impl ControlError {
                 "device authentication failed"
             }
             Self::Conflict => "resource already exists",
+            Self::TooManySessions => "device has too many pending sessions",
             Self::ClockOverflow | Self::Persistence | Self::Crypto => "internal server error",
         }
     }
@@ -773,6 +785,32 @@ impl ControlRepository for PostgresRepository {
     }
 
     async fn create_session(&self, session: NewSession) -> Result<(), ControlError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        let exists =
+            sqlx::query_scalar::<_, i32>("SELECT 1 FROM devices WHERE device_id=$1 FOR UPDATE")
+                .bind(session.device_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| ControlError::Persistence)?;
+        if exists.is_none() {
+            return Err(ControlError::DeviceNotFound);
+        }
+        let pending = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE device_id=$1 AND authorization_status='pending' AND expires_at_ms >= $2")
+            .bind(session.device_id.as_str())
+            .bind(i64_value(session.created_at_ms)?)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        if pending
+            >= i64::try_from(MAX_PENDING_SESSIONS_PER_DEVICE)
+                .map_err(|_| ControlError::Persistence)?
+        {
+            return Err(ControlError::TooManySessions);
+        }
         sqlx::query("INSERT INTO sessions (session_id, device_id, controller_name, permissions_json, controller_token_hash, agent_token_hash, agent_token_wrapped, e2e_key_wrapped, created_at_ms, expires_at_ms, unattended_secret_wrapped) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
             .bind(session.session_id.to_string())
             .bind(session.device_id.as_str())
@@ -785,7 +823,11 @@ impl ControlRepository for PostgresRepository {
             .bind(i64_value(session.created_at_ms)?)
             .bind(i64_value(session.expires_at_ms)?)
             .bind(session.unattended_secret_wrapped)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        transaction
+            .commit()
             .await
             .map_err(|_| ControlError::Persistence)?;
         Ok(())
@@ -1098,7 +1140,19 @@ impl ControlRepository for MemoryRepository {
     }
 
     async fn create_session(&self, session: NewSession) -> Result<(), ControlError> {
-        self.sessions.lock().await.push(MemorySession {
+        let mut sessions = self.sessions.lock().await;
+        let pending = sessions
+            .iter()
+            .filter(|entry| {
+                entry.session.device_id == session.device_id
+                    && entry.authorization == MemoryAuthorization::Pending
+                    && entry.session.expires_at_ms >= session.created_at_ms
+            })
+            .count();
+        if pending >= MAX_PENDING_SESSIONS_PER_DEVICE {
+            return Err(ControlError::TooManySessions);
+        }
+        sessions.push(MemorySession {
             session,
             authorization: MemoryAuthorization::Pending,
         });
@@ -1515,6 +1569,39 @@ mod tests {
             .await
             .expect("second claim");
         assert!(second.authorization_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_sessions_have_a_per_device_hard_limit() {
+        let (service, _, device_id) = enrolled().await;
+        for index in 0..MAX_PENDING_SESSIONS_PER_DEVICE {
+            service
+                .create_session(
+                    CreateSessionRequest {
+                        device_id: device_id.clone(),
+                        controller_name: format!("Controller {index}"),
+                        requested_permissions: capabilities(),
+                        unattended_secret: None,
+                    },
+                    1_050,
+                )
+                .await
+                .expect("create session below the limit");
+        }
+        assert!(matches!(
+            service
+                .create_session(
+                    CreateSessionRequest {
+                        device_id,
+                        controller_name: "One too many".into(),
+                        requested_permissions: capabilities(),
+                        unattended_secret: None,
+                    },
+                    1_050,
+                )
+                .await,
+            Err(ControlError::TooManySessions)
+        ));
     }
 
     #[tokio::test]

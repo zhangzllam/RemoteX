@@ -1,8 +1,8 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestones 0–7 establish
-the module boundaries and a working, relay-only Windows remote-video, mouse,
-keyboard control, plain-text clipboard, and safe remote-file paths.
+RemoteX is a self-hosted remote administration system. Milestones 0–15 provide
+the module boundaries and a complete V1 Windows remote-control and Linux
+server-management system with self-hosted Control and Relay infrastructure.
 
 ## System boundaries
 
@@ -17,13 +17,14 @@ The target system has four deployable roles:
 - **Relay server (`servers/relay`)** pairs authenticated session peers and
   forwards opaque encrypted frames without interpreting their contents.
 
-The control plane and data plane stay separate. HTTPS/WebSocket control-plane
+The control plane and data plane stay separate. HTTPS control-plane
 traffic creates and authorizes a session. Remote desktop, input, clipboard, and
-file-transfer data later travel through QUIC, initially via the relay.
+file-transfer data later travel through QUIC, either directly after authenticated
+candidate negotiation or through the relay fallback.
 
 ## Workspace modules
 
-| Crate | Responsibility | Still excluded through M7 |
+| Crate | Responsibility | V1 boundary |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
 | `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
@@ -32,9 +33,9 @@ file-transfer data later travel through QUIC, initially via the relay.
 | `remotex-clipboard` | Permissioned text revisions, size limits, loop/conflict prevention, and Windows clipboard adapter | Images, HTML, and files |
 | `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Local input capture |
 | `remotex-file-transfer` | Virtual-root resolution, directory metadata, async chunk I/O, resume state, and SHA-256 verification | Networking and destructive deletion |
-| `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows capabilities, persistent Ed25519 identity, heartbeat, and managed Session composition root | Local approval UI |
-| `remotex-desktop` | Tauri/React controller with managed Session creation and manual development fallback | Installer packaging |
+| `remotex-video` | Adaptive software H.264/JPEG encoding, decoding, and telemetry | Capture and transport |
+| `remotex-agent` | Windows capabilities, DPAPI-protected Ed25519 identity, authorization, and Session composition | Windows only |
+| `remotex-desktop` | Installed Tauri/React controller, managed Agent, settings, and tray | Mobile and macOS clients |
 | `remotex-control` | Axum control API, PostgreSQL repository, presence, and credential issuance | User accounts |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
@@ -168,7 +169,7 @@ Control Server audit trail contains request, accept/reject, start/end, Controlle
 name, permissions, connection type, result, timestamps, and aggregate bytes; it
 never contains tokens, private keys, clipboard text, paths, input, or file data.
 
-## Implemented data paths (M9)
+## Implemented Windows data paths
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
@@ -317,7 +318,7 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0–M7 acceptance criteria
+## V1 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;

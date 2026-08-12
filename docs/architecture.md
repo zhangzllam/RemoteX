@@ -286,6 +286,15 @@ disconnect closes handles but preserves partials for explicit same-ID resume.
 Each chunk and the completed file use SHA-256, and a destination becomes visible
 only after final verification.
 
+## M13 self-hosted deployment boundary
+
+Production Control and Relay binaries run as non-root, read-only containers.
+PostgreSQL lives only on an internal network, Control is reachable only through
+Caddy HTTPS, and Relay publishes only its bounded QUIC UDP port. Runtime secrets
+are mounted as read-only files rather than committed or embedded in images.
+Control readiness includes a live database query; Relay has a local container
+health endpoint. Both services emit structured JSON without payload contents.
+
 ## Error handling and observability
 
 Library crates expose typed errors with `thiserror`. Executables may add context

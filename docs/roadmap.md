@@ -36,13 +36,13 @@ tests all pass.
   direct QUIC, bounded upgrade attempts, telemetry, and Relay fallback.
 - **M12 — Linux server Agent:** authorized bounded PTY terminals, M7 Files
   reuse, read-only system information, visible operation, and opt-in systemd.
+- **M13 — Self-hosting:** unprivileged container images, isolated PostgreSQL,
+  Caddy TLS, secret files, health/readiness probes, JSON logs, and runbooks.
 
 ## Next
 
-The remaining milestones start at M13.
+The remaining milestones start at M14.
 
-- **M13 — Self-hosting:** Docker images, Compose stack, PostgreSQL isolation,
-  reverse-proxy TLS, health checks, and deployment documentation.
 - **M14 — Windows usability:** Tauri installer, Agent packaging, opt-in startup,
   settings, visible tray state, and secure update preparation.
 - **M15 — Final review:** systematic security/resource review, malformed-input

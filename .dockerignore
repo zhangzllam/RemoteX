@@ -1,0 +1,8 @@
+.git
+.github
+target
+apps/desktop/ui/node_modules
+apps/desktop/ui/dist
+deploy/secrets/*
+!deploy/secrets/README.md
+*.log

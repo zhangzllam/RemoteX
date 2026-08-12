@@ -1,0 +1,133 @@
+name: remotex
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: remotex
+      POSTGRES_USER: remotex
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U remotex -d remotex"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  control:
+    build:
+      context: ..
+      target: control
+    image: remotex-control:${REMOTEX_IMAGE_TAG:-local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUST_LOG: ${REMOTEX_LOG:-info}
+      REMOTEX_DATABASE_URL_FILE: /run/secrets/database_url
+      REMOTEX_CONTROL_MASTER_KEY_HEX_FILE: /run/secrets/control_master_key
+      REMOTEX_CONTROL_BIND: 0.0.0.0:8080
+      REMOTEX_PUBLIC_RELAY_ADDRESS: ${REMOTEX_RELAY_DOMAIN:?set REMOTEX_RELAY_DOMAIN}:${REMOTEX_RELAY_PORT:-7443}
+      REMOTEX_RELAY_SERVER_NAME: ${REMOTEX_RELAY_DOMAIN:?set REMOTEX_RELAY_DOMAIN}
+    secrets:
+      - database_url
+      - control_master_key
+    networks:
+      - database
+      - edge
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  relay:
+    build:
+      context: ..
+      target: relay
+    image: remotex-relay:${REMOTEX_IMAGE_TAG:-local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUST_LOG: ${REMOTEX_LOG:-info}
+      REMOTEX_DATABASE_URL_FILE: /run/secrets/database_url
+      REMOTEX_RELAY_BIND: 0.0.0.0:7443
+      REMOTEX_RELAY_HEALTH_BIND: 0.0.0.0:8081
+      REMOTEX_RELAY_CERT_FILE: /run/secrets/relay_certificate
+      REMOTEX_RELAY_KEY_FILE: /run/secrets/relay_private_key
+    secrets:
+      - database_url
+      - relay_certificate
+      - relay_private_key
+    networks:
+      - database
+      - edge
+    ports:
+      - "${REMOTEX_RELAY_PORT:-7443}:7443/udp"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      control:
+        condition: service_healthy
+    environment:
+      REMOTEX_CONTROL_DOMAIN: ${REMOTEX_CONTROL_DOMAIN:?set REMOTEX_CONTROL_DOMAIN}
+      REMOTEX_ACME_EMAIL: ${REMOTEX_ACME_EMAIL:?set REMOTEX_ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  database:
+    internal: true
+  edge:
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  postgres_password:
+    file: ${REMOTEX_POSTGRES_PASSWORD_FILE:-./secrets/postgres-password}
+  database_url:
+    file: ${REMOTEX_DATABASE_URL_FILE:-./secrets/database-url}
+  control_master_key:
+    file: ${REMOTEX_CONTROL_MASTER_KEY_FILE:-./secrets/control-master-key}
+  relay_certificate:
+    file: ${REMOTEX_RELAY_CERT_FILE:-./secrets/relay-cert.pem}
+  relay_private_key:
+    file: ${REMOTEX_RELAY_KEY_FILE:-./secrets/relay-key.pem}

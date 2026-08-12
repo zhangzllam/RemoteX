@@ -80,6 +80,8 @@ pub struct AuditEvent {
 
 #[async_trait]
 pub trait ControlRepository: Send + Sync {
+    async fn readiness(&self) -> Result<(), ControlError>;
+
     async fn register_device(
         &self,
         candidate_id: DeviceId,
@@ -136,6 +138,10 @@ impl ControlService {
             secrets: Arc::new(ServerSecretBox::new(master_key)),
             config,
         }
+    }
+
+    pub async fn readiness(&self) -> Result<(), ControlError> {
+        self.repository.readiness().await
     }
 
     pub async fn register(
@@ -439,7 +445,7 @@ pub struct ApiState {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/ready", get(health))
+        .route("/ready", get(readiness))
         .route("/api/devices/register", post(register_device))
         .route("/api/devices/{device_id}", get(get_device))
         .route("/api/devices/{device_id}/heartbeat", post(heartbeat))
@@ -461,6 +467,19 @@ pub fn router(state: ApiState) -> Router {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn readiness(State(state): State<ApiState>) -> Response {
+    match state.service.readiness().await {
+        Ok(()) => (StatusCode::OK, Json(HealthResponse { status: "ready" })).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "unavailable",
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn register_device(
@@ -668,6 +687,14 @@ impl PostgresRepository {
 
 #[async_trait]
 impl ControlRepository for PostgresRepository {
+    async fn readiness(&self) -> Result<(), ControlError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|_| ControlError::Persistence)?;
+        Ok(())
+    }
+
     async fn register_device(
         &self,
         candidate_id: DeviceId,
@@ -976,6 +1003,10 @@ impl MemoryRepository {
 
 #[async_trait]
 impl ControlRepository for MemoryRepository {
+    async fn readiness(&self) -> Result<(), ControlError> {
+        Ok(())
+    }
+
     async fn register_device(
         &self,
         candidate_id: DeviceId,
@@ -1279,6 +1310,13 @@ mod tests {
     async fn enrolled() -> (ControlService, Ed25519DeviceIdentity, DeviceId) {
         let (service, identity, device_id, _) = enrolled_with_repository().await;
         (service, identity, device_id)
+    }
+
+    #[tokio::test]
+    async fn in_memory_readiness_reports_available() {
+        let service =
+            ControlService::new(Arc::new(MemoryRepository::default()), [7_u8; 32], config());
+        service.readiness().await.expect("repository is ready");
     }
 
     async fn enrolled_with_repository() -> (

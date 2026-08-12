@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))?;
@@ -59,7 +60,30 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn required(name: &str) -> anyhow::Result<String> {
-    std::env::var(name).with_context(|| format!("required environment variable {name} is missing"))
+    let file_name = format!("{name}_FILE");
+    match (std::env::var(name), std::env::var(&file_name)) {
+        (Ok(_), Ok(_)) => anyhow::bail!("set only one of {name} and {file_name}"),
+        (Ok(value), Err(std::env::VarError::NotPresent)) => Ok(value),
+        (Err(std::env::VarError::NotPresent), Ok(path)) => read_secret(name, &path),
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
+            anyhow::bail!("required environment variable {name} or {file_name} is missing")
+        }
+        (Err(error), _) => Err(error).with_context(|| format!("read {name}")),
+        (_, Err(error)) => Err(error).with_context(|| format!("read {file_name}")),
+    }
+}
+
+fn read_secret(name: &str, path: &str) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("inspect {name} file"))?;
+    if metadata.len() > 16 * 1024 {
+        anyhow::bail!("{name} file exceeds 16 KiB");
+    }
+    let value = std::fs::read_to_string(path).with_context(|| format!("read {name} file"))?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        anyhow::bail!("{name} file is empty");
+    }
+    Ok(value)
 }
 
 fn parse_or<T>(name: &str, default: T) -> anyhow::Result<T>

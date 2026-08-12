@@ -38,3 +38,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features
+
+  linux:
+    name: Linux Agent and server images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint Linux Agent
+        run: cargo clippy -p remotex-linux-agent --all-targets --all-features -- -D warnings
+      - name: Test Linux PTY and system capabilities
+        run: cargo test -p remotex-linux-agent --all-features
+      - name: Build production server containers
+        run: |
+          docker build --target control --tag remotex-control:ci .
+          docker build --target relay --tag remotex-relay:ci .

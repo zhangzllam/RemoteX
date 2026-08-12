@@ -23,9 +23,18 @@ remotex-video.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
-tauri = "2.9.3"
+serde_json.workspace = true
+tauri = { version = "2.9.3", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-shell = "2"
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [build-dependencies]
 tauri-build = "2.5.2"

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.remotex.desktop",
   "build": {
-    "beforeDevCommand": "pnpm --dir ui dev",
+    "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm --dir ui build",
+    "beforeBuildCommand": "pnpm build",
     "frontendDist": "ui/dist"
   },
   "app": {
@@ -24,6 +24,20 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "shortDescription": "Visible, authorized remote access for your own computers",
+    "longDescription": "RemoteX provides explicitly authorized Windows remote desktop and Linux server management through self-hosted infrastructure.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "SimpChinese"],
+        "displayLanguageSelector": true
+      }
+    }
   }
 }

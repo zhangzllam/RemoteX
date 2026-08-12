@@ -87,6 +87,17 @@ struct ManagedAgentConfig {
     unattended_secret: Option<String>,
     file_roots: Vec<AllowedRoot>,
     direct: Option<DirectServerSettings>,
+    status_path: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedAgentStatus<'a> {
+    device_id: Option<&'a str>,
+    state: &'a str,
+    session_id: Option<String>,
+    updated_at_ms: u64,
 }
 
 #[cfg(windows)]
@@ -330,6 +341,12 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
         .context("decode device registration")?;
     let device_id = response.device_id;
     info!(%device_id, "device registered with control server");
+    write_managed_status(
+        config.status_path.as_deref(),
+        Some(&device_id),
+        "online",
+        None,
+    )?;
 
     let nonce = Arc::new(AtomicU64::new(now_ms()?));
     let connectivity_candidates = config
@@ -389,6 +406,12 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
         }
     }
     heartbeat_task.abort();
+    write_managed_status(
+        config.status_path.as_deref(),
+        Some(&device_id),
+        "offline",
+        None,
+    )?;
     Ok(())
 }
 
@@ -440,6 +463,7 @@ async fn handle_incoming_session(
         return Ok(());
     };
     let session_id = credentials.session_id;
+    update_managed_status(config, device_id, "connecting", Some(session_id))?;
     let session = managed_session_config(config, credentials)?;
     let (connection_sender, connection_receiver) = oneshot::channel();
     let session_future = run_agent_session_with_report(session, Some(connection_sender));
@@ -447,6 +471,7 @@ async fn handle_incoming_session(
     let connection_type = tokio::select! {
         selected = connection_receiver => selected.context("Session ended before selecting a transport")?,
         result = &mut session_future => {
+            update_managed_status(config, device_id, "online", None)?;
             return result.map(|_| ());
         }
     };
@@ -463,6 +488,7 @@ async fn handle_incoming_session(
         "active",
     )
     .await?;
+    update_managed_status(config, device_id, "active", Some(session_id))?;
     let (bytes_transferred, result) = match session_future.await {
         Ok(bytes_transferred) => (bytes_transferred, "disconnected"),
         Err(error) => {
@@ -470,7 +496,7 @@ async fn handle_incoming_session(
             (0, "error")
         }
     };
-    report_managed_session_event(
+    let report_result = report_managed_session_event(
         client,
         &config.control_url,
         device_id,
@@ -482,7 +508,9 @@ async fn handle_incoming_session(
         bytes_transferred,
         result,
     )
-    .await
+    .await;
+    update_managed_status(config, device_id, "online", None)?;
+    report_result
 }
 
 #[cfg(windows)]
@@ -713,6 +741,52 @@ fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity>
 }
 
 #[cfg(windows)]
+fn write_managed_status(
+    path: Option<&Path>,
+    device_id: Option<&DeviceId>,
+    state: &str,
+    session_id: Option<SessionId>,
+) -> anyhow::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create Agent status directory {}", parent.display()))?;
+    }
+    let data = serde_json::to_vec(&ManagedAgentStatus {
+        device_id: device_id.map(DeviceId::as_str),
+        state,
+        session_id: session_id.map(|id| id.to_string()),
+        updated_at_ms: now_ms()?,
+    })
+    .context("encode Agent status")?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open Agent status {}", path.display()))?;
+    std::io::Write::write_all(&mut file, &data).context("write Agent status")?;
+    file.sync_all().context("flush Agent status")
+}
+
+#[cfg(windows)]
+fn update_managed_status(
+    config: &ManagedAgentConfig,
+    device_id: &DeviceId,
+    state: &str,
+    session_id: Option<SessionId>,
+) -> anyhow::Result<()> {
+    write_managed_status(
+        config.status_path.as_deref(),
+        Some(device_id),
+        state,
+        session_id,
+    )
+}
+
+#[cfg(windows)]
 async fn run_active_session(
     transport: &mut dyn Connection,
     capture: &mut DxgiCapture,
@@ -935,6 +1009,7 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         unattended_secret,
         file_roots,
         direct,
+        status_path: std::env::var_os("REMOTEX_STATUS_PATH").map(PathBuf::from),
     }))
 }
 

@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": ["binaries/remotex-agent"],
+    "createUpdaterArtifacts": false
+  }
+}

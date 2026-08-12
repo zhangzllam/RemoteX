@@ -1,4 +1,6 @@
-//! `RemoteX` M7 Tauri Controller for remote desktop, clipboard, and files.
+//! `RemoteX` Tauri Controller and visible Windows Agent host.
+
+mod agent_management;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -34,7 +36,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{
+    AppHandle, Emitter, Manager, State,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
@@ -1647,9 +1653,148 @@ fn emit_status(app: &AppHandle, state: &'static str, message: &str) {
     );
 }
 
+struct TrayUi {
+    agent_status: MenuItem<tauri::Wry>,
+    device_id: MenuItem<tauri::Wry>,
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _result = window.unminimize();
+        let _result = window.show();
+        let _result = window.set_focus();
+    }
+}
+
+fn disconnect_from_tray(app: &AppHandle) {
+    if let Ok(mut active) = app.state::<StreamControl>().active.lock()
+        && let Some(stream) = active.take()
+    {
+        let _result = stream.cancellation.send(());
+    }
+    let _result = agent_management::stop_configured_agent(app);
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let agent_status =
+        MenuItem::with_id(app, "agent_status", "Status: Offline", false, None::<&str>)?;
+    let device_id = MenuItem::with_id(
+        app,
+        "device_id",
+        "Device ID: Not registered",
+        false,
+        None::<&str>,
+    )?;
+    let open = MenuItem::with_id(app, "open", "Open RemoteX", true, None::<&str>)?;
+    let disable = MenuItem::with_id(
+        app,
+        "disable_remote_access",
+        "Disable Remote Access",
+        true,
+        None::<&str>,
+    )?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &agent_status,
+            &device_id,
+            &separator,
+            &open,
+            &disable,
+            &disconnect,
+            &settings,
+            &quit,
+        ],
+    )?;
+    TrayIconBuilder::with_id("remotex-tray")
+        .icon(
+            app.default_window_icon()
+                .context("RemoteX application icon is missing")?
+                .clone(),
+        )
+        .tooltip("RemoteX · Remote Access visible")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "settings" => {
+                show_main_window(app);
+                let _result = app.emit("open-settings", ());
+            }
+            "disable_remote_access" => {
+                let _result = agent_management::disable_remote_access(app);
+            }
+            "disconnect" => disconnect_from_tray(app),
+            "quit" => {
+                disconnect_from_tray(app);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .build(app)?;
+    app.manage(TrayUi {
+        agent_status,
+        device_id,
+    });
+    Ok(())
+}
+
+fn monitor_agent_status(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Ok(status) = agent_management::runtime_status(&app) {
+                let tray = app.state::<TrayUi>();
+                let label = if status.session_id.is_some() {
+                    "Status: Remote session active".to_owned()
+                } else {
+                    format!("Status: {}", status.state)
+                };
+                let _result = tray.agent_status.set_text(label);
+                let _result = tray.device_id.set_text(format!(
+                    "Device ID: {}",
+                    status.device_id.as_deref().unwrap_or("Not registered")
+                ));
+            }
+        }
+    });
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--background")
+                .build(),
+        )
         .manage(StreamControl::default())
+        .manage(agent_management::AgentRuntime::default())
+        .setup(|app| {
+            setup_tray(app)?;
+            if std::env::args().any(|argument| argument == "--background")
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.hide()?;
+            }
+            if let Err(error) = agent_management::start_configured_agent(app.handle()) {
+                warn!(event = "packaged_agent_start_failed", %error);
+            }
+            monitor_agent_status(app.handle().clone());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _result = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             connect_remote,
             disconnect_remote,
@@ -1666,7 +1811,12 @@ fn main() {
             send_terminal_input,
             resize_terminal,
             close_terminal,
-            request_system_info
+            request_system_info,
+            agent_management::load_agent_settings,
+            agent_management::save_agent_settings,
+            agent_management::start_agent,
+            agent_management::stop_agent,
+            agent_management::agent_status
         ])
         .run(tauri::generate_context!())
         .expect("run RemoteX desktop application");

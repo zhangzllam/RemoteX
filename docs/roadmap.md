@@ -38,13 +38,13 @@ tests all pass.
   reuse, read-only system information, visible operation, and opt-in systemd.
 - **M13 — Self-hosting:** unprivileged container images, isolated PostgreSQL,
   Caddy TLS, secret files, health/readiness probes, JSON logs, and runbooks.
+- **M14 — Windows usability:** current-user NSIS packaging, bundled Agent,
+  opt-in autostart, settings, DPAPI secret storage, visible tray, and updater preparation.
 
 ## Next
 
-The remaining milestones start at M14.
+The remaining milestone is M15.
 
-- **M14 — Windows usability:** Tauri installer, Agent packaging, opt-in startup,
-  settings, visible tray state, and secure update preparation.
 - **M15 — Final review:** systematic security/resource review, malformed-input
   coverage, lifecycle cleanup tests, end-to-end validation, and V1 checklists.
 

@@ -295,6 +295,21 @@ are mounted as read-only files rather than committed or embedded in images.
 Control readiness includes a live database query; Relay has a local container
 health endpoint. Both services emit structured JSON without payload contents.
 
+## M14 installed Windows application
+
+The Tauri application composes the Controller UI and a packaged Windows Agent
+sidecar. Agent settings live in per-user application data, and unattended-access
+secrets are protected with Windows DPAPI before persistence. The UI never reads a
+stored secret back. Optional permissions, remote access, unattended access, and
+autostart are independent explicit settings that default off.
+
+Tauri's supported autostart and shell/sidecar plugins own startup registration
+and Agent process creation. The visible tray remains the local control surface
+when the main window is hidden: it reports online/active state and Device ID and
+can disconnect, disable access, reopen Settings, or quit. The NSIS package is a
+current-user installation and contains both binaries; no service, administrator
+privilege, hidden startup entry, or custom updater is introduced.
+
 ## Error handling and observability
 
 Library crates expose typed errors with `thiserror`. Executables may add context

@@ -104,6 +104,32 @@ type ConnectRequest = {
   fileDownloadEnabled: boolean;
 };
 
+type AgentSettings = {
+  remoteAccessEnabled: boolean;
+  serverUrl: string;
+  deviceName: string;
+  caCertificatePath: string;
+  allowInput: boolean;
+  allowClipboard: boolean;
+  allowFileUpload: boolean;
+  allowFileDownload: boolean;
+  fileRoots: string;
+  unattendedAccess: boolean;
+  unattendedSecret: string;
+  secretConfigured: boolean;
+  startWithWindows: boolean;
+  videoQuality: "low" | "balanced" | "high";
+};
+
+type AgentRuntimeStatus = {
+  running: boolean;
+  processId: number | null;
+  deviceId: string | null;
+  state: string;
+  sessionId: string | null;
+  startWithWindows: boolean;
+};
+
 type RemoteFileEntry = {
   name: string;
   path: string;
@@ -216,7 +242,7 @@ type KeyboardInputRequest =
 
 type UnitPoint = { x: number; y: number };
 
-const initialRequest: ConnectRequest = {
+const defaultRequest: ConnectRequest = {
   controlServerUrl: "http://127.0.0.1:8080",
   deviceId: "",
   controllerName: "RemoteX Desktop",
@@ -231,6 +257,40 @@ const initialRequest: ConnectRequest = {
   fileUploadEnabled: false,
   fileDownloadEnabled: false,
 };
+
+const defaultAgentSettings: AgentSettings = {
+  remoteAccessEnabled: false,
+  serverUrl: "https://control.example.com",
+  deviceName: "Windows PC",
+  caCertificatePath: "",
+  allowInput: false,
+  allowClipboard: false,
+  allowFileUpload: false,
+  allowFileDownload: false,
+  fileRoots: "",
+  unattendedAccess: false,
+  unattendedSecret: "",
+  secretConfigured: false,
+  startWithWindows: false,
+  videoQuality: "balanced",
+};
+
+function loadControllerSettings(): ConnectRequest {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem("remotex-controller-settings") ?? "{}") as Partial<ConnectRequest>;
+    return {
+      ...defaultRequest,
+      controlServerUrl: stored.controlServerUrl ?? defaultRequest.controlServerUrl,
+      controllerName: stored.controllerName ?? defaultRequest.controllerName,
+      caCertificatePath: stored.caCertificatePath ?? defaultRequest.caCertificatePath,
+      clipboardEnabled: stored.clipboardEnabled ?? false,
+      fileUploadEnabled: stored.fileUploadEnabled ?? false,
+      fileDownloadEnabled: stored.fileDownloadEnabled ?? false,
+    };
+  } catch {
+    return defaultRequest;
+  }
+}
 
 function parentPath(path: string): string {
   if (path === "/") return "/";
@@ -268,7 +328,7 @@ function wheelDelta(value: number): number {
 }
 
 function App() {
-  const [request, setRequest] = useState(initialRequest);
+  const [request, setRequest] = useState(loadControllerSettings);
   const [status, setStatus] = useState<ConnectionStatus>({
     state: "disconnected",
     message: "Not connected",
@@ -288,6 +348,10 @@ function App() {
   const [terminalOutput, setTerminalOutput] = useState("");
   const [terminalInput, setTerminalInput] = useState("");
   const [systemInfo, setSystemInfo] = useState<SystemSnapshot | null>(null);
+  const [agentSettings, setAgentSettings] = useState(defaultAgentSettings);
+  const [agentRuntime, setAgentRuntime] = useState<AgentRuntimeStatus | null>(null);
+  const [agentMessage, setAgentMessage] = useState("");
+  const settingsRef = useRef<HTMLElement>(null);
   const screenRef = useRef<HTMLDivElement>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement>(null);
   const pressedButtons = useRef(new Set<RemoteMouseButton>());
@@ -361,6 +425,37 @@ function App() {
   }, []);
 
   useEffect(() => {
+    void invoke<AgentSettings>("load_agent_settings")
+      .then(setAgentSettings)
+      .catch((error) => setAgentMessage(String(error)));
+    const refresh = () => {
+      void invoke<AgentRuntimeStatus>("agent_status")
+        .then(setAgentRuntime)
+        .catch((error) => setAgentMessage(String(error)));
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 2_000);
+    const unlistenSettings = listen("open-settings", () => {
+      settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => {
+      window.clearInterval(interval);
+      void unlistenSettings.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("remotex-controller-settings", JSON.stringify({
+      controlServerUrl: request.controlServerUrl,
+      controllerName: request.controllerName,
+      caCertificatePath: request.caCertificatePath,
+      clipboardEnabled: request.clipboardEnabled,
+      fileUploadEnabled: request.fileUploadEnabled,
+      fileDownloadEnabled: request.fileDownloadEnabled,
+    }));
+  }, [request.controlServerUrl, request.controllerName, request.caCertificatePath, request.clipboardEnabled, request.fileUploadEnabled, request.fileDownloadEnabled]);
+
+  useEffect(() => {
     if (!frame || frame.mimeType !== "application/x-remotex-rgba") return;
     const canvas = videoCanvasRef.current;
     const context = canvas?.getContext("2d");
@@ -387,6 +482,34 @@ function App() {
     event.preventDefault();
     setFrame(null);
     await invoke("connect_remote", { request });
+  }
+
+  function updateAgent<K extends keyof AgentSettings>(key: K, value: AgentSettings[K]) {
+    setAgentSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  async function saveAgent(event: FormEvent) {
+    event.preventDefault();
+    setAgentMessage("Saving settings…");
+    try {
+      await invoke("save_agent_settings", { settings: agentSettings });
+      const loaded = await invoke<AgentSettings>("load_agent_settings");
+      setAgentSettings(loaded);
+      setAgentMessage("Settings saved. Remote access permissions remain off unless selected.");
+    } catch (error) {
+      setAgentMessage(String(error));
+    }
+  }
+
+  async function setAgentRunning(running: boolean) {
+    setAgentMessage(running ? "Starting Agent…" : "Disconnecting and stopping Agent…");
+    try {
+      const next = await invoke<AgentRuntimeStatus>(running ? "start_agent" : "stop_agent");
+      setAgentRuntime(next);
+      setAgentMessage(running ? "Agent started." : "Remote access disabled until you start it again.");
+    } catch (error) {
+      setAgentMessage(String(error));
+    }
   }
 
   async function startTerminal() {
@@ -630,6 +753,87 @@ function App() {
         </div>
         <span className={`status ${status.state}`}>{status.message}</span>
       </header>
+
+      <section className="agent-settings" ref={settingsRef}>
+        <div className="settings-title">
+          <div>
+            <p className="eyebrow">THIS WINDOWS PC</p>
+            <h2>Agent Settings</h2>
+          </div>
+          <div className={`agent-state ${agentRuntime?.state ?? "offline"}`}>
+            <strong>{agentRuntime?.sessionId ? "Remote session active" : (agentRuntime?.state ?? "Offline")}</strong>
+            <span>Device ID: {agentRuntime?.deviceId ?? "Not registered"}</span>
+          </div>
+        </div>
+        <form className="settings-form" onSubmit={saveAgent}>
+          <div className="settings-grid">
+            <label>
+              Control Server
+              <input value={agentSettings.serverUrl} onChange={(event) => updateAgent("serverUrl", event.target.value)} placeholder="https://control.example.com" />
+            </label>
+            <label>
+              Device Name
+              <input value={agentSettings.deviceName} onChange={(event) => updateAgent("deviceName", event.target.value)} maxLength={128} />
+            </label>
+            <label>
+              Relay CA certificate path
+              <input value={agentSettings.caCertificatePath} onChange={(event) => updateAgent("caCertificatePath", event.target.value)} placeholder="C:\\ProgramData\\RemoteX\\relay-ca.pem" />
+            </label>
+            <label>
+              Video Quality
+              <select value={agentSettings.videoQuality} onChange={(event) => updateAgent("videoQuality", event.target.value as AgentSettings["videoQuality"])}>
+                <option value="low">Low · up to 10 FPS</option>
+                <option value="balanced">Balanced · up to 20 FPS</option>
+                <option value="high">High · up to 30 FPS</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="permission-settings">
+            <h3>Local permission ceiling</h3>
+            <p>The local approval dialog can reduce these permissions again. All optional permissions default off.</p>
+            <div className="permission-grid">
+              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowInput} onChange={(event) => updateAgent("allowInput", event.target.checked)} /><span>Keyboard &amp; mouse</span></label>
+              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowClipboard} onChange={(event) => updateAgent("allowClipboard", event.target.checked)} /><span>Plain-text clipboard</span></label>
+              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowFileUpload} onChange={(event) => updateAgent("allowFileUpload", event.target.checked)} /><span>File upload</span></label>
+              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowFileDownload} onChange={(event) => updateAgent("allowFileDownload", event.target.checked)} /><span>File download</span></label>
+            </div>
+            <label>
+              Allowed file roots
+              <input value={agentSettings.fileRoots} onChange={(event) => updateAgent("fileRoots", event.target.value)} placeholder="Documents=C:\\Users\\User\\Documents;Data=D:\\Data" />
+            </label>
+          </div>
+
+          <div className="unattended-settings">
+            <label className="checkbox important-setting">
+              <input type="checkbox" checked={agentSettings.unattendedAccess} onChange={(event) => updateAgent("unattendedAccess", event.target.checked)} />
+              <span>Enable unattended access (explicit opt-in)</span>
+            </label>
+            {agentSettings.unattendedAccess && <label>
+              Unattended access secret
+              <input type="password" value={agentSettings.unattendedSecret} onChange={(event) => updateAgent("unattendedSecret", event.target.value)} minLength={12} maxLength={128} placeholder={agentSettings.secretConfigured ? "Protected secret already configured; leave blank to keep it" : "Enter a new 12–128 byte secret"} />
+            </label>}
+          </div>
+
+          <div className="startup-settings">
+            <label className="checkbox important-setting">
+              <input type="checkbox" checked={agentSettings.remoteAccessEnabled} onChange={(event) => updateAgent("remoteAccessEnabled", event.target.checked)} />
+              <span>Enable Remote Access on this PC</span>
+            </label>
+            <label className="checkbox">
+              <input type="checkbox" checked={agentSettings.startWithWindows} onChange={(event) => updateAgent("startWithWindows", event.target.checked)} />
+              <span>Start RemoteX with Windows</span>
+            </label>
+          </div>
+
+          <div className="actions">
+            <button type="submit">Save Settings</button>
+            <button type="button" className="secondary" disabled={agentRuntime?.running || !agentSettings.remoteAccessEnabled} onClick={() => void setAgentRunning(true)}>Start Agent</button>
+            <button type="button" className="danger" disabled={!agentRuntime?.running} onClick={() => void setAgentRunning(false)}>Disconnect &amp; Stop</button>
+          </div>
+          {agentMessage && <p className="settings-message" role="status">{agentMessage}</p>}
+        </form>
+      </section>
 
       <section className="workspace">
         <form onSubmit={connect}>

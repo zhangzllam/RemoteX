@@ -39,10 +39,12 @@ use rustls::RootCertStore;
 #[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -1093,12 +1095,23 @@ fn parse_file_roots(value: Option<&str>) -> anyhow::Result<Vec<AllowedRoot>> {
 
 #[cfg(target_os = "linux")]
 fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
+    match File::open(path) {
+        Ok(file) => {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect Linux identity {}", path.display()))?;
+            anyhow::ensure!(metadata.len() <= 64 * 1024, "Linux identity exceeds 64 KiB");
+            let capacity = usize::try_from(metadata.len()).context("identity size is invalid")?;
+            let mut bytes = Vec::with_capacity(capacity);
+            file.take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("read Linux identity {}", path.display()))?;
+            anyhow::ensure!(bytes.len() <= 64 * 1024, "Linux identity exceeds 64 KiB");
             let stored: StoredIdentity = serde_json::from_slice(&bytes)?;
-            Ok(Ed25519DeviceIdentity::from_secret_bytes(parse_key(
-                &stored.secret_key_hex,
-            )?))
+            let mut secret = parse_key(&stored.secret_key_hex)?;
+            let identity = Ed25519DeviceIdentity::from_secret_bytes(secret);
+            secret.fill(0);
+            Ok(identity)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
@@ -1112,7 +1125,6 @@ fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity>
             })?;
             let mut options = OpenOptions::new();
             options.create_new(true).write(true);
-            use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
             let mut file = options
                 .open(path)

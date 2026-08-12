@@ -30,18 +30,18 @@ use remotex_input::{
 #[cfg(windows)]
 use remotex_protocol::{
     AuthorizationDecision, ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin,
-    ConnectionType, DeviceAuthProof, DeviceHeartbeatRequest, DeviceId, DevicePlatform,
-    DeviceRegistrationRequest, DeviceRegistrationResponse, DisplayId, FileTransferDirection,
-    FileTransferErrorCode, FileTransferMessage, IncomingSessionRequest, MAX_FILE_CHUNK_SIZE,
-    Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, ReportSessionEventRequest,
-    ResolveSessionAuthorizationRequest, ResolveSessionAuthorizationResponse, Role,
-    SessionAuditEventKind, SessionCredentials, SessionId, SessionPermissions, SessionToken,
-    TransferId, decode_wire, encode_wire,
+    ConnectionType, ControlMessage, DeviceAuthProof, DeviceHeartbeatRequest, DeviceId,
+    DevicePlatform, DeviceRegistrationRequest, DeviceRegistrationResponse, DisplayId,
+    FileTransferDirection, FileTransferErrorCode, FileTransferMessage, IncomingSessionRequest,
+    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage, RelayServerMessage,
+    ReportSessionEventRequest, ResolveSessionAuthorizationRequest,
+    ResolveSessionAuthorizationResponse, Role, SessionAuditEventKind, SessionCredentials,
+    SessionId, SessionPermissions, SessionToken, TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 #[cfg(windows)]
-use remotex_video::{EncoderConfig, SoftwareEncoder};
+use remotex_video::SessionVideoEncoder;
 #[cfg(windows)]
 use rustls::RootCertStore;
 #[cfg(windows)]
@@ -54,7 +54,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(windows)]
 use tokio::sync::mpsc;
@@ -652,7 +652,7 @@ async fn run_active_session(
     file_service: AgentFileService,
     context: AgentSessionContext<'_>,
 ) -> anyhow::Result<u64> {
-    let codec = SoftwareEncoder::new(EncoderConfig::default())?;
+    let mut codec = SessionVideoEncoder::new(context.frames_per_second)?;
     let mut outbound_sequence = 0_u64;
     let mut expected_inbound_sequence = 0_u64;
     let mut capture_interval = tokio::time::interval(Duration::from_millis(
@@ -670,12 +670,18 @@ async fn run_active_session(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = capture_interval.tick(), if context.view_permission => {
+                let capture_started = Instant::now();
                 let frame = match capture.next_frame() {
                     Ok(frame) => frame,
                     Err(CaptureError::Timeout) => continue,
                     Err(error) => return Err(error.into()),
                 };
-                let video = codec.encode(&frame)?;
+                if !codec.frame_due(frame.timestamp_ms) {
+                    continue;
+                }
+                let capture_latency_ms = u32::try_from(capture_started.elapsed().as_millis())
+                    .unwrap_or(u32::MAX);
+                let video = codec.encode(&frame, capture_latency_ms)?;
                 bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
                     transport,
                     context.session_id,
@@ -728,6 +734,7 @@ async fn run_active_session(
                     input,
                     clipboard,
                     &file_command_sender,
+                    &mut codec,
                 ).await?;
             }
         }
@@ -772,7 +779,7 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         .parse()
         .context("parse REMOTEX_SESSION_ID")?;
     let frames_per_second = std::env::var("REMOTEX_VIDEO_FPS")
-        .unwrap_or_else(|_| "12".to_owned())
+        .unwrap_or_else(|_| "30".to_owned())
         .parse()
         .context("parse REMOTEX_VIDEO_FPS")?;
     if !(1..=30).contains(&frames_per_second) {
@@ -814,7 +821,7 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         anyhow::bail!("REMOTEX_CONTROL_URL must not be empty");
     }
     let frames_per_second = std::env::var("REMOTEX_VIDEO_FPS")
-        .unwrap_or_else(|_| "12".to_owned())
+        .unwrap_or_else(|_| "30".to_owned())
         .parse()
         .context("parse REMOTEX_VIDEO_FPS")?;
     if !(1..=30).contains(&frames_per_second) {
@@ -922,6 +929,7 @@ async fn handle_relay_message(
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
     file_commands: &mpsc::Sender<FileTransferMessage>,
+    video: &mut SessionVideoEncoder,
 ) -> anyhow::Result<()> {
     match message {
         RelayServerMessage::Heartbeat { nonce } => {
@@ -941,6 +949,7 @@ async fn handle_relay_message(
                 expected_sequence,
                 input,
                 clipboard,
+                video,
             )? {
                 file_commands
                     .try_send(file_message)
@@ -965,6 +974,7 @@ fn apply_controller_payload(
     expected_sequence: &mut u64,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    video: &mut SessionVideoEncoder,
 ) -> anyhow::Result<Option<FileTransferMessage>> {
     if payload.len() > MAX_FILE_CHUNK_SIZE as usize + 64 * 1024 {
         anyhow::bail!("Controller data payload exceeds the M7 limit");
@@ -1009,6 +1019,15 @@ fn apply_controller_payload(
         },
         Message::FileTransfer(message) => {
             return finish_inbound_sequence(expected_sequence, Some(message));
+        }
+        Message::Control(ControlMessage::VideoCapabilities { codecs }) => {
+            let selected = video.negotiate(&codecs)?;
+            info!(?selected, %session_id, "negotiated video codec");
+        }
+        Message::Control(ControlMessage::VideoFeedback(feedback)) => {
+            if video.apply_feedback(feedback)? {
+                info!(profile = ?video.profile(), %session_id, "adapted video quality");
+            }
         }
         _ => {
             anyhow::bail!("Controller sent a message not allowed in its data direction");

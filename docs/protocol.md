@@ -159,6 +159,16 @@ both values to match. Nonces are direction-separated and derived from the
 Session ID plus sequence; sequences must never repeat for a session key and
 direction.
 
+## M10 video extension
+
+M10 extends `EncodedVideoFrame` with frame ID, FPS, bitrate, capture/encode
+latency, and key-frame metadata. The encrypted `VideoCapabilities` control
+message advertises H.264, JPEG, and WebP support; `VideoFeedback` reports bounded
+RTT, packet loss, queue pressure, decoder latency, and render latency. The Agent
+uses feedback hysteresis to select 720p/10 FPS, 900p/20 FPS, or 1080p/30 FPS and
+rebuilds the encoder on resolution transitions. Receivers reject empty or
+oversized data, dimensions above 3840×2160, and inconsistent decoded dimensions.
+
 ## Control messages
 
 - `SessionRequest { device_id }`

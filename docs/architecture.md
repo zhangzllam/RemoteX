@@ -211,6 +211,24 @@ style total order resolves simultaneous initial values deterministically and
 both peers converge. Images, HTML, file clipboard formats, and clipboard content
 logging are excluded.
 
+## M10 video pipeline
+
+After the E2EE path is ready, the Controller advertises H.264, JPEG, and WebP.
+The Agent negotiates H.264 when available and otherwise retains its JPEG
+fallback. Capture, codec, and transport remain separate abstractions. OpenH264
+provides the initial software encoder/decoder; later hardware encoders can be
+introduced behind the same traits.
+
+```text
+DXGI BGRA -> adaptive scale -> H.264 -> E2EE envelope -> transport
+          -> persistent decoder -> RGBA canvas + telemetry overlay
+```
+
+The Controller returns at most one encrypted feedback report per second. Three
+poor samples lower resolution/FPS/bitrate and six good samples raise them. Full
+frames remain bounded to 3840×2160 and encoded frames to 8 MiB. JPEG remains the
+pre-negotiation and encoder-failure path.
+
 ## M7 file path and transfer model
 
 M7 exposes only configured Agent roots under virtual names such as `/Documents`.

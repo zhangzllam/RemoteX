@@ -33,8 +33,10 @@ tests all pass.
 
 ## Next
 
-- **M10 — Video optimization:** codec abstraction and negotiation, H.264 with
-  JPEG/WebP fallback, adaptive quality, and latency telemetry.
+M10 is complete: negotiated OpenH264 software encoding, JPEG fallback,
+persistent decoding, bounded adaptive quality, frame telemetry, and a Controller
+debug overlay are implemented. The remaining milestones start at M11.
+
 - **M11 — Direct connectivity:** authenticated LAN/P2P attempts, bounded NAT
   traversal, and reliable Relay fallback.
 - **M12 — Linux server Agent:** authorized PTY terminal, M7 Files reuse, system

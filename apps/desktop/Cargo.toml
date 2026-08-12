@@ -19,6 +19,7 @@ remotex-file-transfer.workspace = true
 remotex-input.workspace = true
 remotex-protocol.workspace = true
 remotex-transport.workspace = true
+remotex-video.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

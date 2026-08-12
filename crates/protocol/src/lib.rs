@@ -473,6 +473,8 @@ pub enum ControlMessage {
     SessionAccepted { permissions: SessionPermissions },
     SessionRejected { reason: String },
     SessionEnded { reason: String },
+    VideoCapabilities { codecs: Vec<VideoCodec> },
+    VideoFeedback(VideoFeedback),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
 }
@@ -617,6 +619,7 @@ pub enum ClipboardMessage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum VideoCodec {
+    H264,
     Jpeg,
     WebP,
 }
@@ -624,12 +627,26 @@ pub enum VideoCodec {
 /// One independently decodable compressed desktop frame.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EncodedVideoFrame {
+    pub frame_id: u64,
     pub width: u32,
     pub height: u32,
+    pub frames_per_second: u32,
+    pub bitrate_bps: u32,
     pub source_timestamp_ms: u64,
+    pub capture_latency_ms: u32,
+    pub encode_latency_ms: u32,
     pub codec: VideoCodec,
     pub key_frame: bool,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VideoFeedback {
+    pub rtt_ms: u32,
+    pub packet_loss_per_mille: u16,
+    pub send_queue_percent: u8,
+    pub decoder_latency_ms: u32,
+    pub render_latency_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

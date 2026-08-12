@@ -14,9 +14,18 @@ import "./style.css";
 
 type VideoFrame = {
   sequence: number;
+  frameId: number;
   width: number;
   height: number;
+  framesPerSecond: number;
+  bitrateBps: number;
   sourceTimestampMs: number;
+  captureLatencyMs: number;
+  encodeLatencyMs: number;
+  decodeLatencyMs: number;
+  endToEndLatencyMs: number;
+  codec: string;
+  keyFrame: boolean;
   mimeType: string;
   data: string;
 };
@@ -223,6 +232,7 @@ function App() {
   const [resumeTransferId, setResumeTransferId] = useState("");
   const [transfers, setTransfers] = useState<Record<string, TransferProgress>>({});
   const screenRef = useRef<HTMLDivElement>(null);
+  const videoCanvasRef = useRef<HTMLCanvasElement>(null);
   const pressedButtons = useRef(new Set<RemoteMouseButton>());
   const pressedKeys = useRef(new Set<RemoteKeyCode>());
   const pendingMove = useRef<UnitPoint | null>(null);
@@ -276,6 +286,22 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!frame || frame.mimeType !== "application/x-remotex-rgba") return;
+    const canvas = videoCanvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    const binary = window.atob(frame.data);
+    const rgba = new Uint8ClampedArray(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      rgba[index] = binary.charCodeAt(index);
+    }
+    if (rgba.length !== frame.width * frame.height * 4) return;
+    canvas.width = frame.width;
+    canvas.height = frame.height;
+    context.putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+  }, [frame]);
 
   useEffect(() => {
     if (status.state !== "connected") {
@@ -506,7 +532,8 @@ function App() {
 
   const connected = status.state === "connected" || status.state === "connecting";
   const interactive = status.state === "connected" && frame !== null;
-  const imageUrl = frame ? `data:${frame.mimeType};base64,${frame.data}` : undefined;
+  const rawFrame = frame?.mimeType === "application/x-remotex-rgba";
+  const imageUrl = frame && !rawFrame ? `data:${frame.mimeType};base64,${frame.data}` : undefined;
 
   return (
     <main>
@@ -626,15 +653,21 @@ function App() {
           onKeyUp={handleKeyUp}
           onBlur={() => void releaseRemoteInputs()}
         >
-          {imageUrl ? (
+          {rawFrame ? (
+            <canvas ref={videoCanvasRef} aria-label="Decoded remote desktop" />
+          ) : imageUrl ? (
             <img src={imageUrl} alt="Remote desktop" draggable={false} />
           ) : (
             <div className="empty">
               <span>Remote display</span>
-              <small>720p JPEG · 10–15 FPS target</small>
+              <small>Adaptive H.264 stream · JPEG fallback</small>
             </div>
           )}
-          {frame && <div className="telemetry">{frame.width}×{frame.height} · frame {frame.sequence}</div>}
+          {frame && (
+            <div className="telemetry">
+              {frame.width}×{frame.height} · {frame.codec} · {frame.framesPerSecond} FPS · {Math.round(frame.bitrateBps / 1000)} kbps · {frame.endToEndLatencyMs} ms
+            </div>
+          )}
         </div>
 
         <section className="files-panel">

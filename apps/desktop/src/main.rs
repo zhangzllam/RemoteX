@@ -11,13 +11,14 @@ use remotex_file_transfer::{
 };
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    ClipboardOrigin, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame, FileEntry,
-    FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
+    ClipboardOrigin, ControlMessage, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame,
+    FileEntry, FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
     MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, MouseButton, RelayClientMessage,
     RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
-    TransferId, VideoCodec, WheelAxis, decode_wire, encode_wire,
+    TransferId, VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
+use remotex_video::{StreamDecoder, VideoDecoder};
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -168,11 +169,26 @@ enum FileEvent {
 #[serde(rename_all = "camelCase")]
 struct VideoFrameEvent {
     sequence: u64,
+    frame_id: u64,
     width: u32,
     height: u32,
+    frames_per_second: u32,
+    bitrate_bps: u32,
     source_timestamp_ms: u64,
+    capture_latency_ms: u32,
+    encode_latency_ms: u32,
+    decode_latency_ms: u32,
+    end_to_end_latency_ms: u64,
+    codec: &'static str,
+    key_frame: bool,
     mime_type: &'static str,
     data: String,
+}
+
+#[derive(Default)]
+struct AgentMessageOutcome {
+    file_message: Option<FileTransferMessage>,
+    video_feedback: Option<VideoFeedback>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -554,6 +570,18 @@ async fn run_remote_session(
     );
     let mut outbound_sequence = 0_u64;
     let mut expected_inbound_sequence = 0_u64;
+    let mut video_decoder = StreamDecoder::new()?;
+    let mut last_video_feedback_ms = 0_u64;
+    send_controller_message(
+        &mut transport,
+        session_id,
+        &outbound_cipher,
+        &mut outbound_sequence,
+        Message::Control(ControlMessage::VideoCapabilities {
+            codecs: vec![VideoCodec::H264, VideoCodec::Jpeg, VideoCodec::WebP],
+        }),
+    )
+    .await?;
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let file_service = ControllerFileService {
@@ -578,7 +606,7 @@ async fn run_remote_session(
             _ = &mut cancellation => break,
             result = transport.receive() => {
                 let relay_message = decode_wire::<RelayServerMessage>(&result?)?;
-                if let Some(message) = handle_relay_message(
+                let outcome = handle_relay_message(
                     &app,
                     &mut transport,
                     relay_message,
@@ -586,10 +614,25 @@ async fn run_remote_session(
                     &inbound_cipher,
                     &mut expected_inbound_sequence,
                     &mut clipboard,
-                ).await? {
+                    &mut video_decoder,
+                ).await?;
+                if let Some(message) = outcome.file_message {
                     remote_file_sender
                         .try_send(message)
                         .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+                }
+                if let Some(feedback) = outcome.video_feedback {
+                    let current_ms = now_ms()?;
+                    if current_ms.saturating_sub(last_video_feedback_ms) >= 1_000 {
+                        send_controller_message(
+                            &mut transport,
+                            session_id,
+                            &outbound_cipher,
+                            &mut outbound_sequence,
+                            Message::Control(ControlMessage::VideoFeedback(feedback)),
+                        ).await?;
+                        last_video_feedback_ms = current_ms;
+                    }
                 }
             }
             event = input_receiver.recv(), if resolved.permissions.control_input => {
@@ -693,6 +736,7 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_relay_message(
     app: &AppHandle,
     transport: &mut QuicFrameConnection,
@@ -701,7 +745,8 @@ async fn handle_relay_message(
     inbound_cipher: &XChaChaSessionCipher,
     expected_sequence: &mut u64,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
-) -> anyhow::Result<Option<FileTransferMessage>> {
+    video_decoder: &mut StreamDecoder,
+) -> anyhow::Result<AgentMessageOutcome> {
     match message {
         RelayServerMessage::Payload(payload) => handle_agent_payload(
             app,
@@ -710,17 +755,18 @@ async fn handle_relay_message(
             inbound_cipher,
             expected_sequence,
             clipboard,
+            video_decoder,
         ),
         RelayServerMessage::Heartbeat { nonce } => {
             let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
             transport
                 .send(Bytes::from(encode_wire(&acknowledgement)?))
                 .await?;
-            Ok(None)
+            Ok(AgentMessageOutcome::default())
         }
         RelayServerMessage::HeartbeatAck { .. }
         | RelayServerMessage::WaitingForPeer { .. }
-        | RelayServerMessage::PeerReady => Ok(None),
+        | RelayServerMessage::PeerReady => Ok(AgentMessageOutcome::default()),
         RelayServerMessage::SessionClosed { reason } => {
             anyhow::bail!("relay session closed: {reason:?}");
         }
@@ -737,7 +783,8 @@ fn handle_agent_payload(
     cipher: &XChaChaSessionCipher,
     expected_sequence: &mut u64,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
-) -> anyhow::Result<Option<FileTransferMessage>> {
+    video_decoder: &mut StreamDecoder,
+) -> anyhow::Result<AgentMessageOutcome> {
     if bytes.len() > MAX_FILE_CHUNK_SIZE as usize + 64 * 1024 {
         anyhow::bail!("Agent data payload exceeds the M7 limit");
     }
@@ -766,51 +813,74 @@ fn handle_agent_payload(
     if envelope.sequence != sequence {
         anyhow::bail!("encrypted Agent sequence does not match its envelope");
     }
-    let file_message = match envelope.message {
+    let mut outcome = AgentMessageOutcome::default();
+    match envelope.message {
         Message::Video(frame) => {
-            emit_video_frame(app, sequence, frame)?;
-            None
+            outcome.video_feedback = Some(emit_video_frame(app, sequence, &frame, video_decoder)?);
         }
-        Message::Clipboard(message) => {
-            match clipboard.apply(message) {
-                Ok(_) => {}
-                Err(ClipboardError::PermissionDenied) => {
-                    warn!(event = "clipboard_permission_denied", %session_id);
-                }
-                Err(error) => return Err(error.into()),
+        Message::Clipboard(message) => match clipboard.apply(message) {
+            Ok(_) => {}
+            Err(ClipboardError::PermissionDenied) => {
+                warn!(event = "clipboard_permission_denied", %session_id);
             }
-            None
-        }
-        Message::FileTransfer(message) => Some(message),
+            Err(error) => return Err(error.into()),
+        },
+        Message::FileTransfer(message) => outcome.file_message = Some(message),
         _ => anyhow::bail!("Agent sent a message not allowed in its data direction"),
-    };
+    }
     *expected_sequence = expected_sequence
         .checked_add(1)
         .context("Agent inbound sequence space exhausted")?;
-    Ok(file_message)
+    Ok(outcome)
 }
 
 fn emit_video_frame(
     app: &AppHandle,
     sequence: u64,
-    frame: EncodedVideoFrame,
-) -> anyhow::Result<()> {
-    let mime_type = match frame.codec {
-        VideoCodec::Jpeg => "image/jpeg",
-        VideoCodec::WebP => "image/webp",
+    frame: &EncodedVideoFrame,
+    decoder: &mut StreamDecoder,
+) -> anyhow::Result<VideoFeedback> {
+    let decoded_frame = decoder.decode_frame(frame)?;
+    let frame_budget_ms = 1_000 / frame.frames_per_second.max(1);
+    let queue_percent = decoded_frame
+        .decode_latency_ms
+        .saturating_mul(100)
+        .checked_div(frame_budget_ms)
+        .unwrap_or(100)
+        .min(100) as u8;
+    let codec = match frame.codec {
+        VideoCodec::H264 => "H.264",
+        VideoCodec::Jpeg => "JPEG",
+        VideoCodec::WebP => "WebP",
     };
+    let end_to_end_latency_ms = now_ms()?.saturating_sub(frame.source_timestamp_ms);
     app.emit(
         "video-frame",
         VideoFrameEvent {
             sequence,
+            frame_id: frame.frame_id,
             width: frame.width,
             height: frame.height,
+            frames_per_second: frame.frames_per_second,
+            bitrate_bps: frame.bitrate_bps,
             source_timestamp_ms: frame.source_timestamp_ms,
-            mime_type,
-            data: STANDARD.encode(frame.payload),
+            capture_latency_ms: frame.capture_latency_ms,
+            encode_latency_ms: frame.encode_latency_ms,
+            decode_latency_ms: decoded_frame.decode_latency_ms,
+            end_to_end_latency_ms,
+            codec,
+            key_frame: frame.key_frame,
+            mime_type: "application/x-remotex-rgba",
+            data: STANDARD.encode(decoded_frame.rgba),
         },
     )?;
-    Ok(())
+    Ok(VideoFeedback {
+        rtt_ms: 0,
+        packet_loss_per_mille: 0,
+        send_queue_percent: queue_percent,
+        decoder_latency_ms: decoded_frame.decode_latency_ms,
+        render_latency_ms: 0,
+    })
 }
 
 impl ControllerFileService {

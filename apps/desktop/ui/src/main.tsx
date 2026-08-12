@@ -11,7 +11,11 @@ import {
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Icon, StatusPill, Toggle, type IconName } from "./ui";
+import "./design-tokens.css";
 import "./style.css";
+import "./v11.css";
 
 type VideoFrame = {
   sequence: number;
@@ -61,6 +65,7 @@ const ANSI_COLORS: Record<number, string> = {
   90: "#7d8798", 91: "#ff8e8e", 92: "#9bf0c3", 93: "#ffe29a",
   94: "#94bdff", 95: "#e3b0ff", 96: "#91edf1", 97: "#ffffff",
 };
+const IS_TAURI = typeof (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ === "object";
 
 function renderAnsi(text: string): ReactNode[] {
   const output: ReactNode[] = [];
@@ -129,6 +134,43 @@ type AgentRuntimeStatus = {
   sessionId: string | null;
   startWithWindows: boolean;
 };
+
+type Page = "home" | "devices" | "files" | "settings" | "about" | "session";
+type SettingsSection = "general" | "remote" | "permissions" | "video" | "network" | "security" | "advanced";
+type AllowedFolder = { label: string; path: string };
+type RecentDevice = { deviceId: string; connectedAt: number };
+
+const NAV_ITEMS: { page: Exclude<Page, "session">; label: string; icon: IconName }[] = [
+  { page: "home", label: "Home", icon: "home" }, { page: "devices", label: "Devices", icon: "devices" },
+  { page: "files", label: "Files", icon: "files" }, { page: "settings", label: "Settings", icon: "settings" },
+  { page: "about", label: "About", icon: "about" },
+];
+const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
+  { id: "general", label: "General" }, { id: "remote", label: "Remote Access" },
+  { id: "permissions", label: "Permissions" }, { id: "video", label: "Video" },
+  { id: "network", label: "Network" }, { id: "security", label: "Security" },
+  { id: "advanced", label: "Advanced" },
+];
+function parseFolders(value: string): AllowedFolder[] {
+  return value.split(";").map((item) => item.trim()).filter(Boolean).map((item) => {
+    const separator = item.indexOf("=");
+    if (separator < 0) return { label: item.split(/[\\/]/).filter(Boolean).at(-1) ?? "Folder", path: item };
+    return { label: item.slice(0, separator).trim() || "Folder", path: item.slice(separator + 1).trim() };
+  }).filter((folder) => Boolean(folder.path));
+}
+function serializeFolders(folders: AllowedFolder[]): string {
+  return folders.map((folder) => `${folder.label.replace(/[;=]/g, "").trim() || "Folder"}=${folder.path}`).join(";");
+}
+function formatDeviceId(value: string | null | undefined): string {
+  if (!value) return "Not registered";
+  const digits = value.replace(/\D/g, "");
+  return digits.length === 9 ? `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}` : value;
+}
+function loadRecentDevices(): RecentDevice[] {
+  try { return (JSON.parse(localStorage.getItem("remotex-recent-devices") ?? "[]") as RecentDevice[]).filter((item) => /^\d{9}$/.test(item.deviceId)).slice(0, 5); }
+  catch { return []; }
+}
+function friendlyError(error: unknown): string { return String(error).replace(/^Error:\s*/i, "") || "The operation could not be completed."; }
 
 type RemoteFileEntry = {
   name: string;
@@ -331,8 +373,15 @@ function App() {
   const [request, setRequest] = useState(loadControllerSettings);
   const [status, setStatus] = useState<ConnectionStatus>({
     state: "disconnected",
-    message: "Not connected",
+    message: "",
   });
+  const [page, setPage] = useState<Page>("home");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [recentDevices, setRecentDevices] = useState<RecentDevice[]>(loadRecentDevices);
+  const [copied, setCopied] = useState(false);
+  const [sessionSeconds, setSessionSeconds] = useState(0);
+  const [uiError, setUiError] = useState("");
+  const [saving, setSaving] = useState(false);
   const [frame, setFrame] = useState<VideoFrame | null>(null);
   const [filePath, setFilePath] = useState("/");
   const [fileEntries, setFileEntries] = useState<RemoteFileEntry[]>([]);
@@ -361,12 +410,13 @@ function App() {
   const inputChain = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
+    if (!IS_TAURI) return;
     const unlistenFrame = listen<VideoFrame>("video-frame", (event) => {
       setFrame(event.payload);
     });
     const unlistenStatus = listen<ConnectionStatus>(
       "connection-status",
-      (event) => setStatus(event.payload),
+      (event) => { setStatus(event.payload); if (event.payload.state === "connected") setPage("session"); },
     );
     const unlistenFiles = listen<FileEvent>("file-event", (event) => {
       const update = event.payload;
@@ -425,24 +475,34 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!IS_TAURI) return;
     void invoke<AgentSettings>("load_agent_settings")
-      .then(setAgentSettings)
-      .catch((error) => setAgentMessage(String(error)));
+      .then((loaded) => { setAgentSettings(loaded); setRequest((current) => ({ ...current, controlServerUrl: current.controlServerUrl || loaded.serverUrl, caCertificatePath: current.caCertificatePath || loaded.caCertificatePath })); })
+      .catch((error) => setUiError(friendlyError(error)));
     const refresh = () => {
       void invoke<AgentRuntimeStatus>("agent_status")
         .then(setAgentRuntime)
-        .catch((error) => setAgentMessage(String(error)));
+        .catch((error) => setUiError(friendlyError(error)));
     };
     refresh();
     const interval = window.setInterval(refresh, 2_000);
     const unlistenSettings = listen("open-settings", () => {
-      settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setPage("settings"); setSettingsSection("general");
     });
     return () => {
       window.clearInterval(interval);
       void unlistenSettings.then((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    if (status.state !== "connected") { setSessionSeconds(0); return; }
+    const deviceId = request.deviceId.replace(/\D/g, "");
+    if (/^\d{9}$/.test(deviceId)) setRecentDevices((current) => [{ deviceId, connectedAt: Date.now() }, ...current.filter((item) => item.deviceId !== deviceId)].slice(0, 5));
+    const interval = window.setInterval(() => setSessionSeconds((seconds) => seconds + 1), 1_000);
+    return () => window.clearInterval(interval);
+  }, [status.state, request.deviceId]);
+  useEffect(() => { localStorage.setItem("remotex-recent-devices", JSON.stringify(recentDevices)); }, [recentDevices]);
 
   useEffect(() => {
     window.localStorage.setItem("remotex-controller-settings", JSON.stringify({
@@ -480,25 +540,65 @@ function App() {
 
   async function connect(event: FormEvent) {
     event.preventDefault();
+    const deviceId = request.deviceId.replace(/\D/g, "");
+    if (!/^\d{9}$/.test(deviceId)) { setUiError("Enter the 9-digit ID shown on the remote device."); return; }
+    setUiError("");
     setFrame(null);
-    await invoke("connect_remote", { request });
+    setStatus({ state: "connecting", message: "Requesting a secure session…" });
+    try { await invoke("connect_remote", { request: { ...request, deviceId } }); }
+    catch (error) { setStatus({ state: "failed", message: friendlyError(error) }); setUiError(friendlyError(error)); }
   }
 
   function updateAgent<K extends keyof AgentSettings>(key: K, value: AgentSettings[K]) {
     setAgentSettings((current) => ({ ...current, [key]: value }));
   }
 
+  async function persistAgent(next: AgentSettings, message = "Changes saved.") {
+    setSaving(true); setAgentMessage(""); setUiError(""); setAgentSettings(next);
+    try {
+      await invoke("save_agent_settings", { settings: next });
+      const loaded = await invoke<AgentSettings>("load_agent_settings");
+      setAgentSettings(loaded); setAgentMessage(message); return loaded;
+    } catch (error) { setUiError(friendlyError(error)); throw error; }
+    finally { setSaving(false); }
+  }
+
   async function saveAgent(event: FormEvent) {
     event.preventDefault();
     setAgentMessage("Saving settings…");
+    try { await persistAgent(agentSettings, "Settings applied."); } catch { /* handled above */ }
+  }
+
+  async function toggleRemoteAccess(enabled: boolean) {
+    const previous = agentSettings;
     try {
-      await invoke("save_agent_settings", { settings: agentSettings });
-      const loaded = await invoke<AgentSettings>("load_agent_settings");
-      setAgentSettings(loaded);
-      setAgentMessage("Settings saved. Remote access permissions remain off unless selected.");
-    } catch (error) {
-      setAgentMessage(String(error));
-    }
+      const saved = await persistAgent({ ...agentSettings, remoteAccessEnabled: enabled }, enabled ? "Remote access enabled." : "Remote access disabled.");
+      setAgentRuntime(await invoke<AgentRuntimeStatus>(enabled ? "start_agent" : "stop_agent")); setAgentSettings(saved);
+    } catch { setAgentSettings(previous); void invoke<AgentSettings>("load_agent_settings").then(setAgentSettings).catch(() => undefined); }
+  }
+
+  async function chooseCertificate(target: "agent" | "controller") {
+    try {
+      const selected = await open({ multiple: false, directory: false, filters: [{ name: "Certificates", extensions: ["pem", "crt", "cer"] }] });
+      if (typeof selected !== "string") return;
+      if (target === "agent") updateAgent("caCertificatePath", selected); else update("caCertificatePath", selected);
+    } catch (error) { setUiError(friendlyError(error)); }
+  }
+
+  async function addAllowedFolder() {
+    try {
+      const selected = await open({ multiple: false, directory: true });
+      if (typeof selected !== "string") return;
+      const folders = parseFolders(agentSettings.fileRoots);
+      if (folders.some((folder) => folder.path.toLocaleLowerCase() === selected.toLocaleLowerCase())) return;
+      updateAgent("fileRoots", serializeFolders([...folders, { label: selected.split(/[\\/]/).filter(Boolean).at(-1) ?? "Folder", path: selected }]));
+    } catch (error) { setUiError(friendlyError(error)); }
+  }
+
+  async function copyDeviceId() {
+    if (!agentRuntime?.deviceId) return;
+    try { await navigator.clipboard.writeText(agentRuntime.deviceId); setCopied(true); window.setTimeout(() => setCopied(false), 1_500); }
+    catch (error) { setUiError(friendlyError(error)); }
   }
 
   async function setAgentRunning(running: boolean) {
@@ -739,332 +839,104 @@ function App() {
     void sendKeyboard({ kind: "keyUp", key });
   }
 
-  const connected = status.state === "connected" || status.state === "connecting";
-  const interactive = status.state === "connected" && frame !== null;
-  const rawFrame = frame?.mimeType === "application/x-remotex-rgba";
-  const imageUrl = frame && !rawFrame ? `data:${frame.mimeType};base64,${frame.data}` : undefined;
+  const isConnected = status.state === "connected";
+  const isConnecting = status.state === "connecting";
+  const rawV11Frame = frame?.mimeType === "application/x-remotex-rgba";
+  const v11ImageUrl = frame && !rawV11Frame ? `data:${frame.mimeType};base64,${frame.data}` : undefined;
+  const folders = parseFolders(agentSettings.fileRoots);
+  const remoteEnabled = agentSettings.remoteAccessEnabled;
+  const agentReady = Boolean(agentRuntime?.running && agentRuntime.deviceId);
+  const topTitle = page === "session" ? "Active Session" : NAV_ITEMS.find((item) => item.page === page)?.label ?? "RemoteX";
+  const duration = `${String(Math.floor(sessionSeconds / 60)).padStart(2, "0")}:${String(sessionSeconds % 60).padStart(2, "0")}`;
+
+  function immediateAgent<K extends keyof AgentSettings>(key: K, value: AgentSettings[K]) {
+    const next = { ...agentSettings, [key]: value };
+    void persistAgent(next).catch(() => undefined);
+  }
 
   return (
-    <main>
-      <header>
-        <div>
-          <p className="eyebrow">SELF-HOSTED REMOTE DESKTOP</p>
-          <h1>RemoteX</h1>
-        </div>
-        <span className={`status ${status.state}`}>{status.message}</span>
-      </header>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><span className="brand-mark"><Icon name="monitor" size={20} /></span><span><strong>RemoteX</strong><small>Secure remote access</small></span></div>
+        <nav aria-label="Main navigation">
+          {NAV_ITEMS.map((item) => <button key={item.page} type="button" className={page === item.page ? "active" : ""} aria-current={page === item.page ? "page" : undefined} onClick={() => setPage(item.page)}><Icon name={item.icon} /><span>{item.label}</span>{item.page === "devices" && isConnected && <i className="live-dot" />}</button>)}
+        </nav>
+        <div className="sidebar-device"><span className={`device-orb ${agentReady ? "success" : remoteEnabled ? "warning" : ""}`}><Icon name="power" size={15} /></span><span><strong>{agentSettings.deviceName || "This Windows PC"}</strong><small>{agentReady ? "Ready for access" : remoteEnabled ? "Starting…" : "Remote access off"}</small></span></div>
+      </aside>
 
-      <section className="agent-settings" ref={settingsRef}>
-        <div className="settings-title">
-          <div>
-            <p className="eyebrow">THIS WINDOWS PC</p>
-            <h2>Agent Settings</h2>
-          </div>
-          <div className={`agent-state ${agentRuntime?.state ?? "offline"}`}>
-            <strong>{agentRuntime?.sessionId ? "Remote session active" : (agentRuntime?.state ?? "Offline")}</strong>
-            <span>Device ID: {agentRuntime?.deviceId ?? "Not registered"}</span>
-          </div>
-        </div>
-        <form className="settings-form" onSubmit={saveAgent}>
-          <div className="settings-grid">
-            <label>
-              Control Server
-              <input value={agentSettings.serverUrl} onChange={(event) => updateAgent("serverUrl", event.target.value)} placeholder="https://control.example.com" />
-            </label>
-            <label>
-              Device Name
-              <input value={agentSettings.deviceName} onChange={(event) => updateAgent("deviceName", event.target.value)} maxLength={128} />
-            </label>
-            <label>
-              Relay CA certificate path
-              <input value={agentSettings.caCertificatePath} onChange={(event) => updateAgent("caCertificatePath", event.target.value)} placeholder="C:\\ProgramData\\RemoteX\\relay-ca.pem" />
-            </label>
-            <label>
-              Video Quality
-              <select value={agentSettings.videoQuality} onChange={(event) => updateAgent("videoQuality", event.target.value as AgentSettings["videoQuality"])}>
-                <option value="low">Low · up to 10 FPS</option>
-                <option value="balanced">Balanced · up to 20 FPS</option>
-                <option value="high">High · up to 30 FPS</option>
-              </select>
-            </label>
-          </div>
+      <main className="main-area">
+        <header className="topbar"><div><p className="eyebrow">REMOTEX DESKTOP</p><h1>{topTitle}</h1></div>{isConnected ? <button type="button" className="session-chip" onClick={() => setPage("session")}><i className="live-dot" /><span>{formatDeviceId(request.deviceId)} · {duration}</span><Icon name="chevron" size={14} /></button> : <StatusPill tone={agentReady ? "success" : remoteEnabled ? "warning" : "neutral"}>{agentReady ? "This PC is ready" : remoteEnabled ? "Agent starting" : "Local access off"}</StatusPill>}</header>
 
-          <div className="permission-settings">
-            <h3>Local permission ceiling</h3>
-            <p>The local approval dialog can reduce these permissions again. All optional permissions default off.</p>
-            <div className="permission-grid">
-              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowInput} onChange={(event) => updateAgent("allowInput", event.target.checked)} /><span>Keyboard &amp; mouse</span></label>
-              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowClipboard} onChange={(event) => updateAgent("allowClipboard", event.target.checked)} /><span>Plain-text clipboard</span></label>
-              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowFileUpload} onChange={(event) => updateAgent("allowFileUpload", event.target.checked)} /><span>File upload</span></label>
-              <label className="checkbox"><input type="checkbox" checked={agentSettings.allowFileDownload} onChange={(event) => updateAgent("allowFileDownload", event.target.checked)} /><span>File download</span></label>
-            </div>
-            <label>
-              Allowed file roots
-              <input value={agentSettings.fileRoots} onChange={(event) => updateAgent("fileRoots", event.target.value)} placeholder="Documents=C:\\Users\\User\\Documents;Data=D:\\Data" />
-            </label>
-          </div>
+        <div className={`page-content page-${page}`}>
+          {page === "home" && <div className="home-grid">
+            <section className="hero-card">
+              <div className="card-heading"><div><span className="feature-icon"><Icon name="monitor" size={21} /></span><h2>This Windows PC</h2><p>Share this ID only with people you trust.</p></div><StatusPill tone={agentReady ? "success" : remoteEnabled ? "warning" : "neutral"}>{agentReady ? "Ready" : remoteEnabled ? "Starting" : "Access off"}</StatusPill></div>
+              <div className={`device-identity ${agentRuntime?.deviceId ? "" : "unregistered"}`}><span>Your device ID</span><div><strong>{formatDeviceId(agentRuntime?.deviceId)}</strong><button type="button" className="icon-button" aria-label="Copy device ID" disabled={!agentRuntime?.deviceId} onClick={() => void copyDeviceId()}><Icon name={copied ? "check" : "copy"} /></button></div><small>{agentRuntime?.deviceId ? "Use this ID to connect to this PC." : "Enable remote access to register this device."}</small></div>
+              <div className="setting-row emphasized"><span><strong>Allow remote access</strong><small>Automatically starts or stops the local Agent.</small></span><Toggle label="Allow remote access" checked={remoteEnabled} disabled={saving} onChange={(value) => void toggleRemoteAccess(value)} /></div>
+              {!remoteEnabled && <div className="setup-guide"><span className="step-number">1</span><span><strong>Turn on remote access</strong><small>Your ID appears after secure registration.</small></span><button type="button" className="text-button" onClick={() => { setPage("settings"); setSettingsSection("remote"); }}>Review settings</button></div>}
+              {agentMessage && <p className="inline-message success" role="status"><Icon name="check" size={14} />{agentMessage}</p>}
+              <div className="privacy-note"><Icon name="shield" /><span><strong>End-to-end encrypted</strong><small>Session keys remain between your devices.</small></span></div>
+            </section>
 
-          <div className="unattended-settings">
-            <label className="checkbox important-setting">
-              <input type="checkbox" checked={agentSettings.unattendedAccess} onChange={(event) => updateAgent("unattendedAccess", event.target.checked)} />
-              <span>Enable unattended access (explicit opt-in)</span>
-            </label>
-            {agentSettings.unattendedAccess && <label>
-              Unattended access secret
-              <input type="password" value={agentSettings.unattendedSecret} onChange={(event) => updateAgent("unattendedSecret", event.target.value)} minLength={12} maxLength={128} placeholder={agentSettings.secretConfigured ? "Protected secret already configured; leave blank to keep it" : "Enter a new 12–128 byte secret"} />
-            </label>}
-          </div>
-
-          <div className="startup-settings">
-            <label className="checkbox important-setting">
-              <input type="checkbox" checked={agentSettings.remoteAccessEnabled} onChange={(event) => updateAgent("remoteAccessEnabled", event.target.checked)} />
-              <span>Enable Remote Access on this PC</span>
-            </label>
-            <label className="checkbox">
-              <input type="checkbox" checked={agentSettings.startWithWindows} onChange={(event) => updateAgent("startWithWindows", event.target.checked)} />
-              <span>Start RemoteX with Windows</span>
-            </label>
-          </div>
-
-          <div className="actions">
-            <button type="submit">Save Settings</button>
-            <button type="button" className="secondary" disabled={agentRuntime?.running || !agentSettings.remoteAccessEnabled} onClick={() => void setAgentRunning(true)}>Start Agent</button>
-            <button type="button" className="danger" disabled={!agentRuntime?.running} onClick={() => void setAgentRunning(false)}>Disconnect &amp; Stop</button>
-          </div>
-          {agentMessage && <p className="settings-message" role="status">{agentMessage}</p>}
-        </form>
-      </section>
-
-      <section className="workspace">
-        <form onSubmit={connect}>
-          <label>
-            Control server URL
-            <input value={request.controlServerUrl} onChange={(e) => update("controlServerUrl", e.target.value)} placeholder="https://control.example.com" />
-          </label>
-          <label>
-            Remote device ID
-            <input value={request.deviceId} onChange={(e) => update("deviceId", e.target.value)} inputMode="numeric" pattern="[0-9]{9}" required={Boolean(request.controlServerUrl.trim())} />
-          </label>
-          <label>
-            Controller name
-            <input value={request.controllerName} onChange={(e) => update("controllerName", e.target.value)} required={Boolean(request.controlServerUrl.trim())} />
-          </label>
-          <label>
-            Unattended access secret (optional)
-            <input type="password" value={request.unattendedSecret} onChange={(e) => update("unattendedSecret", e.target.value)} minLength={12} maxLength={128} />
-          </label>
-          <label>
-            CA certificate path
-            <input value={request.caCertificatePath} onChange={(e) => update("caCertificatePath", e.target.value)} required />
-          </label>
-          <details>
-            <summary>Manual session fallback</summary>
-            <label>
-              Relay address
-              <input value={request.relayAddress} onChange={(e) => update("relayAddress", e.target.value)} required={!request.controlServerUrl.trim()} />
-            </label>
-            <label>
-              TLS server name
-              <input value={request.serverName} onChange={(e) => update("serverName", e.target.value)} required={!request.controlServerUrl.trim()} />
-            </label>
-            <label>
-              Session ID
-              <input value={request.sessionId} onChange={(e) => update("sessionId", e.target.value)} required={!request.controlServerUrl.trim()} />
-            </label>
-            <label>
-              One-time controller token
-              <input type="password" value={request.tokenHex} onChange={(e) => update("tokenHex", e.target.value)} minLength={64} maxLength={64} required={!request.controlServerUrl.trim()} />
-            </label>
-            <label>
-              End-to-end session key
-              <input type="password" value={request.endToEndKeyHex} onChange={(e) => update("endToEndKeyHex", e.target.value)} minLength={64} maxLength={64} required={!request.controlServerUrl.trim()} />
-            </label>
-          </details>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={request.clipboardEnabled}
-              onChange={(event) =>
-                setRequest((current) => ({
-                  ...current,
-                  clipboardEnabled: event.target.checked,
-                }))
-              }
-            />
-            <span>Sync plain-text clipboard</span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={request.fileUploadEnabled}
-              onChange={(event) =>
-                setRequest((current) => ({
-                  ...current,
-                  fileUploadEnabled: event.target.checked,
-                }))
-              }
-            />
-            <span>Allow file upload</span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={request.fileDownloadEnabled}
-              onChange={(event) =>
-                setRequest((current) => ({
-                  ...current,
-                  fileDownloadEnabled: event.target.checked,
-                }))
-              }
-            />
-            <span>Allow file download</span>
-          </label>
-          <div className="actions">
-            <button type="submit" disabled={connected}>Connect</button>
-            <button type="button" className="secondary" onClick={disconnect} disabled={!connected}>Disconnect</button>
-          </div>
-        </form>
-
-        <div className="content-column">
-        <div
-          ref={screenRef}
-          className={`screen ${interactive ? "interactive" : ""}`}
-          aria-live="polite"
-          aria-label="Remote desktop"
-          role="application"
-          tabIndex={interactive ? 0 : -1}
-          onContextMenu={(event) => event.preventDefault()}
-          onPointerMove={handlePointerMove}
-          onPointerDown={handlePointerDown}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerCancel}
-          onWheel={handleWheel}
-          onKeyDown={handleKeyDown}
-          onKeyUp={handleKeyUp}
-          onBlur={() => void releaseRemoteInputs()}
-        >
-          {rawFrame ? (
-            <canvas ref={videoCanvasRef} aria-label="Decoded remote desktop" />
-          ) : imageUrl ? (
-            <img src={imageUrl} alt="Remote desktop" draggable={false} />
-          ) : (
-            <div className="empty">
-              <span>Remote display</span>
-              <small>Adaptive H.264 stream · JPEG fallback</small>
-            </div>
-          )}
-          {frame && (
-            <div className="telemetry">
-              {frame.width}×{frame.height} · {frame.codec} · {frame.framesPerSecond} FPS · {Math.round(frame.bitrateBps / 1000)} kbps · {frame.endToEndLatencyMs} ms
-            </div>
-          )}
-        </div>
-
-        <section className="files-panel">
-          <div className="files-header">
-            <div>
-              <p className="eyebrow">REMOTE FILES</p>
-              <h2>{filePath}</h2>
-            </div>
-            <div className="inline-actions">
-              <button type="button" className="secondary" disabled={status.state !== "connected" || filePath === "/"} onClick={() => void listFiles(parentPath(filePath))}>Up</button>
-              <button type="button" className="secondary" disabled={status.state !== "connected"} onClick={() => void listFiles(filePath)}>Refresh</button>
-            </div>
-          </div>
-          {fileError && <p className="file-error">{fileError}</p>}
-          <div className="file-table-wrap">
-            <table>
-              <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead>
-              <tbody>
-                {fileEntries.map((entry) => (
-                  <tr key={entry.path} onDoubleClick={() => {
-                    if (entry.entryType === "directory") void listFiles(entry.path);
-                    else setDownloadSourcePath(entry.path);
-                  }}>
-                    <td><button type="button" className="file-link" onClick={() => entry.entryType === "directory" ? void listFiles(entry.path) : setDownloadSourcePath(entry.path)}>{entry.name}</button></td>
-                    <td>{entry.entryType === "file" ? formatBytes(entry.size) : "—"}</td>
-                    <td>{entry.modifiedMs ? new Date(entry.modifiedMs).toLocaleString() : "—"}</td>
-                    <td>{entry.entryType}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="file-tools">
-            <div>
-              <h3>New folder</h3>
-              <input value={newFolderName} onChange={(event) => setNewFolderName(event.target.value)} placeholder="Folder name" />
-              <button type="button" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void createDirectory()}>Create</button>
-            </div>
-            <div>
-              <h3>Upload</h3>
-              <input value={uploadLocalPath} onChange={(event) => setUploadLocalPath(event.target.value)} placeholder="Local source file" />
-              <input value={uploadDestinationPath} onChange={(event) => setUploadDestinationPath(event.target.value)} placeholder="Remote destination, e.g. /Data/file.zip" />
-              <button type="button" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void uploadFile()}>Upload</button>
-            </div>
-            <div>
-              <h3>Download</h3>
-              <input value={downloadSourcePath} onChange={(event) => setDownloadSourcePath(event.target.value)} placeholder="Remote source file" />
-              <input value={downloadLocalPath} onChange={(event) => setDownloadLocalPath(event.target.value)} placeholder="Local destination file" />
-              <button type="button" disabled={status.state !== "connected" || !request.fileDownloadEnabled} onClick={() => void downloadFile()}>Download</button>
-            </div>
-          </div>
-
-          <div className="resume-tools">
-            <input value={resumeTransferId} onChange={(event) => setResumeTransferId(event.target.value)} placeholder="Interrupted transfer ID" />
-            <button type="button" className="secondary" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void resumeUpload()}>Resume upload</button>
-            <button type="button" className="secondary" disabled={status.state !== "connected" || !request.fileDownloadEnabled} onClick={() => void resumeDownload()}>Resume download</button>
-          </div>
-
-          <div className="transfers">
-            {Object.values(transfers).map((transfer) => {
-              const percent = transfer.total > 0 ? Math.min(100, transfer.transferred / transfer.total * 100) : 0;
-              return <div className="transfer" key={transfer.transferId}>
-                <div><strong>{transfer.direction}</strong><span>{transfer.state} · {formatBytes(transfer.transferred)}{transfer.total > 0 ? ` / ${formatBytes(transfer.total)}` : ""}</span></div>
-                <progress max={100} value={percent} />
-                {!(["completed", "cancelled", "error"].includes(transfer.state)) && <button type="button" className="secondary" onClick={() => void invoke("cancel_file_transfer", { transferId: transfer.transferId })}>Cancel</button>}
-              </div>;
-            })}
-          </div>
-        </section>
-
-        <section className="server-panel">
-          <div className="files-header">
-            <div><p className="eyebrow">LINUX SERVER</p><h2>Terminal</h2></div>
-            <div className="inline-actions">
-              <button type="button" disabled={status.state !== "connected" || Boolean(terminalId)} onClick={() => void startTerminal()}>Open terminal</button>
-              <button type="button" className="secondary" disabled={!terminalId} onClick={() => void invoke("resize_terminal", { terminalId, columns: 160, rows: 40 })}>Resize 160×40</button>
-              <button type="button" className="secondary" disabled={!terminalId} onClick={() => {
-                void invoke("close_terminal", { terminalId });
-                setTerminalId("");
-              }}>Close</button>
-            </div>
-          </div>
-          <pre className="terminal" aria-live="polite">{terminalOutput ? renderAnsi(terminalOutput) : "Connect to an authorized Linux Agent, then open a PTY."}</pre>
-          <form className="terminal-input" onSubmit={submitTerminal}>
-            <input value={terminalInput} onChange={(event) => setTerminalInput(event.target.value)} disabled={!terminalId} placeholder="Command or UTF-8 terminal input" />
-            <button type="submit" disabled={!terminalId || !terminalInput}>Send</button>
-            <button type="button" className="secondary" disabled={!terminalId} onClick={() => void invoke("send_terminal_input", { terminalId, data: "\u0003" })}>Ctrl+C</button>
-          </form>
-
-          <div className="files-header system-header">
-            <div><p className="eyebrow">SYSTEM</p><h2>{systemInfo?.hostname ?? "System information"}</h2></div>
-            <button type="button" className="secondary" disabled={status.state !== "connected"} onClick={() => void invoke("request_system_info")}>Refresh</button>
-          </div>
-          {systemInfo && <div className="system-grid">
-            <div><span>OS</span><strong>{systemInfo.operatingSystem}</strong><small>{systemInfo.kernelVersion}</small></div>
-            <div><span>CPU</span><strong>{systemInfo.cpuModel}</strong><small>{systemInfo.cpuCount} logical CPUs</small></div>
-            <div><span>Memory</span><strong>{formatBytes(systemInfo.usedMemoryBytes)} / {formatBytes(systemInfo.totalMemoryBytes)}</strong><small>Uptime {Math.floor(systemInfo.uptimeSeconds / 3600)}h</small></div>
-            <div><span>Storage</span><strong>{systemInfo.disks.length} mounts</strong><small>{systemInfo.disks.map((disk) => disk.mountPoint).join(", ") || "None"}</small></div>
-            <div><span>Network</span><strong>{systemInfo.networkInterfaces.length} interfaces</strong><small>{systemInfo.networkInterfaces.map((network) => network.name).join(", ") || "None"}</small></div>
-            <div><span>GPU</span><strong>{systemInfo.gpus.map((gpu) => gpu.name).join(", ") || "Optional / not detected"}</strong><small>NVIDIA metrics use nvidia-smi when available</small></div>
+            <section className="hero-card">
+              <div className="card-heading"><div><span className="feature-icon"><Icon name="devices" size={21} /></span><h2>Connect to a device</h2><p>Enter the ID shown in RemoteX on the other device.</p></div></div>
+              <form className="connect-form" onSubmit={connect}>
+                <label htmlFor="remote-device-id">Remote device ID</label>
+                <div className={`connect-input ${uiError && !/^\d{9}$/.test(request.deviceId.replace(/\D/g, "")) ? "invalid" : ""}`}><Icon name="monitor" /><input id="remote-device-id" value={request.deviceId} onChange={(event) => { update("deviceId", event.target.value.replace(/\D/g, "").slice(0, 9)); setUiError(""); }} inputMode="numeric" autoComplete="off" placeholder="123 456 789" aria-describedby="device-id-help" /><button type="submit" disabled={isConnecting || isConnected}>{isConnecting ? <span className="spinner" /> : "Connect"}{!isConnecting && <Icon name="chevron" size={14} />}</button></div>
+                <small id="device-id-help" className={uiError ? "field-error" : ""}>{uiError || "A 9-digit RemoteX device ID."}</small>
+                <details className="connection-options"><summary>Connection options</summary><div className="options-grid"><label>Controller name<input value={request.controllerName} onChange={(event) => update("controllerName", event.target.value)} /></label><label>Unattended secret<input type="password" value={request.unattendedSecret} onChange={(event) => update("unattendedSecret", event.target.value)} placeholder="Optional" /></label></div></details>
+              </form>
+              {(isConnecting || status.state === "failed") && <div className={`connection-feedback ${status.state}`}><span className="feedback-icon">{isConnecting ? <span className="spinner" /> : <Icon name="warning" size={15} />}</span><span><strong>{isConnecting ? "Connecting securely…" : "Connection failed"}</strong><small>{status.message || uiError}</small></span></div>}
+              {recentDevices.length > 0 && <div className="recent-strip"><span>Recent</span>{recentDevices.slice(0, 3).map((device) => <button type="button" key={device.deviceId} onClick={() => update("deviceId", device.deviceId)}><Icon name="monitor" size={12} />{formatDeviceId(device.deviceId)}</button>)}</div>}
+              <div className="privacy-note"><Icon name="shield" /><span><strong>Permission-first sessions</strong><small>The remote device controls input, clipboard, and files.</small></span></div>
+            </section>
           </div>}
-        </section>
+
+          {page === "devices" && <div className="standard-page">
+            <div className="page-intro"><div><h2>Devices</h2><p>Your local device and connections stored only on this PC.</p></div></div>
+            <section className="panel local-device-panel"><span className="device-avatar"><Icon name="monitor" /></span><div className="grow"><strong>{agentSettings.deviceName || "This Windows PC"}</strong><span>{formatDeviceId(agentRuntime?.deviceId)}</span><small>{agentReady ? "Online and ready for secure access" : remoteEnabled ? "Agent is starting" : "Remote access is disabled"}</small></div><StatusPill tone={agentReady ? "success" : remoteEnabled ? "warning" : "neutral"}>{agentReady ? "Ready" : remoteEnabled ? "Starting" : "Offline"}</StatusPill></section>
+            {isConnected && <section className="active-session-panel"><i className="live-dot" /><div><strong>Active session · {formatDeviceId(request.deviceId)}</strong><small>Connected for {duration}</small></div><button type="button" className="danger-quiet" onClick={() => void disconnect()}><Icon name="disconnect" size={15} />Disconnect</button></section>}
+            <section className="panel"><div className="section-heading"><div><h3>Recent devices</h3><p>Created from successful connections on this PC.</p></div></div>{recentDevices.length ? <div className="device-list">{recentDevices.map((device) => <div className="device-list-row" key={device.deviceId}><span className="device-avatar small"><Icon name="monitor" size={16} /></span><div className="grow"><strong>{formatDeviceId(device.deviceId)}</strong><small>Last connected {new Date(device.connectedAt).toLocaleString()}</small></div><button type="button" className="secondary-button" onClick={() => { update("deviceId", device.deviceId); setPage("home"); }}>Connect</button></div>)}</div> : <div className="empty-state compact"><Icon name="devices" size={26} /><h3>No recent devices</h3><p>Devices appear here after your first successful connection.</p></div>}</section>
+          </div>}
+
+          {page === "session" && <div className="session-page">
+            <div className="session-toolbar"><div><i className="live-dot" /><span><strong>{formatDeviceId(request.deviceId)}</strong><small>Secure session · {duration}</small></span></div><div className="session-actions"><button type="button" className="secondary-button" onClick={() => setPage("files")}><Icon name="files" size={15} />Files</button><button type="button" className="danger-quiet" onClick={() => void disconnect()}><Icon name="disconnect" size={15} />Disconnect</button></div></div>
+            <div ref={screenRef} className={`screen ${isConnected && frame ? "interactive" : ""}`} aria-label="Remote desktop" role="application" tabIndex={isConnected && frame ? 0 : -1} onContextMenu={(event) => event.preventDefault()} onPointerMove={handlePointerMove} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerCancel} onWheel={handleWheel} onKeyDown={handleKeyDown} onKeyUp={handleKeyUp} onBlur={() => void releaseRemoteInputs()}>
+              {rawV11Frame ? <canvas ref={videoCanvasRef} aria-label="Decoded remote desktop" /> : v11ImageUrl ? <img src={v11ImageUrl} alt="Remote desktop" draggable={false} /> : <div className="empty screen-empty">{isConnected ? <><span className="spinner large" /><strong>Waiting for the first frame</strong><small>{status.message}</small></> : <><Icon name="monitor" size={34} /><strong>Session ended</strong><button type="button" onClick={() => setPage("home")}>Return home</button></>}</div>}
+              {frame && <div className="telemetry">{frame.width}×{frame.height} · {frame.codec} · {frame.framesPerSecond} FPS · {frame.endToEndLatencyMs} ms</div>}
+            </div>
+          </div>}
+
+          {page === "files" && <div className="standard-page files-page">
+            <div className="page-intro"><div><h2>Files &amp; tools</h2><p>Browse transfers and administer the active remote device.</p></div><StatusPill tone={isConnected ? "success" : "neutral"}>{isConnected ? "Session active" : "No active session"}</StatusPill></div>
+            {!isConnected ? <section className="panel empty-state"><Icon name="files" size={30} /><h3>Connect to use remote tools</h3><p>File browsing, terminal access, and system details are available during an authorized session.</p><button type="button" onClick={() => setPage("home")}>Connect a device</button></section> : <>
+              <section className="panel file-browser"><div className="section-heading"><div><h3>Remote files</h3><p>{filePath}</p></div><div className="button-group"><button type="button" className="secondary-button" disabled={filePath === "/"} onClick={() => void listFiles(parentPath(filePath))}>Up</button><button type="button" className="icon-button" aria-label="Refresh files" onClick={() => void listFiles(filePath)}><Icon name="refresh" size={15} /></button></div></div>{fileError && <p className="inline-message"><Icon name="warning" size={14} />{fileError}</p>}<div className="file-table-wrap"><table><thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>{fileEntries.map((entry) => <tr key={entry.path}><td><button type="button" className="file-link" onClick={() => entry.entryType === "directory" ? void listFiles(entry.path) : setDownloadSourcePath(entry.path)}><Icon name={entry.entryType === "directory" ? "folder" : "files"} size={15} />{entry.name}</button></td><td>{entry.entryType === "file" ? formatBytes(entry.size) : "—"}</td><td>{entry.modifiedMs ? new Date(entry.modifiedMs).toLocaleString() : "—"}</td></tr>)}{!fileEntries.length && <tr><td colSpan={3} className="table-empty">Refresh to load this directory.</td></tr>}</tbody></table></div></section>
+              <div className="tool-grid"><section className="panel tool-card"><span className="feature-icon"><Icon name="plus" /></span><h3>New folder</h3><input value={newFolderName} onChange={(event) => setNewFolderName(event.target.value)} placeholder="Folder name" /><button type="button" disabled={!request.fileUploadEnabled} onClick={() => void createDirectory()}>Create folder</button></section><section className="panel tool-card"><span className="feature-icon"><Icon name="upload" /></span><h3>Upload</h3><input value={uploadLocalPath} onChange={(event) => setUploadLocalPath(event.target.value)} placeholder="Local source path" /><input value={uploadDestinationPath} onChange={(event) => setUploadDestinationPath(event.target.value)} placeholder="Remote destination path" /><button type="button" disabled={!request.fileUploadEnabled} onClick={() => void uploadFile()}>Upload</button></section><section className="panel tool-card"><span className="feature-icon"><Icon name="download" /></span><h3>Download</h3><input value={downloadSourcePath} onChange={(event) => setDownloadSourcePath(event.target.value)} placeholder="Remote source path" /><input value={downloadLocalPath} onChange={(event) => setDownloadLocalPath(event.target.value)} placeholder="Local destination path" /><button type="button" disabled={!request.fileDownloadEnabled} onClick={() => void downloadFile()}>Download</button></section></div>
+              {Object.keys(transfers).length > 0 && <section className="panel"><h3>Transfers</h3><div className="transfers">{Object.values(transfers).map((transfer) => <div className="transfer" key={transfer.transferId}><div><strong>{transfer.direction}</strong><span>{transfer.state} · {formatBytes(transfer.transferred)}</span></div><progress max={100} value={transfer.total ? transfer.transferred / transfer.total * 100 : 0} /><button type="button" className="secondary-button" onClick={() => void invoke("cancel_file_transfer", { transferId: transfer.transferId })}>Cancel</button></div>)}</div><div className="resume-row"><input value={resumeTransferId} onChange={(event) => setResumeTransferId(event.target.value)} placeholder="Interrupted transfer ID" /><button type="button" className="secondary-button" onClick={() => void resumeUpload()}>Resume upload</button><button type="button" className="secondary-button" onClick={() => void resumeDownload()}>Resume download</button></div></section>}
+              <section className="panel server-tools"><div className="section-heading"><div><h3>Linux terminal</h3><p>Open an authorized remote PTY.</p></div><div className="button-group"><button type="button" disabled={Boolean(terminalId)} onClick={() => void startTerminal()}>Open terminal</button><button type="button" className="secondary-button" disabled={!terminalId} onClick={() => { void invoke("close_terminal", { terminalId }); setTerminalId(""); }}>Close</button></div></div><pre className="terminal">{terminalOutput ? renderAnsi(terminalOutput) : "Terminal output will appear here."}</pre><form className="terminal-input" onSubmit={submitTerminal}><input value={terminalInput} onChange={(event) => setTerminalInput(event.target.value)} disabled={!terminalId} placeholder="Command or terminal input" /><button type="submit" disabled={!terminalId || !terminalInput}>Send</button><button type="button" className="secondary-button" disabled={!terminalId} onClick={() => void invoke("send_terminal_input", { terminalId, data: "\u0003" })}>Ctrl+C</button></form><div className="system-summary"><div className="section-heading"><div><h3>{systemInfo?.hostname ?? "System information"}</h3><p>OS, CPU, memory, storage, network, and GPU summary.</p></div><button type="button" className="secondary-button" onClick={() => void invoke("request_system_info")}>Refresh</button></div>{systemInfo && <div className="system-grid"><div><span>OS</span><strong>{systemInfo.operatingSystem}</strong></div><div><span>CPU</span><strong>{systemInfo.cpuModel}</strong></div><div><span>Memory</span><strong>{formatBytes(systemInfo.usedMemoryBytes)} / {formatBytes(systemInfo.totalMemoryBytes)}</strong></div><div><span>GPU</span><strong>{systemInfo.gpus.map((gpu) => gpu.name).join(", ") || "Not detected"}</strong></div></div>}</div></section>
+            </>}
+          </div>}
+
+          {page === "settings" && <div className="settings-layout" ref={settingsRef as React.RefObject<HTMLDivElement>}>
+            <nav className="settings-nav" aria-label="Settings categories">{SETTINGS_SECTIONS.map((section) => <button type="button" key={section.id} className={settingsSection === section.id ? "active" : ""} onClick={() => setSettingsSection(section.id)}><span>{section.label}</span><Icon name="chevron" size={13} /></button>)}</nav>
+            <form className="settings-pane" onSubmit={saveAgent}><div className="settings-pane-header"><div><h2>{SETTINGS_SECTIONS.find((item) => item.id === settingsSection)?.label}</h2><p>Settings marked with a switch are saved immediately.</p></div><span className="save-state">{saving ? <><span className="spinner" />Saving…</> : agentMessage || uiError}</span></div><div className="settings-groups">
+              {settingsSection === "general" && <section className="settings-group"><label className="field-label">Device name<input value={agentSettings.deviceName} onChange={(event) => updateAgent("deviceName", event.target.value)} maxLength={128} /><small>Shown to people connecting to this PC.</small></label><div className="setting-row"><span><strong>Start with Windows</strong><small>Launch RemoteX after you sign in.</small></span><Toggle label="Start with Windows" checked={agentSettings.startWithWindows} onChange={(value) => immediateAgent("startWithWindows", value)} /></div></section>}
+              {settingsSection === "remote" && <section className="settings-group"><div className="setting-row emphasized"><span><strong>Allow remote access</strong><small>Starts or stops the local Agent automatically.</small></span><Toggle label="Allow remote access" checked={remoteEnabled} disabled={saving} onChange={(value) => void toggleRemoteAccess(value)} /></div><label className="field-label">Control server<input value={agentSettings.serverUrl} onChange={(event) => updateAgent("serverUrl", event.target.value)} placeholder="https://control.example.com" /><small>Used to register this PC and coordinate secure sessions.</small></label></section>}
+              {settingsSection === "permissions" && <><section className="settings-group">{([["allowInput","Keyboard and mouse","Allow remote input"],["allowClipboard","Plain-text clipboard","Allow clipboard synchronization"],["allowFileUpload","File upload","Allow files to be sent to this PC"],["allowFileDownload","File download","Allow files to be downloaded from this PC"]] as const).map(([key,title,detail]) => <div className="setting-row" key={key}><span><strong>{title}</strong><small>{detail}</small></span><Toggle label={title} checked={agentSettings[key]} onChange={(value) => immediateAgent(key, value)} /></div>)}</section><section className="settings-group"><div className="section-heading"><div><h3>Allowed folders</h3><p>Remote file access stays inside these locations.</p></div><button type="button" className="secondary-button" onClick={() => void addAllowedFolder()}><Icon name="plus" size={15} />Add folder</button></div>{folders.length ? <div className="folder-list">{folders.map((folder, index) => <div className="folder-row" key={folder.path}><span className="folder-icon"><Icon name="folder" size={16} /></span><div className="grow"><input aria-label={`Folder ${index + 1} label`} value={folder.label} onChange={(event) => updateAgent("fileRoots", serializeFolders(folders.map((item, itemIndex) => itemIndex === index ? { ...item, label: event.target.value } : item)))} /><small>{folder.path}</small></div><button type="button" className="icon-button danger" aria-label={`Remove ${folder.label}`} onClick={() => updateAgent("fileRoots", serializeFolders(folders.filter((_, itemIndex) => itemIndex !== index)))}><Icon name="trash" size={15} /></button></div>)}</div> : <div className="empty-inline"><Icon name="folder" /><span><strong>No folders allowed</strong><small>File permissions remain unavailable until you add one.</small></span></div>}</section></>}
+              {settingsSection === "video" && <section className="settings-group"><label className="field-label">Video quality<select value={agentSettings.videoQuality} onChange={(event) => immediateAgent("videoQuality", event.target.value as AgentSettings["videoQuality"])}><option value="low">Low · up to 10 FPS</option><option value="balanced">Balanced · up to 20 FPS</option><option value="high">High · up to 30 FPS</option></select><small>Balanced is recommended for most networks.</small></label></section>}
+              {settingsSection === "network" && <section className="settings-group"><label className="field-label">Controller server<input value={request.controlServerUrl} onChange={(event) => update("controlServerUrl", event.target.value)} placeholder="https://control.example.com" /></label><div className="setting-row"><span><strong>Clipboard for outgoing sessions</strong><small>Request clipboard permission when connecting.</small></span><Toggle label="Request clipboard access" checked={request.clipboardEnabled} onChange={(value) => setRequest((current) => ({ ...current, clipboardEnabled: value }))} /></div><div className="setting-row"><span><strong>File upload for outgoing sessions</strong></span><Toggle label="Request file upload" checked={request.fileUploadEnabled} onChange={(value) => setRequest((current) => ({ ...current, fileUploadEnabled: value }))} /></div><div className="setting-row"><span><strong>File download for outgoing sessions</strong></span><Toggle label="Request file download" checked={request.fileDownloadEnabled} onChange={(value) => setRequest((current) => ({ ...current, fileDownloadEnabled: value }))} /></div></section>}
+              {settingsSection === "security" && <section className="settings-group"><div className="setting-row"><span><strong>Unattended access</strong><small>Requires an explicit secret of at least 12 characters.</small></span><Toggle label="Unattended access" checked={agentSettings.unattendedAccess} onChange={(value) => updateAgent("unattendedAccess", value)} /></div>{agentSettings.unattendedAccess && <label className="field-label">Unattended secret<input type="password" value={agentSettings.unattendedSecret} onChange={(event) => updateAgent("unattendedSecret", event.target.value)} minLength={12} maxLength={128} placeholder={agentSettings.secretConfigured ? "Leave blank to keep the protected secret" : "At least 12 characters"} /></label>}</section>}
+              {settingsSection === "advanced" && <><section className="settings-group"><label className="field-label">Agent CA certificate<div className="path-picker"><input value={agentSettings.caCertificatePath} onChange={(event) => updateAgent("caCertificatePath", event.target.value)} placeholder="Select a PEM, CRT, or CER file" /><button type="button" className="secondary-button" onClick={() => void chooseCertificate("agent")}>Choose…</button></div></label><label className="field-label">Controller CA certificate<div className="path-picker"><input value={request.caCertificatePath} onChange={(event) => update("caCertificatePath", event.target.value)} /><button type="button" className="secondary-button" onClick={() => void chooseCertificate("controller")}>Choose…</button></div></label></section><details className="advanced-details"><summary>Manual relay session fallback</summary><div className="options-grid"><label>Relay address<input value={request.relayAddress} onChange={(event) => update("relayAddress", event.target.value)} /></label><label>TLS server name<input value={request.serverName} onChange={(event) => update("serverName", event.target.value)} /></label><label>Session ID<input value={request.sessionId} onChange={(event) => update("sessionId", event.target.value)} /></label><label>One-time token<input type="password" value={request.tokenHex} onChange={(event) => update("tokenHex", event.target.value)} /></label><label>End-to-end key<input type="password" value={request.endToEndKeyHex} onChange={(event) => update("endToEndKeyHex", event.target.value)} /></label></div></details></>}
+              {(["general","remote","permissions","security","advanced"] as SettingsSection[]).includes(settingsSection) && <button type="submit" disabled={saving}>Apply</button>}
+            </div></form>
+          </div>}
+
+          {page === "about" && <div className="about-page"><span className="about-mark"><Icon name="monitor" size={35} /></span><h2>RemoteX</h2><p className="version">Version 1.1.0</p><p>A private remote desktop for your own Windows PCs and Linux servers, designed around explicit permissions and end-to-end encryption.</p><div className="about-grid"><div><Icon name="shield" /><span><strong>Private</strong><small>Self-hosted coordination</small></span></div><div><Icon name="wifi" /><span><strong>Responsive</strong><small>Adaptive remote video</small></span></div><div><Icon name="server" /><span><strong>Capable</strong><small>Desktop and server tools</small></span></div></div><small className="copyright">© 2026 RemoteX</small></div>}
         </div>
-      </section>
-    </main>
+      </main>
+    </div>
   );
+
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

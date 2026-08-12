@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "RemoteX main window capabilities",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

@@ -1,12 +1,13 @@
 //! Versioned, platform-neutral `RemoteX` protocol domain types.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+pub const MAX_RELAY_HANDSHAKE_SIZE: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -136,16 +137,16 @@ pub enum Role {
     Agent,
 }
 
-/// First application frame sent by a peer after opening its QUIC stream.
+/// Authentication message sent in the first relay frame on a QUIC stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RelayHandshake {
+pub struct ClientHello {
     pub version: u16,
     pub session_id: SessionId,
     pub role: Role,
     pub token: SessionToken,
 }
 
-impl RelayHandshake {
+impl ClientHello {
     #[must_use]
     pub const fn new(session_id: SessionId, role: Role, token: SessionToken) -> Self {
         Self {
@@ -155,6 +156,83 @@ impl RelayHandshake {
             token,
         }
     }
+}
+
+/// Compatibility name retained for the M3 composition roots.
+pub type RelayHandshake = ClientHello;
+
+/// Messages sent from an authenticated peer to the relay.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RelayClientMessage {
+    ClientHello(ClientHello),
+    Payload(Vec<u8>),
+    Heartbeat { nonce: u64 },
+    HeartbeatAck { nonce: u64 },
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RelayProtocolErrorCode {
+    UnsupportedVersion,
+    UnknownSession,
+    ExpiredSession,
+    InvalidToken,
+    RoleMismatch,
+    TokenAlreadyUsed,
+    DuplicateRole,
+    SessionNotReady,
+    MalformedMessage,
+    FrameTooLarge,
+    CapacityExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionCloseReason {
+    ClientClosed,
+    PeerDisconnected,
+    HeartbeatTimeout,
+    ProtocolViolation,
+    SlowConsumer,
+    RelayShutdown,
+}
+
+/// Relay control messages and opaque application payload delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RelayServerMessage {
+    WaitingForPeer {
+        role: Role,
+    },
+    PeerReady,
+    Payload(Vec<u8>),
+    Heartbeat {
+        nonce: u64,
+    },
+    HeartbeatAck {
+        nonce: u64,
+    },
+    SessionClosed {
+        reason: SessionCloseReason,
+    },
+    ProtocolError {
+        code: RelayProtocolErrorCode,
+        message: String,
+    },
+}
+
+/// Serializes a protocol value using the single workspace wire codec.
+pub fn encode_wire<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolCodecError> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .map_err(|error| ProtocolCodecError::Encode(error.to_string()))
+}
+
+/// Deserializes one complete protocol value and rejects trailing bytes.
+pub fn decode_wire<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolCodecError> {
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map_err(|error| ProtocolCodecError::Decode(error.to_string()))?;
+    if consumed != bytes.len() {
+        return Err(ProtocolCodecError::TrailingBytes);
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -346,6 +424,16 @@ pub enum ProtocolError {
     ChannelMismatch,
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ProtocolCodecError {
+    #[error("protocol serialization failed: {0}")]
+    Encode(String),
+    #[error("protocol deserialization failed: {0}")]
+    Decode(String),
+    #[error("protocol message contains trailing bytes")]
+    TrailingBytes,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,11 +491,20 @@ mod tests {
                 content: "hello".into(),
             }),
         );
-        let config = bincode::config::standard();
-        let bytes = bincode::serde::encode_to_vec(&original, config).expect("encode test value");
-        let (decoded, consumed): (MessageEnvelope, usize) =
-            bincode::serde::decode_from_slice(&bytes, config).expect("decode test value");
-        assert_eq!(consumed, bytes.len());
+        let bytes = encode_wire(&original).expect("encode test value");
+        let decoded: MessageEnvelope = decode_wire(&bytes).expect("decode test value");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn relay_messages_use_the_central_wire_codec() {
+        let original = RelayServerMessage::ProtocolError {
+            code: RelayProtocolErrorCode::InvalidToken,
+            message: "authentication failed".to_owned(),
+        };
+        let bytes = encode_wire(&original).expect("encode relay message");
+        let decoded: RelayServerMessage = decode_wire(&bytes).expect("decode relay message");
+
         assert_eq!(decoded, original);
     }
 }

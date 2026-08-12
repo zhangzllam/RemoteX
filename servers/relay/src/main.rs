@@ -4,7 +4,10 @@ use anyhow::{Context, bail};
 use quinn::ServerConfig;
 use remotex_protocol::{Role, SessionId, SessionToken};
 use remotex_relay::{RelayLimits, RelayServer, SessionAuthorizer};
-use std::{fs::File, io::BufReader, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    fmt::Display, fs::File, io::BufReader, net::SocketAddr, path::Path, str::FromStr,
+    time::Duration,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -50,11 +53,35 @@ async fn main() -> anyhow::Result<()> {
         load_server_config(Path::new(&certificate_path), Path::new(&private_key_path))?;
     let endpoint = quinn::Endpoint::server(server_config, bind).context("bind relay endpoint")?;
     info!(address = %endpoint.local_addr()?, %session_id, "relay listening");
+    let defaults = RelayLimits::default();
     RelayServer::new(
         authorizer,
         RelayLimits {
-            idle_timeout: Duration::from_secs(30),
-            ..RelayLimits::default()
+            maximum_frame_size: parse_or(
+                "REMOTEX_RELAY_MAX_MESSAGE_SIZE",
+                defaults.maximum_frame_size,
+            )?,
+            max_connections: parse_or("REMOTEX_RELAY_MAX_CONNECTIONS", defaults.max_connections)?,
+            max_pending_sessions: parse_or(
+                "REMOTEX_RELAY_MAX_PENDING_SESSIONS",
+                defaults.max_pending_sessions,
+            )?,
+            outbound_queue_capacity: parse_or(
+                "REMOTEX_RELAY_QUEUE_CAPACITY",
+                defaults.outbound_queue_capacity,
+            )?,
+            handshake_timeout: Duration::from_millis(parse_or(
+                "REMOTEX_RELAY_HANDSHAKE_TIMEOUT_MS",
+                u64::try_from(defaults.handshake_timeout.as_millis())?,
+            )?),
+            heartbeat_interval: Duration::from_millis(parse_or(
+                "REMOTEX_RELAY_HEARTBEAT_INTERVAL_MS",
+                u64::try_from(defaults.heartbeat_interval.as_millis())?,
+            )?),
+            peer_timeout: Duration::from_millis(parse_or(
+                "REMOTEX_RELAY_PEER_TIMEOUT_MS",
+                u64::try_from(defaults.peer_timeout.as_millis())?,
+            )?),
         },
     )
     .serve_until(endpoint, async {
@@ -66,6 +93,20 @@ async fn main() -> anyhow::Result<()> {
 
 fn required(name: &str) -> anyhow::Result<String> {
     std::env::var(name).with_context(|| format!("required environment variable {name} is missing"))
+}
+
+fn parse_or<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("parse {name}: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow::anyhow!("read {name}: {error}")),
+    }
 }
 
 fn parse_token(value: &str) -> anyhow::Result<SessionToken> {

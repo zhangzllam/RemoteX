@@ -17,10 +17,13 @@ No operational remote-control functionality is included.
 ## M1 — Relay path (completed)
 
 - Controller → relay → agent mock data path
-- one-time session/role token verification
-- peer pairing, binary forwarding, timeouts, and maximum frame size
-- structured logging
-- end-to-end integration test with mock peers
+- replaceable `SessionAuthenticator` with one-time session/role token verification
+- explicit waiting/`PeerReady` states and duplicate-role rejection
+- bounded bidirectional opaque forwarding and defensive connection/Session limits
+- application heartbeat, timeout, disconnect notification, and deterministic cleanup
+- structured logging without tokens or payload contents
+- runnable mock Controller/Agent and development certificate generator
+- integration coverage for all ten M1 acceptance scenarios
 
 ## M2 — Windows capture demo (completed)
 

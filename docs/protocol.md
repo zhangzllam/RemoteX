@@ -59,12 +59,40 @@ not used alone for authentication or ordering.
 `Message` is a tagged union of `ControlMessage`, `EncodedVideoFrame`,
 `InputEvent`, `ClipboardMessage`, and `FileTransferMessage`.
 
-## Relay handshake
+## Relay protocol
 
-The first framed message on a peer stream is a `RelayHandshake` containing the
-protocol version, Session ID, Role, and opaque 256-bit token. The relay verifies
-that the grant is unexpired, matches the Session/Role, and has not been consumed.
-Only a Controller and Agent with complementary credentials are paired.
+The first framed message on a peer stream is
+`RelayClientMessage::ClientHello(ClientHello)`. `ClientHello` contains the
+protocol version, Session ID, Role, and opaque 256-bit token. The Relay verifies
+the version, registered Session, expiry, role binding, token value, one-time use,
+and duplicate-role state. Authentication failures return a typed
+`RelayServerMessage::ProtocolError`; token values are never included.
+
+Client-to-Relay messages are:
+
+- `ClientHello` — allowed only as the first message;
+- `Payload(bytes)` — opaque application bytes, accepted only after pairing;
+- `Heartbeat` / `HeartbeatAck` — Relay liveness control;
+- `Close` — clean client shutdown.
+
+Relay-to-client messages are:
+
+- `WaitingForPeer { role }`;
+- `PeerReady`;
+- `Payload(bytes)`;
+- `Heartbeat` / `HeartbeatAck`;
+- `SessionClosed { reason }`;
+- `ProtocolError { code, message }`.
+
+When the second complementary role registers, both peers receive `PeerReady`.
+The Relay then routes only opaque `Payload` bytes. Heartbeats are not forwarded;
+they belong to each peer-to-Relay link. Any valid inbound Relay message resets
+the liveness deadline. If one peer disconnects or times out, the Session entry is
+removed and the other peer receives `SessionClosed` when delivery is possible.
+
+All protocol serialization goes through `encode_wire` and `decode_wire`, which
+use bincode 2 standard configuration and reject trailing bytes. A malformed
+message closes only the offending Session, never the Relay process.
 
 ## Video frames
 
@@ -74,7 +102,7 @@ codec enum also reserves WebP; the controller decoder accepts it, while the M3
 agent emits JPEG. Frames are scaled within 1280×720 while preserving aspect
 ratio before encoding.
 
-Before transport framing, the serialized video envelope is encrypted with
+Before Relay `Payload` wrapping and transport framing, the serialized video envelope is encrypted with
 XChaCha20-Poly1305. The wire payload is an eight-byte big-endian sequence number
 followed by authenticated ciphertext. The sequence is also present inside the
 encrypted envelope and the controller requires both values to match. Nonces are
@@ -122,5 +150,8 @@ it performs no filesystem I/O.
 ## Limits
 
 M1 sets and enforces a maximum frame size before allocating payload buffers.
+The handshake is separately limited to 4 KiB. Relay connection count, Session
+count, outbound queue capacity, heartbeat interval, and peer timeout are also
+bounded and configurable.
 File chunks must never exceed the negotiated chunk size. Strings and rejection
 reasons also need explicit encoded-length limits at the transport boundary.

@@ -11,7 +11,10 @@ use remotex_capture::{CaptureError, DxgiCapture, MonitorId, ScreenCapture};
 #[cfg(windows)]
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 #[cfg(windows)]
-use remotex_protocol::{Message, MessageEnvelope, RelayHandshake, Role, SessionId, SessionToken};
+use remotex_protocol::{
+    Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, Role, SessionId,
+    SessionToken, decode_wire, encode_wire,
+};
 #[cfg(windows)]
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 #[cfg(windows)]
@@ -59,16 +62,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut capture = DxgiCapture::new();
-    let monitors = capture.monitors()?;
-    let requested_monitor = std::env::var("REMOTEX_MONITOR_ID").ok().map(MonitorId);
-    let monitor = requested_monitor
-        .as_ref()
-        .and_then(|id| monitors.iter().find(|monitor| monitor.id == *id))
-        .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
-        .or_else(|| monitors.first())
-        .context("no attached monitor is available")?;
-    capture.start(&monitor.id)?;
-    info!(monitor = %monitor.name, width = monitor.width, height = monitor.height, "capture started");
+    start_capture(&mut capture)?;
 
     let client_endpoint = client_endpoint(Path::new(&certificate_path))?;
     let connection = client_endpoint
@@ -78,11 +72,14 @@ async fn main() -> anyhow::Result<()> {
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
     let mut transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
-    let handshake = RelayHandshake::new(session_id, Role::Agent, token);
-    let encoded_handshake = bincode::serde::encode_to_vec(&handshake, bincode::config::standard())
-        .context("encode relay handshake")?;
-    transport.send(Bytes::from(encoded_handshake)).await?;
-    info!(%session_id, %relay_address, "video relay connected");
+    let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
+        session_id,
+        Role::Agent,
+        token,
+    ));
+    transport.send(Bytes::from(encode_wire(&hello)?)).await?;
+    wait_for_peer(&mut transport, session_id).await?;
+    info!(%session_id, %relay_address, "video relay paired");
 
     let codec = SoftwareEncoder::new(EncoderConfig::default())?;
     let mut sequence = 0_u64;
@@ -90,9 +87,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_millis(1000 / u64::from(frames_per_second)));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
+        let capture_tick = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = interval.tick() => {}
+            _ = interval.tick() => true,
+            incoming = transport.receive() => {
+                handle_relay_message(&mut transport, decode_wire(&incoming?)?).await?;
+                false
+            }
+        };
+        if !capture_tick {
+            continue;
         }
         let frame = match capture.next_frame() {
             Ok(frame) => frame,
@@ -106,16 +110,18 @@ async fn main() -> anyhow::Result<()> {
             frame.timestamp_ms,
             Message::Video(video),
         );
-        let serialized_frame =
-            bincode::serde::encode_to_vec(&envelope, bincode::config::standard())
-                .context("encode video envelope")?;
+        let serialized_frame = encode_wire(&envelope).context("encode video envelope")?;
         let encrypted_frame = cipher
             .seal(sequence, &serialized_frame)
             .context("encrypt video envelope")?;
         let mut wire_frame = Vec::with_capacity(8 + encrypted_frame.len());
         wire_frame.extend_from_slice(&sequence.to_be_bytes());
         wire_frame.extend_from_slice(&encrypted_frame);
-        if let Err(error) = transport.send(Bytes::from(wire_frame)).await {
+        let relay_frame = RelayClientMessage::Payload(wire_frame);
+        if let Err(error) = transport
+            .send(Bytes::from(encode_wire(&relay_frame)?))
+            .await
+        {
             warn!(%error, "video relay disconnected");
             return Err(error.into());
         }
@@ -123,9 +129,72 @@ async fn main() -> anyhow::Result<()> {
             .checked_add(1)
             .context("video sequence space exhausted")?;
     }
+    let _result = transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
+        .await;
     capture.stop()?;
     transport.close().await?;
     client_endpoint.close(0_u32.into(), b"agent stopped");
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_peer(
+    transport: &mut QuicFrameConnection,
+    session_id: SessionId,
+) -> anyhow::Result<()> {
+    loop {
+        let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
+        match message {
+            RelayServerMessage::WaitingForPeer { role } => {
+                info!(%session_id, ?role, "waiting for relay peer");
+            }
+            RelayServerMessage::PeerReady => return Ok(()),
+            other => handle_relay_message(transport, other).await?,
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn handle_relay_message(
+    transport: &mut QuicFrameConnection,
+    message: RelayServerMessage,
+) -> anyhow::Result<()> {
+    match message {
+        RelayServerMessage::Heartbeat { nonce } => {
+            let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+            transport
+                .send(Bytes::from(encode_wire(&acknowledgement)?))
+                .await?;
+        }
+        RelayServerMessage::HeartbeatAck { .. }
+        | RelayServerMessage::WaitingForPeer { .. }
+        | RelayServerMessage::PeerReady => {}
+        RelayServerMessage::Payload(_) => {
+            warn!("M3 Agent ignored an unsupported controller payload");
+        }
+        RelayServerMessage::SessionClosed { reason } => {
+            anyhow::bail!("relay session closed: {reason:?}");
+        }
+        RelayServerMessage::ProtocolError { code, message } => {
+            anyhow::bail!("relay protocol error {code:?}: {message}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_capture(capture: &mut DxgiCapture) -> anyhow::Result<()> {
+    let monitors = capture.monitors()?;
+    let requested_monitor = std::env::var("REMOTEX_MONITOR_ID").ok().map(MonitorId);
+    let monitor = requested_monitor
+        .as_ref()
+        .and_then(|id| monitors.iter().find(|monitor| monitor.id == *id))
+        .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
+        .or_else(|| monitors.first())
+        .context("no attached monitor is available")?;
+    capture.start(&monitor.id)?;
+    info!(monitor = %monitor.name, width = monitor.width, height = monitor.height, "capture started");
     Ok(())
 }
 

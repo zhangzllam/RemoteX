@@ -6,7 +6,8 @@ use bytes::Bytes;
 use quinn::{ClientConfig, Endpoint};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_protocol::{
-    Message, MessageEnvelope, RelayHandshake, Role, SessionId, SessionToken, VideoCodec,
+    Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, Role, SessionId,
+    SessionToken, VideoCodec, decode_wire, encode_wire,
 };
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 use rustls::RootCertStore;
@@ -116,16 +117,38 @@ async fn receive_video(
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
     let mut transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
-    let handshake = RelayHandshake::new(session_id, Role::Controller, token);
-    let encoded_handshake = bincode::serde::encode_to_vec(&handshake, bincode::config::standard())
-        .context("encode relay handshake")?;
-    transport.send(Bytes::from(encoded_handshake)).await?;
-    emit_status(&app, "connected", "Waiting for remote video");
+    let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
+        session_id,
+        Role::Controller,
+        token,
+    ));
+    transport.send(Bytes::from(encode_wire(&hello)?)).await?;
+    wait_for_peer(&app, &mut transport).await?;
+    emit_status(&app, "connected", "Remote peer ready");
 
     loop {
-        let bytes = tokio::select! {
+        let relay_message = tokio::select! {
             _ = &mut cancellation => break,
-            result = transport.receive() => result?,
+            result = transport.receive() => decode_wire::<RelayServerMessage>(&result?)?,
+        };
+        let bytes = match relay_message {
+            RelayServerMessage::Payload(payload) => payload,
+            RelayServerMessage::Heartbeat { nonce } => {
+                let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+                transport
+                    .send(Bytes::from(encode_wire(&acknowledgement)?))
+                    .await?;
+                continue;
+            }
+            RelayServerMessage::HeartbeatAck { .. }
+            | RelayServerMessage::WaitingForPeer { .. }
+            | RelayServerMessage::PeerReady => continue,
+            RelayServerMessage::SessionClosed { reason } => {
+                anyhow::bail!("relay session closed: {reason:?}");
+            }
+            RelayServerMessage::ProtocolError { code, message } => {
+                anyhow::bail!("relay protocol error {code:?}: {message}");
+            }
         };
         if bytes.len() < 8 {
             anyhow::bail!("encrypted video frame is missing its sequence number");
@@ -138,12 +161,8 @@ async fn receive_video(
         let plaintext = cipher
             .open(sequence, &bytes[8..])
             .context("authenticate and decrypt video envelope")?;
-        let (envelope, consumed): (MessageEnvelope, usize) =
-            bincode::serde::decode_from_slice(&plaintext, bincode::config::standard())
-                .context("decode protocol envelope")?;
-        if consumed != plaintext.len() {
-            anyhow::bail!("video envelope contains trailing bytes");
-        }
+        let envelope: MessageEnvelope =
+            decode_wire(&plaintext).context("decode protocol envelope")?;
         envelope.validate()?;
         if envelope.session_id != session_id {
             anyhow::bail!("received a frame for a different session");
@@ -170,8 +189,39 @@ async fn receive_video(
             },
         )?;
     }
+    let _result = transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
+        .await;
     endpoint.close(0_u32.into(), b"controller disconnected");
     Ok(())
+}
+
+async fn wait_for_peer(app: &AppHandle, transport: &mut QuicFrameConnection) -> anyhow::Result<()> {
+    loop {
+        let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
+        match message {
+            RelayServerMessage::WaitingForPeer { role } => {
+                emit_status(app, "connecting", &format!("Waiting for {role:?}"));
+            }
+            RelayServerMessage::PeerReady => return Ok(()),
+            RelayServerMessage::Heartbeat { nonce } => {
+                let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+                transport
+                    .send(Bytes::from(encode_wire(&acknowledgement)?))
+                    .await?;
+            }
+            RelayServerMessage::HeartbeatAck { .. } => {}
+            RelayServerMessage::SessionClosed { reason } => {
+                anyhow::bail!("relay session closed before pairing: {reason:?}");
+            }
+            RelayServerMessage::ProtocolError { code, message } => {
+                anyhow::bail!("relay protocol error {code:?}: {message}");
+            }
+            RelayServerMessage::Payload(_) => {
+                anyhow::bail!("relay delivered a payload before PeerReady");
+            }
+        }
+    }
 }
 
 fn client_endpoint(certificate_path: &Path) -> anyhow::Result<Endpoint> {

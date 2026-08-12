@@ -57,6 +57,37 @@ identifiers or protocol data are required)
 No library crate depends on an executable crate. Capture and input crates do not
 contain networking. Transport does not contain platform APIs.
 
+## M1 relay networking
+
+Both peers initiate an outbound Quinn connection and open one bidirectional
+QUIC stream. The first framed value is `ClientHello`. After authentication, the
+Relay registers the peer in an in-memory Session entry and returns
+`WaitingForPeer` or `PeerReady`. Application data is carried inside
+`RelayClientMessage::Payload` and `RelayServerMessage::Payload`; the Relay only
+examines this outer variant and never decodes the contained bytes.
+
+Each connected peer owns one reader loop and one writer task. The writer is fed
+by a bounded Tokio channel (32 entries by default), so a blocked destination
+does not block reads or the opposite direction indefinitely. A full queue closes
+the Session instead of growing memory without bound. The Session registry uses
+one `Mutex<HashMap<...>>`; locks protect only short lookup/update operations and
+are always released before network I/O or channel waits. `JoinSet` gives the
+server ownership of every connection task during shutdown.
+
+Session state is derived from two optional peer slots:
+
+```text
+Controller only -> WaitingForAgent
+Agent only      -> WaitingForController
+Both present    -> Ready
+Peer removed    -> Closed and registry entry removed
+```
+
+The Relay sends application-level heartbeats on a configurable interval. Any
+valid inbound Relay message refreshes liveness; an inactive peer is closed after
+`peer_timeout`. Disconnect, timeout, malformed input, an oversized frame, or a
+slow consumer removes the whole Session and signals the remaining peer.
+
 ## Session and security model
 
 A session is identified by an opaque `SessionId`. A one-time, expiring token is
@@ -108,6 +139,7 @@ identifiers, never secrets or payload contents.
 - `cargo fmt`, `cargo clippy --workspace --all-targets --all-features`, and
   `cargo test --workspace --all-features` pass.
 - mock controller and agent exchange frames through a real local QUIC relay;
+- both peers receive `PeerReady`, answer heartbeats, and observe Session closure;
 - the Windows demo captures 100 frames and writes a valid PNG;
 - a 1080p BGRA test frame scales to 720p, crosses the relay, and decodes;
 - relayed video remains authenticated end-to-end ciphertext until the controller;

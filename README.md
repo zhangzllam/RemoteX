@@ -9,6 +9,7 @@ The repository currently implements **Milestones 0–3**:
 
 - a modular Rust workspace and versioned protocol model;
 - an authenticated QUIC relay with one-time, role-bound credentials;
+- explicit peer readiness, heartbeat, disconnect cleanup, and bounded forwarding;
 - XChaCha20-Poly1305 end-to-end frame encryption, leaving the relay blind;
 - Windows DXGI Desktop Duplication with cursor composition and mode recovery;
 - 720p JPEG software encoding at a configurable 10–15 FPS target;
@@ -46,6 +47,7 @@ pnpm --dir apps/desktop/ui build
 
 See [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), and
 [Roadmap](docs/roadmap.md) for design boundaries and planned work. See
+[Relay M1](docs/relay.md) for the mock transport workflow and
 [Running M3](docs/running-m3.md) for the current development-only relay, agent,
 and controller workflow.
 

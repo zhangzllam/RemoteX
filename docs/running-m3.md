@@ -37,6 +37,8 @@ $env:REMOTEX_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 $env:REMOTEX_CONTROLLER_TOKEN_HEX = "<64 hex characters>"
 $env:REMOTEX_AGENT_TOKEN_HEX = "<different 64 hex characters>"
 $env:REMOTEX_TOKEN_LIFETIME_SECONDS = "300"
+$env:REMOTEX_RELAY_HEARTBEAT_INTERVAL_MS = "5000"
+$env:REMOTEX_RELAY_PEER_TIMEOUT_MS = "30000"
 $env:RUST_LOG = "remotex_relay=info"
 cargo run -p remotex-relay
 ```

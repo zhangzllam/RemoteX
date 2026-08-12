@@ -2805,7 +2805,6 @@ name = "remotex-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "bytes",
  "hex",
  "quinn",
@@ -2856,7 +2855,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "bincode",
  "bytes",
  "hex",
  "quinn",
@@ -2903,7 +2901,7 @@ name = "remotex-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
+ "async-trait",
  "hex",
  "quinn",
  "rcgen",

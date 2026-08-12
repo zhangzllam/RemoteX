@@ -11,7 +11,10 @@ use remotex_capture::{CaptureError, DxgiCapture, MonitorId, MonitorInfo, ScreenC
 #[cfg(windows)]
 use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardBackend};
 #[cfg(windows)]
-use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
+use remotex_crypto::{
+    DeviceIdentity, Ed25519DeviceIdentity, SessionCipher, SessionDirection, XChaChaSessionCipher,
+    device_auth_message,
+};
 #[cfg(windows)]
 use remotex_file_transfer::{
     AllowedRoot, FileTransferError, IncomingTransfer, OutgoingTransfer, RootedFileSystem,
@@ -23,9 +26,12 @@ use remotex_input::{
 };
 #[cfg(windows)]
 use remotex_protocol::{
-    ClipboardOrigin, DisplayId, FileTransferDirection, FileTransferErrorCode, FileTransferMessage,
-    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, Role,
-    SessionId, SessionToken, TransferId, decode_wire, encode_wire,
+    ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin, DeviceAuthProof,
+    DeviceHeartbeatRequest, DeviceId, DevicePlatform, DeviceRegistrationRequest,
+    DeviceRegistrationResponse, DisplayId, FileTransferDirection, FileTransferErrorCode,
+    FileTransferMessage, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage,
+    RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
+    TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
@@ -35,11 +41,14 @@ use remotex_video::{EncoderConfig, SoftwareEncoder};
 use rustls::RootCertStore;
 #[cfg(windows)]
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::BufReader,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 #[cfg(windows)]
@@ -50,6 +59,23 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 #[cfg(windows)]
 use tracing_subscriber::EnvFilter;
+
+#[cfg(windows)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredIdentity {
+    secret_key_hex: String,
+}
+
+#[cfg(windows)]
+struct ManagedAgentConfig {
+    control_url: String,
+    identity_path: PathBuf,
+    relay_certificate_path: String,
+    device_name: String,
+    frames_per_second: u32,
+    local_permissions: SessionPermissions,
+    file_roots: Vec<AllowedRoot>,
+}
 
 #[cfg(windows)]
 #[allow(clippy::struct_excessive_bools)]
@@ -100,6 +126,15 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize tracing: {error}"))?;
 
+    if let Some(config) = load_managed_config()? {
+        return run_managed_agent(config).await;
+    }
+    run_agent_session(load_config()?).await
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
+async fn run_agent_session(config: AgentConfig) -> anyhow::Result<()> {
     let AgentConfig {
         relay_address,
         server_name,
@@ -113,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         file_upload_permission,
         file_download_permission,
         file_roots,
-    } = load_config()?;
+    } = config;
     let outbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
         *session_id.as_uuid().as_bytes(),
@@ -199,6 +234,221 @@ async fn main() -> anyhow::Result<()> {
     transport.close().await?;
     client_endpoint.close(0_u32.into(), b"agent stopped");
     Ok(())
+}
+
+#[cfg(windows)]
+async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
+    let identity = Arc::new(load_or_create_identity(&config.identity_path)?);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build control client")?;
+    let registration = DeviceRegistrationRequest {
+        public_key: identity.public_bytes().to_vec(),
+        device_name: config.device_name.clone(),
+        platform: DevicePlatform::Windows,
+        agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        capabilities: config.local_permissions,
+    };
+    let response = client
+        .post(format!("{}/api/devices/register", config.control_url))
+        .json(&registration)
+        .send()
+        .await
+        .context("register device")?
+        .error_for_status()
+        .context("control server rejected device registration")?
+        .json::<DeviceRegistrationResponse>()
+        .await
+        .context("decode device registration")?;
+    let device_id = response.device_id;
+    info!(%device_id, "device registered with control server");
+
+    let nonce = Arc::new(AtomicU64::new(now_ms()?));
+    let heartbeat_task = tokio::spawn(run_managed_heartbeats(
+        client.clone(),
+        config.control_url.clone(),
+        device_id.clone(),
+        Arc::clone(&identity),
+        Arc::clone(&nonce),
+        config.local_permissions,
+    ));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            () = tokio::time::sleep(Duration::from_secs(2)) => {
+                let proof = signed_proof(
+                    &identity,
+                    "claim_session",
+                    &device_id,
+                    &nonce,
+                )?;
+                let response = client
+                    .post(format!(
+                        "{}/api/devices/{device_id}/sessions/claim",
+                        config.control_url
+                    ))
+                    .json(&ClaimAgentSessionRequest { proof })
+                    .send()
+                    .await
+                    .context("claim pending session")?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    warn!(event = "control_device_auth_rejected", %device_id);
+                    continue;
+                }
+                let claimed = response
+                    .error_for_status()
+                    .context("control server rejected Session claim")?
+                    .json::<ClaimAgentSessionResponse>()
+                    .await
+                    .context("decode claimed Session")?;
+                if let Some(credentials) = claimed.credentials {
+                    let session = managed_session_config(&config, credentials)?;
+                    if let Err(error) = run_agent_session(session).await {
+                        warn!(event = "managed_session_ended_with_error", %error);
+                    }
+                }
+            }
+        }
+    }
+    heartbeat_task.abort();
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_managed_heartbeats(
+    client: reqwest::Client,
+    control_url: String,
+    device_id: DeviceId,
+    identity: Arc<Ed25519DeviceIdentity>,
+    nonce: Arc<AtomicU64>,
+    capabilities: SessionPermissions,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let request = match signed_proof(&identity, "heartbeat", &device_id, &nonce) {
+            Ok(proof) => DeviceHeartbeatRequest {
+                proof,
+                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                platform: DevicePlatform::Windows,
+                capabilities,
+            },
+            Err(error) => {
+                warn!(event = "heartbeat_sign_failed", %error);
+                continue;
+            }
+        };
+        match client
+            .post(format!("{control_url}/api/devices/{device_id}/heartbeat"))
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => warn!(
+                event = "control_heartbeat_rejected",
+                status = %response.status(),
+                %device_id
+            ),
+            Err(error) => warn!(event = "control_heartbeat_failed", %error, %device_id),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn managed_session_config(
+    config: &ManagedAgentConfig,
+    credentials: SessionCredentials,
+) -> anyhow::Result<AgentConfig> {
+    if credentials.expires_at_ms <= now_ms()? {
+        anyhow::bail!("claimed Session credentials have expired");
+    }
+    Ok(AgentConfig {
+        relay_address: credentials
+            .relay_address
+            .parse()
+            .context("parse managed Relay address")?,
+        server_name: credentials.relay_server_name,
+        certificate_path: config.relay_certificate_path.clone(),
+        session_id: credentials.session_id,
+        token: parse_token(&credentials.role_token_hex)?,
+        end_to_end_key: parse_key(&credentials.end_to_end_key_hex)?,
+        frames_per_second: config.frames_per_second,
+        input_permission: credentials.permissions.control_input
+            && config.local_permissions.control_input,
+        clipboard_permission: credentials.permissions.clipboard
+            && config.local_permissions.clipboard,
+        file_upload_permission: credentials.permissions.file_upload
+            && config.local_permissions.file_upload,
+        file_download_permission: credentials.permissions.file_download
+            && config.local_permissions.file_download,
+        file_roots: config.file_roots.clone(),
+    })
+}
+
+#[cfg(windows)]
+fn signed_proof(
+    identity: &Ed25519DeviceIdentity,
+    action: &str,
+    device_id: &DeviceId,
+    last_nonce: &AtomicU64,
+) -> anyhow::Result<DeviceAuthProof> {
+    let timestamp_ms = now_ms()?;
+    let nonce = last_nonce
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+            Some(timestamp_ms.max(previous.saturating_add(1)))
+        })
+        .map_err(|_| anyhow::anyhow!("device proof nonce update failed"))?
+        .saturating_add(1)
+        .max(timestamp_ms);
+    Ok(DeviceAuthProof {
+        timestamp_ms,
+        nonce,
+        signature: identity.sign(&device_auth_message(
+            action,
+            device_id.as_str(),
+            timestamp_ms,
+            nonce,
+        ))?,
+    })
+}
+
+#[cfg(windows)]
+fn load_or_create_identity(path: &Path) -> anyhow::Result<Ed25519DeviceIdentity> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let stored: StoredIdentity =
+                serde_json::from_slice(&bytes).context("decode device identity")?;
+            let secret: [u8; 32] = hex::decode(stored.secret_key_hex)
+                .context("decode device identity secret")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("device identity secret must contain 32 bytes"))?;
+            Ok(Ed25519DeviceIdentity::from_secret_bytes(secret))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("create device identity directory {}", parent.display())
+                })?;
+            }
+            let identity = Ed25519DeviceIdentity::generate();
+            let bytes = serde_json::to_vec(&StoredIdentity {
+                secret_key_hex: hex::encode(identity.secret_bytes()),
+            })?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("create device identity {}", path.display()))?;
+            std::io::Write::write_all(&mut file, &bytes).context("write device identity")?;
+            Ok(identity)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read device identity {}", path.display()))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -355,6 +605,48 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         file_download_permission,
         file_roots,
     })
+}
+
+#[cfg(windows)]
+fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
+    let control_url = match std::env::var("REMOTEX_CONTROL_URL") {
+        Ok(value) => value.trim_end_matches('/').to_owned(),
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error).context("read REMOTEX_CONTROL_URL"),
+    };
+    if control_url.is_empty() {
+        anyhow::bail!("REMOTEX_CONTROL_URL must not be empty");
+    }
+    let frames_per_second = std::env::var("REMOTEX_VIDEO_FPS")
+        .unwrap_or_else(|_| "12".to_owned())
+        .parse()
+        .context("parse REMOTEX_VIDEO_FPS")?;
+    if !(1..=30).contains(&frames_per_second) {
+        anyhow::bail!("REMOTEX_VIDEO_FPS must be between 1 and 30");
+    }
+    let local_permissions = SessionPermissions {
+        view_desktop: true,
+        control_input: parse_switch("REMOTEX_ALLOW_INPUT", false)?,
+        clipboard: parse_switch("REMOTEX_ALLOW_CLIPBOARD", false)?,
+        file_upload: parse_switch("REMOTEX_ALLOW_FILE_UPLOAD", false)?,
+        file_download: parse_switch("REMOTEX_ALLOW_FILE_DOWNLOAD", false)?,
+    };
+    let file_roots = parse_file_roots(std::env::var("REMOTEX_FILE_ROOTS").ok().as_deref())?;
+    if (local_permissions.file_upload || local_permissions.file_download) && file_roots.is_empty() {
+        anyhow::bail!(
+            "REMOTEX_FILE_ROOTS must configure at least one Name=Path root when file access is enabled"
+        );
+    }
+    Ok(Some(ManagedAgentConfig {
+        control_url,
+        identity_path: PathBuf::from(required("REMOTEX_IDENTITY_PATH")?),
+        relay_certificate_path: required("REMOTEX_RELAY_CA_CERT")?,
+        device_name: std::env::var("REMOTEX_DEVICE_NAME")
+            .unwrap_or_else(|_| "Windows PC".to_owned()),
+        frames_per_second,
+        local_permissions,
+        file_roots,
+    }))
 }
 
 #[cfg(windows)]

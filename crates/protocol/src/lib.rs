@@ -316,6 +316,81 @@ pub struct SessionPermissions {
     pub file_download: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePlatform {
+    Windows,
+    Linux,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRegistrationRequest {
+    pub public_key: Vec<u8>,
+    pub device_name: String,
+    pub platform: DevicePlatform,
+    pub agent_version: String,
+    pub capabilities: SessionPermissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRegistrationResponse {
+    pub device_id: DeviceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceAuthProof {
+    pub timestamp_ms: u64,
+    pub nonce: u64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceHeartbeatRequest {
+    pub proof: DeviceAuthProof,
+    pub agent_version: String,
+    pub platform: DevicePlatform,
+    pub capabilities: SessionPermissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    pub device_id: DeviceId,
+    pub device_name: String,
+    pub platform: DevicePlatform,
+    pub agent_version: String,
+    pub capabilities: SessionPermissions,
+    pub last_seen_ms: u64,
+    pub online: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub device_id: DeviceId,
+    pub controller_name: String,
+    pub requested_permissions: SessionPermissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionCredentials {
+    pub session_id: SessionId,
+    pub relay_address: String,
+    pub relay_server_name: String,
+    pub role_token_hex: String,
+    pub end_to_end_key_hex: String,
+    pub expires_at_ms: u64,
+    pub permissions: SessionPermissions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimAgentSessionRequest {
+    pub proof: DeviceAuthProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimAgentSessionResponse {
+    pub credentials: Option<SessionCredentials>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     SessionRequest { device_id: DeviceId },

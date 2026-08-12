@@ -24,11 +24,12 @@ tests all pass.
 - **M7 — Files:** safe rooted directory browsing, directory creation, chunked
   upload/download, bounded acknowledgement backpressure, cancellation, progress,
   same-ID resume, and SHA-256 completion verification.
+- **M8 — Control server:** Ed25519 device enrollment, nine-digit Device IDs,
+  signed heartbeat and claims, PostgreSQL presence and Session records,
+  wrapped pending secrets, and short-lived one-time Relay credentials.
 
 ## Next
 
-- **M8 — Control server:** PostgreSQL-backed device registration, identity,
-  presence, Session creation, and short-lived Relay credentials.
 - **M9 — Authorization:** visible accept/reject UI, per-capability permissions,
   opt-in unattended access, active-Session controls, and audit records.
 - **M10 — Video optimization:** codec abstraction and negotiation, H.264 with

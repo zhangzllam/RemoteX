@@ -26,6 +26,32 @@ reject lengths above the configured limit before allocating; the default is
 Identifiers are opaque. Clients must not derive authorization decisions from
 their contents.
 
+## Control API data model
+
+M8 adds JSON DTOs for device registration, signed heartbeat, device status,
+Session creation, and signed Agent Session claim. The HTTP API is:
+
+- `POST /api/devices/register` registers an Ed25519 public key and returns a
+  stable nine-digit Device ID;
+- `GET /api/devices/{device_id}` returns public device presence and capability
+  metadata;
+- `POST /api/devices/{device_id}/heartbeat` verifies a signed heartbeat;
+- `POST /api/sessions` creates short-lived, role-bound credentials for an
+  online device;
+- `POST /api/devices/{device_id}/sessions/claim` verifies the Agent and returns
+  at most one pending Agent credential.
+
+`DeviceAuthProof` contains a millisecond timestamp, monotonic nonce, and Ed25519
+signature. The signed bytes include a RemoteX domain, action, Device ID,
+timestamp, and nonce. A proof for one action cannot authorize another action.
+The default accepted clock skew is 60 seconds.
+
+`SessionCredentials` contains a Session ID, Relay endpoint and TLS server name,
+one role's 256-bit token, the 256-bit E2EE Session key, expiry, and intersected
+permissions. Controller and Agent tokens differ and are consumed independently.
+Raw credentials are never returned by device status endpoints or written to
+logs.
+
 ## Logical channels
 
 | Value | Channel | Direction |

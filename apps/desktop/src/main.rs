@@ -11,10 +11,11 @@ use remotex_file_transfer::{
 };
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    ClipboardOrigin, DisplayId, EncodedVideoFrame, FileEntry, FileEntryKind, FileTransferDirection,
-    FileTransferMessage, InputEvent, KeyCode, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope,
-    MouseButton, RelayClientMessage, RelayServerMessage, Role, SessionId, SessionToken, TransferId,
-    VideoCodec, WheelAxis, decode_wire, encode_wire,
+    ClipboardOrigin, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame, FileEntry,
+    FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
+    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, MouseButton, RelayClientMessage,
+    RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
+    TransferId, VideoCodec, WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 use rustls::RootCertStore;
@@ -50,6 +51,12 @@ struct ActiveStream {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectRequest {
+    #[serde(default)]
+    control_server_url: String,
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    controller_name: String,
     relay_address: String,
     server_name: String,
     ca_certificate_path: String,
@@ -59,6 +66,15 @@ struct ConnectRequest {
     clipboard_enabled: bool,
     file_upload_enabled: bool,
     file_download_enabled: bool,
+}
+
+struct ResolvedSession {
+    relay_address: String,
+    server_name: String,
+    session_id: String,
+    token_hex: String,
+    end_to_end_key_hex: String,
+    permissions: SessionPermissions,
 }
 
 #[derive(Debug)]
@@ -487,13 +503,14 @@ async fn run_remote_session(
     mut input_receiver: mpsc::Receiver<InputEvent>,
     file_commands: mpsc::Receiver<ControllerFileCommand>,
 ) -> anyhow::Result<()> {
-    let relay_address: SocketAddr = request
+    let resolved = resolve_session(&request).await?;
+    let relay_address: SocketAddr = resolved
         .relay_address
         .parse()
         .context("parse relay address")?;
-    let session_id: SessionId = request.session_id.parse().context("parse session ID")?;
-    let token = parse_token(&request.token_hex)?;
-    let end_to_end_key = parse_key(&request.end_to_end_key_hex)?;
+    let session_id: SessionId = resolved.session_id.parse().context("parse session ID")?;
+    let token = parse_token(&resolved.token_hex)?;
+    let end_to_end_key = parse_key(&resolved.end_to_end_key_hex)?;
     let inbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
         *session_id.as_uuid().as_bytes(),
@@ -506,7 +523,7 @@ async fn run_remote_session(
     );
     let endpoint = client_endpoint(Path::new(&request.ca_certificate_path))?;
     let connection = endpoint
-        .connect(relay_address, &request.server_name)
+        .connect(relay_address, &resolved.server_name)
         .context("create relay connection")?
         .await
         .context("connect to relay")?;
@@ -524,15 +541,15 @@ async fn run_remote_session(
     let mut clipboard = PermissionedClipboard::new(
         WindowsClipboardBackend,
         ClipboardOrigin::Controller,
-        request.clipboard_enabled,
+        resolved.permissions.clipboard,
     );
     let mut outbound_sequence = 0_u64;
     let mut expected_inbound_sequence = 0_u64;
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let file_service = ControllerFileService {
-        upload_permission: request.file_upload_enabled,
-        download_permission: request.file_download_enabled,
+        upload_permission: resolved.permissions.file_upload,
+        download_permission: resolved.permissions.file_download,
         next_request_id: 1,
         uploads: TransferRegistry::default(),
         downloads: TransferRegistry::default(),
@@ -566,7 +583,7 @@ async fn run_remote_session(
                         .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
                 }
             }
-            event = input_receiver.recv() => {
+            event = input_receiver.recv(), if resolved.permissions.control_input => {
                 let Some(event) = event else { break; };
                 send_controller_message(
                     &mut transport,
@@ -609,6 +626,60 @@ async fn run_remote_session(
         .await;
     endpoint.close(0_u32.into(), b"controller disconnected");
     Ok(())
+}
+
+async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSession> {
+    let requested_permissions = SessionPermissions {
+        view_desktop: true,
+        control_input: true,
+        clipboard: request.clipboard_enabled,
+        file_upload: request.file_upload_enabled,
+        file_download: request.file_download_enabled,
+    };
+    if request.control_server_url.trim().is_empty() {
+        return Ok(ResolvedSession {
+            relay_address: request.relay_address.clone(),
+            server_name: request.server_name.clone(),
+            session_id: request.session_id.clone(),
+            token_hex: request.token_hex.clone(),
+            end_to_end_key_hex: request.end_to_end_key_hex.clone(),
+            permissions: requested_permissions,
+        });
+    }
+
+    let device_id = DeviceId::new(request.device_id.trim()).context("validate device ID")?;
+    let controller_name = request.controller_name.trim();
+    if controller_name.is_empty() {
+        anyhow::bail!("controller name is required when using the control server");
+    }
+    let url = format!(
+        "{}/api/sessions",
+        request.control_server_url.trim().trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&CreateSessionRequest {
+            device_id,
+            controller_name: controller_name.to_owned(),
+            requested_permissions,
+        })
+        .send()
+        .await
+        .context("request a managed session")?
+        .error_for_status()
+        .context("control server rejected the session request")?
+        .json::<SessionCredentials>()
+        .await
+        .context("decode managed session credentials")?;
+
+    Ok(ResolvedSession {
+        relay_address: response.relay_address,
+        server_name: response.relay_server_name,
+        session_id: response.session_id.to_string(),
+        token_hex: response.role_token_hex,
+        end_to_end_key_hex: response.end_to_end_key_hex,
+        permissions: response.permissions,
+    })
 }
 
 async fn handle_relay_message(

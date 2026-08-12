@@ -8,6 +8,8 @@ use remotex_protocol::{
     decode_wire, encode_wire,
 };
 use remotex_transport::{TransportError, read_frame, write_frame};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
 use std::{
     collections::HashMap,
     future::Future,
@@ -142,6 +144,100 @@ impl SessionAuthenticator for InMemorySessionAuthenticator {
 
 /// Compatibility name used by the existing composition root.
 pub type SessionAuthorizer = InMemorySessionAuthenticator;
+
+/// PostgreSQL-backed one-time credentials issued by the M8 control server.
+#[derive(Clone)]
+pub struct PostgresSessionAuthenticator {
+    pool: PgPool,
+}
+
+impl PostgresSessionAuthenticator {
+    #[must_use]
+    pub const fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl SessionAuthenticator for PostgresSessionAuthenticator {
+    async fn authenticate(
+        &self,
+        hello: &ClientHello,
+        now_ms: u64,
+    ) -> Result<AuthenticatedSession, AuthenticationError> {
+        if hello.version != PROTOCOL_VERSION {
+            return Err(AuthenticationError::UnsupportedVersion(hello.version));
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        let row = sqlx::query(
+            "SELECT controller_token_hash, agent_token_hash, controller_consumed, agent_consumed, expires_at_ms FROM sessions WHERE session_id=$1::uuid FOR UPDATE",
+        )
+        .bind(hello.session_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| AuthenticationError::BackendUnavailable)?
+        .ok_or(AuthenticationError::UnknownSession)?;
+        let controller_hash: Vec<u8> = row
+            .try_get("controller_token_hash")
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        let agent_hash: Vec<u8> = row
+            .try_get("agent_token_hash")
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        let presented: [u8; 32] = Sha256::digest(hello.token.as_bytes()).into();
+        let (expected, opposite, consumed, consumed_column) = match hello.role {
+            Role::Controller => (
+                controller_hash.as_slice(),
+                agent_hash.as_slice(),
+                row.try_get::<bool, _>("controller_consumed")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?,
+                "controller_consumed",
+            ),
+            Role::Agent => (
+                agent_hash.as_slice(),
+                controller_hash.as_slice(),
+                row.try_get::<bool, _>("agent_consumed")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?,
+                "agent_consumed",
+            ),
+        };
+        if bool::from(opposite.ct_eq(&presented)) {
+            return Err(AuthenticationError::RoleMismatch);
+        }
+        if !bool::from(expected.ct_eq(&presented)) {
+            return Err(AuthenticationError::InvalidToken);
+        }
+        let expires_at_ms: i64 = row
+            .try_get("expires_at_ms")
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        let expires_at_ms =
+            u64::try_from(expires_at_ms).map_err(|_| AuthenticationError::BackendUnavailable)?;
+        if now_ms > expires_at_ms {
+            return Err(AuthenticationError::ExpiredSession);
+        }
+        if consumed {
+            return Err(AuthenticationError::TokenAlreadyUsed);
+        }
+        let statement =
+            format!("UPDATE sessions SET {consumed_column}=TRUE WHERE session_id=$1::uuid");
+        sqlx::query(&statement)
+            .bind(hello.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        Ok(AuthenticatedSession {
+            session_id: hello.session_id,
+            role: hello.role,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RelayLimits {
@@ -339,6 +435,20 @@ impl RelayServer {
     {
         Self {
             authenticator: Arc::new(authenticator),
+            registry: Arc::new(SessionRegistry::default()),
+            connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
+            connection_sequence: Arc::new(AtomicU64::new(1)),
+            limits,
+        }
+    }
+
+    #[must_use]
+    pub fn with_authenticator(
+        authenticator: Arc<dyn SessionAuthenticator>,
+        limits: RelayLimits,
+    ) -> Self {
+        Self {
+            authenticator,
             registry: Arc::new(SessionRegistry::default()),
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
             connection_sequence: Arc::new(AtomicU64::new(1)),
@@ -748,13 +858,17 @@ pub enum AuthenticationError {
     RoleMismatch,
     #[error("session token has already been used")]
     TokenAlreadyUsed,
+    #[error("session authentication backend is unavailable")]
+    BackendUnavailable,
 }
 
 impl AuthenticationError {
     const fn code(self) -> RelayProtocolErrorCode {
         match self {
             Self::UnsupportedVersion(_) => RelayProtocolErrorCode::UnsupportedVersion,
-            Self::UnknownSession => RelayProtocolErrorCode::UnknownSession,
+            Self::UnknownSession | Self::BackendUnavailable => {
+                RelayProtocolErrorCode::UnknownSession
+            }
             Self::ExpiredSession => RelayProtocolErrorCode::ExpiredSession,
             Self::InvalidToken => RelayProtocolErrorCode::InvalidToken,
             Self::RoleMismatch => RelayProtocolErrorCode::RoleMismatch,

@@ -27,6 +27,9 @@ type ConnectionStatus = {
 };
 
 type ConnectRequest = {
+  controlServerUrl: string;
+  deviceId: string;
+  controllerName: string;
   relayAddress: string;
   serverName: string;
   caCertificatePath: string;
@@ -151,6 +154,9 @@ type KeyboardInputRequest =
 type UnitPoint = { x: number; y: number };
 
 const initialRequest: ConnectRequest = {
+  controlServerUrl: "http://127.0.0.1:8080",
+  deviceId: "",
+  controllerName: "RemoteX Desktop",
   relayAddress: "127.0.0.1:7443",
   serverName: "localhost",
   caCertificatePath: "",
@@ -513,29 +519,44 @@ function App() {
       <section className="workspace">
         <form onSubmit={connect}>
           <label>
-            Relay address
-            <input value={request.relayAddress} onChange={(e) => update("relayAddress", e.target.value)} required />
+            Control server URL
+            <input value={request.controlServerUrl} onChange={(e) => update("controlServerUrl", e.target.value)} placeholder="https://control.example.com" />
           </label>
           <label>
-            TLS server name
-            <input value={request.serverName} onChange={(e) => update("serverName", e.target.value)} required />
+            Remote device ID
+            <input value={request.deviceId} onChange={(e) => update("deviceId", e.target.value)} inputMode="numeric" pattern="[0-9]{9}" required={Boolean(request.controlServerUrl.trim())} />
+          </label>
+          <label>
+            Controller name
+            <input value={request.controllerName} onChange={(e) => update("controllerName", e.target.value)} required={Boolean(request.controlServerUrl.trim())} />
           </label>
           <label>
             CA certificate path
             <input value={request.caCertificatePath} onChange={(e) => update("caCertificatePath", e.target.value)} required />
           </label>
-          <label>
-            Session ID
-            <input value={request.sessionId} onChange={(e) => update("sessionId", e.target.value)} required />
-          </label>
-          <label>
-            One-time controller token
-            <input type="password" value={request.tokenHex} onChange={(e) => update("tokenHex", e.target.value)} minLength={64} maxLength={64} required />
-          </label>
-          <label>
-            End-to-end session key
-            <input type="password" value={request.endToEndKeyHex} onChange={(e) => update("endToEndKeyHex", e.target.value)} minLength={64} maxLength={64} required />
-          </label>
+          <details>
+            <summary>Manual session fallback</summary>
+            <label>
+              Relay address
+              <input value={request.relayAddress} onChange={(e) => update("relayAddress", e.target.value)} required={!request.controlServerUrl.trim()} />
+            </label>
+            <label>
+              TLS server name
+              <input value={request.serverName} onChange={(e) => update("serverName", e.target.value)} required={!request.controlServerUrl.trim()} />
+            </label>
+            <label>
+              Session ID
+              <input value={request.sessionId} onChange={(e) => update("sessionId", e.target.value)} required={!request.controlServerUrl.trim()} />
+            </label>
+            <label>
+              One-time controller token
+              <input type="password" value={request.tokenHex} onChange={(e) => update("tokenHex", e.target.value)} minLength={64} maxLength={64} required={!request.controlServerUrl.trim()} />
+            </label>
+            <label>
+              End-to-end session key
+              <input type="password" value={request.endToEndKeyHex} onChange={(e) => update("endToEndKeyHex", e.target.value)} minLength={64} maxLength={64} required={!request.controlServerUrl.trim()} />
+            </label>
+          </details>
           <label className="checkbox">
             <input
               type="checkbox"

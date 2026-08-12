@@ -3,9 +3,12 @@
 use anyhow::{Context, bail};
 use quinn::ServerConfig;
 use remotex_protocol::{Role, SessionId, SessionToken};
-use remotex_relay::{RelayLimits, RelayServer, SessionAuthorizer};
+use remotex_relay::{
+    PostgresSessionAuthenticator, RelayLimits, RelayServer, SessionAuthenticator, SessionAuthorizer,
+};
+use sqlx::postgres::PgPoolOptions;
 use std::{
-    fmt::Display, fs::File, io::BufReader, net::SocketAddr, path::Path, str::FromStr,
+    fmt::Display, fs::File, io::BufReader, net::SocketAddr, path::Path, str::FromStr, sync::Arc,
     time::Duration,
 };
 use tracing::info;
@@ -23,38 +26,49 @@ async fn main() -> anyhow::Result<()> {
         .context("parse REMOTEX_RELAY_BIND")?;
     let certificate_path = required("REMOTEX_RELAY_CERT")?;
     let private_key_path = required("REMOTEX_RELAY_KEY")?;
-    let session_id: SessionId = required("REMOTEX_SESSION_ID")?
-        .parse()
-        .context("parse REMOTEX_SESSION_ID")?;
-    let controller_token = parse_token(&required("REMOTEX_CONTROLLER_TOKEN_HEX")?)?;
-    let agent_token = parse_token(&required("REMOTEX_AGENT_TOKEN_HEX")?)?;
-    let lifetime_seconds: u64 = std::env::var("REMOTEX_TOKEN_LIFETIME_SECONDS")
-        .unwrap_or_else(|_| "300".to_owned())
-        .parse()
-        .context("parse REMOTEX_TOKEN_LIFETIME_SECONDS")?;
-    let expires_at_ms = now_ms()?
-        .checked_add(lifetime_seconds.saturating_mul(1000))
-        .context("token expiration overflow")?;
-
-    let authorizer = SessionAuthorizer::default();
-    authorizer
-        .grant(
-            session_id,
-            Role::Controller,
-            controller_token,
-            expires_at_ms,
-        )
-        .await;
-    authorizer
-        .grant(session_id, Role::Agent, agent_token, expires_at_ms)
-        .await;
+    let (authorizer, development_session): (Arc<dyn SessionAuthenticator>, Option<SessionId>) =
+        match std::env::var("REMOTEX_DATABASE_URL") {
+            Ok(database_url) => {
+                let pool = PgPoolOptions::new()
+                    .max_connections(parse_or("REMOTEX_RELAY_DB_CONNECTIONS", 10_u32)?)
+                    .connect(&database_url)
+                    .await
+                    .context("connect Relay to PostgreSQL")?;
+                (Arc::new(PostgresSessionAuthenticator::new(pool)), None)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                let session_id: SessionId = required("REMOTEX_SESSION_ID")?
+                    .parse()
+                    .context("parse REMOTEX_SESSION_ID")?;
+                let controller_token = parse_token(&required("REMOTEX_CONTROLLER_TOKEN_HEX")?)?;
+                let agent_token = parse_token(&required("REMOTEX_AGENT_TOKEN_HEX")?)?;
+                let lifetime_seconds: u64 = parse_or("REMOTEX_TOKEN_LIFETIME_SECONDS", 300)?;
+                let expires_at_ms = now_ms()?
+                    .checked_add(lifetime_seconds.saturating_mul(1000))
+                    .context("token expiration overflow")?;
+                let development = SessionAuthorizer::default();
+                development
+                    .grant(
+                        session_id,
+                        Role::Controller,
+                        controller_token,
+                        expires_at_ms,
+                    )
+                    .await;
+                development
+                    .grant(session_id, Role::Agent, agent_token, expires_at_ms)
+                    .await;
+                (Arc::new(development), Some(session_id))
+            }
+            Err(error) => return Err(error).context("read REMOTEX_DATABASE_URL"),
+        };
 
     let server_config =
         load_server_config(Path::new(&certificate_path), Path::new(&private_key_path))?;
     let endpoint = quinn::Endpoint::server(server_config, bind).context("bind relay endpoint")?;
-    info!(address = %endpoint.local_addr()?, %session_id, "relay listening");
+    info!(address = %endpoint.local_addr()?, ?development_session, "relay listening");
     let defaults = RelayLimits::default();
-    RelayServer::new(
+    RelayServer::with_authenticator(
         authorizer,
         RelayLimits {
             maximum_frame_size: parse_or(

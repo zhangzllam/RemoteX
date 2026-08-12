@@ -19,8 +19,10 @@ The repository currently implements **Milestones 0–7**:
 - safe virtual-root file browsing, directory creation, and opt-in upload and
   download with 4 MiB chunks, acknowledgement backpressure, cancellation,
   explicit resume, progress, and SHA-256 verification.
+- a PostgreSQL-backed Control Server with persistent device identity, nine-digit
+  Device IDs, signed presence, and short-lived one-time Relay credentials.
 
-The control-server API, persistent device registration, and P2P are intentionally
+Interactive authorization, unattended-access policy, and P2P are intentionally
 not implemented yet.
 
 ## Workspace
@@ -52,7 +54,7 @@ pnpm --dir apps/desktop/ui build
 See [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), and
 [Roadmap](docs/roadmap.md) for design boundaries and planned work. See
 [Relay M1](docs/relay.md) for the mock transport workflow and
-[Running M7](docs/running-m7.md) for the current development-only relay, agent,
+[Running M8](docs/running-m8.md) for the PostgreSQL-backed control, relay, agent,
 and controller workflow.
 
 ## Security posture

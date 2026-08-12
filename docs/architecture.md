@@ -33,9 +33,9 @@ file-transfer data later travel through QUIC, initially via the relay.
 | `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Local input capture |
 | `remotex-file-transfer` | Virtual-root resolution, directory metadata, async chunk I/O, resume state, and SHA-256 verification | Networking and destructive deletion |
 | `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows video/input plus authorized clipboard and rooted-file composition root | Device enrollment |
-| `remotex-desktop` | Tauri/React video/input, clipboard, and Files composition root | Installer packaging |
-| `remotex-control` | Control-server composition root | HTTP APIs and database |
+| `remotex-agent` | Windows capabilities, persistent Ed25519 identity, heartbeat, and managed Session composition root | Local approval UI |
+| `remotex-desktop` | Tauri/React controller with managed Session creation and manual development fallback | Installer packaging |
+| `remotex-control` | Axum control API, PostgreSQL repository, presence, and credential issuance | User accounts |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
 Platform-independent crates must not depend on application crates. Applications
@@ -117,7 +117,35 @@ a new logical channel is added. The temporary development key is provisioned out
 band until the M8/M9 control plane distributes session keys. No home-grown
 cryptographic algorithm is used.
 
-## Implemented data paths (M7)
+## M8 control plane
+
+On first managed startup the Agent creates an Ed25519 identity key locally and
+registers only its public key. Registration is idempotent per public key and the
+Control Server assigns a nine-digit `DeviceId`. Heartbeats and Agent Session
+claims are domain-separated, timestamped, nonce-bearing signatures; the server
+checks clock skew and atomically advances the stored nonce to reject replay.
+
+The Desktop asks the HTTPS-friendly API for a Session by Device ID. PostgreSQL
+stores the Session metadata and SHA-256 hashes of the two independently random,
+role-bound Relay tokens. It never stores a raw Relay token. The response returns
+the Controller credential once. The pending Agent credential and shared E2EE key
+are encrypted at rest with the configured 256-bit Control Server master key and
+are released exactly once to the signed Agent claim. The Relay validates and
+consumes the applicable hash in a PostgreSQL row-locking transaction. Credentials
+expire after five minutes by default.
+
+```text
+Agent --register/signed heartbeat--> Control API --> PostgreSQL
+Desktop --create Session-----------> Control API --> PostgreSQL
+Agent --signed claim---------------> Control API
+Desktop + Agent --one-time credentials--> Relay --> opaque E2EE data
+```
+
+The Control Server derives `online` from `last_seen_ms`; no background flag can
+leave a stale device permanently online. Manual Relay Session configuration is
+retained only as a local development fallback.
+
+## Implemented data paths (M8)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope

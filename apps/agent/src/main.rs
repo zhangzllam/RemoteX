@@ -1,4 +1,4 @@
-//! `RemoteX` M6 Windows remote-screen, input, and plain-text clipboard Agent.
+//! `RemoteX` M7 Windows Agent with remote screen, input, clipboard, and files.
 
 #[cfg(windows)]
 use anyhow::Context;
@@ -13,14 +13,19 @@ use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardB
 #[cfg(windows)]
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 #[cfg(windows)]
+use remotex_file_transfer::{
+    AllowedRoot, FileTransferError, IncomingTransfer, OutgoingTransfer, RootedFileSystem,
+    TransferRegistry,
+};
+#[cfg(windows)]
 use remotex_input::{
     DisplayGeometry, InputController, InputError, PermissionedInputController, WindowsInputBackend,
 };
 #[cfg(windows)]
 use remotex_protocol::{
-    ClipboardOrigin, DisplayId, MAX_CLIPBOARD_TEXT_SIZE, Message, MessageEnvelope,
-    RelayClientMessage, RelayServerMessage, Role, SessionId, SessionToken, decode_wire,
-    encode_wire,
+    ClipboardOrigin, DisplayId, FileTransferDirection, FileTransferErrorCode, FileTransferMessage,
+    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, RelayClientMessage, RelayServerMessage, Role,
+    SessionId, SessionToken, TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
@@ -29,7 +34,16 @@ use remotex_video::{EncoderConfig, SoftwareEncoder};
 #[cfg(windows)]
 use rustls::RootCertStore;
 #[cfg(windows)]
-use std::{fs::File, io::BufReader, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    io::BufReader,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+#[cfg(windows)]
+use tokio::sync::mpsc;
 #[cfg(windows)]
 use tokio::time::MissedTickBehavior;
 #[cfg(windows)]
@@ -38,6 +52,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(windows)]
+#[allow(clippy::struct_excessive_bools)]
 struct AgentConfig {
     relay_address: SocketAddr,
     server_name: String,
@@ -48,6 +63,24 @@ struct AgentConfig {
     frames_per_second: u32,
     input_permission: bool,
     clipboard_permission: bool,
+    file_upload_permission: bool,
+    file_download_permission: bool,
+    file_roots: Vec<AllowedRoot>,
+}
+
+#[cfg(windows)]
+const FILE_COMMAND_QUEUE_CAPACITY: usize = 8;
+
+#[cfg(windows)]
+const FILE_RESPONSE_QUEUE_CAPACITY: usize = 2;
+
+#[cfg(windows)]
+struct AgentFileService {
+    filesystem: Option<RootedFileSystem>,
+    upload_permission: bool,
+    download_permission: bool,
+    uploads: TransferRegistry<IncomingTransfer>,
+    downloads: TransferRegistry<OutgoingTransfer>,
 }
 
 #[cfg(windows)]
@@ -60,6 +93,7 @@ struct AgentSessionContext<'a> {
 
 #[cfg(windows)]
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -76,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         frames_per_second,
         input_permission,
         clipboard_permission,
+        file_upload_permission,
+        file_download_permission,
+        file_roots,
     } = load_config()?;
     let outbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
@@ -101,13 +138,27 @@ async fn main() -> anyhow::Result<()> {
         event = "session_permissions_configured",
         control_input = input_permission,
         clipboard = clipboard_permission,
-        "local M6 permissions loaded"
+        file_upload = file_upload_permission,
+        file_download = file_download_permission,
+        "local M7 permissions loaded"
     );
     let mut clipboard = PermissionedClipboard::new(
         WindowsClipboardBackend,
         ClipboardOrigin::Agent,
         clipboard_permission,
     );
+    let filesystem = if file_roots.is_empty() {
+        None
+    } else {
+        Some(RootedFileSystem::new(file_roots)?)
+    };
+    let file_service = AgentFileService {
+        filesystem,
+        upload_permission: file_upload_permission,
+        download_permission: file_download_permission,
+        uploads: TransferRegistry::default(),
+        downloads: TransferRegistry::default(),
+    };
 
     let client_endpoint = client_endpoint(Path::new(&certificate_path))?;
     let connection = client_endpoint
@@ -131,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         &mut capture,
         &mut input,
         &mut clipboard,
+        file_service,
         AgentSessionContext {
             session_id,
             frames_per_second,
@@ -155,6 +207,7 @@ async fn run_active_session(
     capture: &mut DxgiCapture,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    file_service: AgentFileService,
     context: AgentSessionContext<'_>,
 ) -> anyhow::Result<()> {
     let codec = SoftwareEncoder::new(EncoderConfig::default())?;
@@ -166,6 +219,10 @@ async fn run_active_session(
     capture_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut clipboard_interval = tokio::time::interval(Duration::from_millis(500));
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (file_command_sender, file_command_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
+    let (file_response_sender, mut file_response_receiver) =
+        mpsc::channel(FILE_RESPONSE_QUEUE_CAPACITY);
+    let file_worker = tokio::spawn(file_service.run(file_command_receiver, file_response_sender));
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -201,6 +258,19 @@ async fn run_active_session(
                     Err(error) => warn!(event = "clipboard_poll_failed", %error),
                 }
             }
+            response = file_response_receiver.recv() => {
+                let Some(response) = response else {
+                    anyhow::bail!("file service stopped unexpectedly");
+                };
+                send_agent_message(
+                    transport,
+                    context.session_id,
+                    context.outbound_cipher,
+                    &mut outbound_sequence,
+                    now_ms()?,
+                    Message::FileTransfer(response),
+                ).await?;
+            }
             incoming = transport.receive() => {
                 handle_relay_message(
                     transport,
@@ -210,10 +280,13 @@ async fn run_active_session(
                     &mut expected_inbound_sequence,
                     input,
                     clipboard,
+                    &file_command_sender,
                 ).await?;
             }
         }
     }
+    drop(file_command_sender);
+    file_worker.abort();
     Ok(())
 }
 
@@ -260,6 +333,14 @@ fn load_config() -> anyhow::Result<AgentConfig> {
     if !(1..=30).contains(&frames_per_second) {
         anyhow::bail!("REMOTEX_VIDEO_FPS must be between 1 and 30");
     }
+    let file_upload_permission = parse_switch("REMOTEX_ALLOW_FILE_UPLOAD", false)?;
+    let file_download_permission = parse_switch("REMOTEX_ALLOW_FILE_DOWNLOAD", false)?;
+    let file_roots = parse_file_roots(std::env::var("REMOTEX_FILE_ROOTS").ok().as_deref())?;
+    if (file_upload_permission || file_download_permission) && file_roots.is_empty() {
+        anyhow::bail!(
+            "REMOTEX_FILE_ROOTS must configure at least one Name=Path root when file access is enabled"
+        );
+    }
     Ok(AgentConfig {
         relay_address,
         server_name: required("REMOTEX_RELAY_SERVER_NAME")?,
@@ -270,7 +351,32 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         frames_per_second,
         input_permission: parse_switch("REMOTEX_ALLOW_INPUT", false)?,
         clipboard_permission: parse_switch("REMOTEX_ALLOW_CLIPBOARD", false)?,
+        file_upload_permission,
+        file_download_permission,
+        file_roots,
     })
+}
+
+#[cfg(windows)]
+fn parse_file_roots(value: Option<&str>) -> anyhow::Result<Vec<AllowedRoot>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(';')
+        .map(|entry| {
+            let (name, path) = entry
+                .split_once('=')
+                .context("each REMOTEX_FILE_ROOTS entry must use Name=Path")?;
+            if name.trim().is_empty() || path.trim().is_empty() {
+                anyhow::bail!("REMOTEX_FILE_ROOTS names and paths must not be empty");
+            }
+            Ok(AllowedRoot {
+                name: name.trim().to_owned(),
+                path: PathBuf::from(path.trim()),
+            })
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -306,6 +412,7 @@ async fn wait_for_peer(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_relay_message(
     transport: &mut QuicFrameConnection,
     message: RelayServerMessage,
@@ -314,6 +421,7 @@ async fn handle_relay_message(
     expected_sequence: &mut u64,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    file_commands: &mpsc::Sender<FileTransferMessage>,
 ) -> anyhow::Result<()> {
     match message {
         RelayServerMessage::Heartbeat { nonce } => {
@@ -326,14 +434,18 @@ async fn handle_relay_message(
         | RelayServerMessage::WaitingForPeer { .. }
         | RelayServerMessage::PeerReady => {}
         RelayServerMessage::Payload(payload) => {
-            apply_controller_payload(
+            if let Some(file_message) = apply_controller_payload(
                 &payload,
                 session_id,
                 inbound_cipher,
                 expected_sequence,
                 input,
                 clipboard,
-            )?;
+            )? {
+                file_commands
+                    .try_send(file_message)
+                    .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+            }
         }
         RelayServerMessage::SessionClosed { reason } => {
             anyhow::bail!("relay session closed: {reason:?}");
@@ -353,9 +465,9 @@ fn apply_controller_payload(
     expected_sequence: &mut u64,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
-) -> anyhow::Result<()> {
-    if payload.len() > MAX_CLIPBOARD_TEXT_SIZE + 1024 {
-        anyhow::bail!("Controller data payload exceeds the M6 input/clipboard limit");
+) -> anyhow::Result<Option<FileTransferMessage>> {
+    if payload.len() > MAX_FILE_CHUNK_SIZE as usize + 64 * 1024 {
+        anyhow::bail!("Controller data payload exceeds the M7 limit");
     }
     if payload.len() < 8 {
         anyhow::bail!("encrypted Controller payload is missing its sequence number");
@@ -395,14 +507,377 @@ fn apply_controller_payload(
             }
             Err(error) => return Err(error.into()),
         },
+        Message::FileTransfer(message) => {
+            return finish_inbound_sequence(expected_sequence, Some(message));
+        }
         _ => {
             anyhow::bail!("Controller sent a message not allowed in its data direction");
         }
     }
+    finish_inbound_sequence(expected_sequence, None)
+}
+
+#[cfg(windows)]
+fn finish_inbound_sequence(
+    expected_sequence: &mut u64,
+    message: Option<FileTransferMessage>,
+) -> anyhow::Result<Option<FileTransferMessage>> {
     *expected_sequence = expected_sequence
         .checked_add(1)
         .context("Controller inbound sequence space exhausted")?;
-    Ok(())
+    Ok(message)
+}
+
+#[cfg(windows)]
+impl AgentFileService {
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<FileTransferMessage>,
+        responses: mpsc::Sender<FileTransferMessage>,
+    ) {
+        while let Some(command) = commands.recv().await {
+            for response in self.handle(command).await {
+                if responses.send(response).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle(&mut self, message: FileTransferMessage) -> Vec<FileTransferMessage> {
+        match message {
+            FileTransferMessage::ListDirectoryRequest { request_id, path } => {
+                if !self.upload_permission && !self.download_permission {
+                    return vec![file_error(
+                        Some(request_id),
+                        None,
+                        FileTransferErrorCode::PermissionDenied,
+                    )];
+                }
+                let result = match self.filesystem.as_ref() {
+                    Some(filesystem) => filesystem.list_directory(&path).await,
+                    None => {
+                        return vec![file_error(
+                            Some(request_id),
+                            None,
+                            FileTransferErrorCode::PermissionDenied,
+                        )];
+                    }
+                };
+                match result {
+                    Ok(entries) => vec![FileTransferMessage::ListDirectoryResponse {
+                        request_id,
+                        path,
+                        entries,
+                    }],
+                    Err(error) => vec![file_service_error(Some(request_id), None, &error)],
+                }
+            }
+            FileTransferMessage::CreateDirectoryRequest { request_id, path } => {
+                if !self.upload_permission {
+                    return vec![file_error(
+                        Some(request_id),
+                        None,
+                        FileTransferErrorCode::PermissionDenied,
+                    )];
+                }
+                let result = match self.filesystem.as_ref() {
+                    Some(filesystem) => filesystem.create_directory(&path).await,
+                    None => {
+                        return vec![file_error(
+                            Some(request_id),
+                            None,
+                            FileTransferErrorCode::PermissionDenied,
+                        )];
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        vec![FileTransferMessage::CreateDirectoryResponse { request_id, path }]
+                    }
+                    Err(error) => vec![file_service_error(Some(request_id), None, &error)],
+                }
+            }
+            FileTransferMessage::DownloadRequest {
+                transfer_id,
+                source_path,
+            } => {
+                if !self.download_permission {
+                    return vec![file_error(
+                        None,
+                        Some(transfer_id),
+                        FileTransferErrorCode::PermissionDenied,
+                    )];
+                }
+                let result = match self.filesystem.as_ref() {
+                    Some(filesystem) => filesystem.open_download(&source_path).await,
+                    None => {
+                        return vec![file_error(
+                            None,
+                            Some(transfer_id),
+                            FileTransferErrorCode::PermissionDenied,
+                        )];
+                    }
+                };
+                match result {
+                    Ok(transfer) => {
+                        let response = match transfer.filename() {
+                            Ok(filename) => FileTransferMessage::Start {
+                                transfer_id,
+                                direction: FileTransferDirection::Download,
+                                filename,
+                                source_path,
+                                destination_path: String::new(),
+                                total_size: transfer.total_size(),
+                                chunk_size: transfer.chunk_size(),
+                                sha256: transfer.sha256(),
+                            },
+                            Err(error) => {
+                                return vec![file_service_error(None, Some(transfer_id), &error)];
+                            }
+                        };
+                        match self.downloads.insert(transfer_id, transfer) {
+                            Ok(()) => vec![response],
+                            Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                        }
+                    }
+                    Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                }
+            }
+            FileTransferMessage::Start {
+                transfer_id,
+                direction: FileTransferDirection::Upload,
+                destination_path,
+                total_size,
+                chunk_size,
+                sha256,
+                ..
+            } => {
+                if !self.upload_permission {
+                    return vec![file_error(
+                        None,
+                        Some(transfer_id),
+                        FileTransferErrorCode::PermissionDenied,
+                    )];
+                }
+                let result = match self.filesystem.as_ref() {
+                    Some(filesystem) => {
+                        filesystem
+                            .open_upload(
+                                transfer_id,
+                                &destination_path,
+                                total_size,
+                                chunk_size,
+                                sha256,
+                            )
+                            .await
+                    }
+                    None => {
+                        return vec![file_error(
+                            None,
+                            Some(transfer_id),
+                            FileTransferErrorCode::PermissionDenied,
+                        )];
+                    }
+                };
+                match result {
+                    Ok(transfer) => {
+                        let next_offset = transfer.next_offset();
+                        match self.uploads.insert(transfer_id, transfer) {
+                            Ok(()) => vec![FileTransferMessage::Accept {
+                                transfer_id,
+                                next_offset,
+                            }],
+                            Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                        }
+                    }
+                    Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                }
+            }
+            FileTransferMessage::Chunk {
+                transfer_id,
+                offset,
+                checksum,
+                payload,
+            } => {
+                let result = match self.uploads.get_mut(&transfer_id) {
+                    Ok(transfer) => transfer.write_chunk(offset, checksum, &payload).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(next_offset) => vec![FileTransferMessage::ChunkAck {
+                        transfer_id,
+                        next_offset,
+                    }],
+                    Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                }
+            }
+            FileTransferMessage::Complete {
+                transfer_id,
+                total_size,
+                sha256,
+            } => {
+                let result = match self.uploads.remove(&transfer_id) {
+                    Ok(transfer) => transfer.complete(total_size, sha256).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => vec![FileTransferMessage::Complete {
+                        transfer_id,
+                        total_size,
+                        sha256,
+                    }],
+                    Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                }
+            }
+            FileTransferMessage::Accept {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::ChunkAck {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::Resume {
+                transfer_id,
+                next_offset,
+            } => {
+                vec![self.download_chunk(transfer_id, next_offset).await]
+            }
+            FileTransferMessage::Cancel { transfer_id } => {
+                let result = if self.uploads.contains(&transfer_id) {
+                    match self.uploads.remove(&transfer_id) {
+                        Ok(transfer) => transfer.cancel().await,
+                        Err(error) => Err(error),
+                    }
+                } else if self.downloads.contains(&transfer_id) {
+                    self.downloads.remove(&transfer_id).map(|_| ())
+                } else {
+                    Err(FileTransferError::NotFound)
+                };
+                match result {
+                    Ok(()) => vec![FileTransferMessage::Cancel { transfer_id }],
+                    Err(error) => vec![file_service_error(None, Some(transfer_id), &error)],
+                }
+            }
+            FileTransferMessage::Error {
+                transfer_id: Some(transfer_id),
+                ..
+            } => {
+                if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                }
+                if self.downloads.contains(&transfer_id) {
+                    let _ = self.downloads.remove(&transfer_id);
+                }
+                Vec::new()
+            }
+            FileTransferMessage::Progress { transfer_id, .. }
+            | FileTransferMessage::Start { transfer_id, .. } => vec![file_error(
+                None,
+                Some(transfer_id),
+                FileTransferErrorCode::InvalidChunk,
+            )],
+            FileTransferMessage::ListDirectoryResponse { request_id, .. }
+            | FileTransferMessage::CreateDirectoryResponse { request_id, .. }
+            | FileTransferMessage::Error {
+                request_id: Some(request_id),
+                transfer_id: None,
+                ..
+            } => vec![file_error(
+                Some(request_id),
+                None,
+                FileTransferErrorCode::InvalidPath,
+            )],
+            FileTransferMessage::Error {
+                request_id: None,
+                transfer_id: None,
+                ..
+            } => Vec::new(),
+        }
+    }
+
+    async fn download_chunk(
+        &mut self,
+        transfer_id: TransferId,
+        offset: u64,
+    ) -> FileTransferMessage {
+        let result = match self.downloads.get_mut(&transfer_id) {
+            Ok(transfer) => transfer.read_chunk(offset).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(Some((offset, checksum, payload))) => FileTransferMessage::Chunk {
+                transfer_id,
+                offset,
+                checksum,
+                payload,
+            },
+            Ok(None) => match self.downloads.remove(&transfer_id) {
+                Ok(transfer) => FileTransferMessage::Complete {
+                    transfer_id,
+                    total_size: transfer.total_size(),
+                    sha256: transfer.sha256(),
+                },
+                Err(error) => file_service_error(None, Some(transfer_id), &error),
+            },
+            Err(error) => file_service_error(None, Some(transfer_id), &error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn file_service_error(
+    request_id: Option<u64>,
+    transfer_id: Option<TransferId>,
+    error: &FileTransferError,
+) -> FileTransferMessage {
+    let code = match error {
+        FileTransferError::PermissionDenied => FileTransferErrorCode::PermissionDenied,
+        FileTransferError::NotFound | FileTransferError::UnknownRoot => {
+            FileTransferErrorCode::NotFound
+        }
+        FileTransferError::AlreadyExists | FileTransferError::DuplicateRoot(_) => {
+            FileTransferErrorCode::AlreadyExists
+        }
+        FileTransferError::UnexpectedOffset { .. } => FileTransferErrorCode::InvalidOffset,
+        FileTransferError::InvalidChunk
+        | FileTransferError::InvalidChunkSize
+        | FileTransferError::ExceedsDeclaredSize
+        | FileTransferError::ChunkChecksumMismatch
+        | FileTransferError::Incomplete { .. } => FileTransferErrorCode::InvalidChunk,
+        FileTransferError::ChecksumMismatch => FileTransferErrorCode::ChecksumMismatch,
+        FileTransferError::Io(_) => FileTransferErrorCode::Io,
+        _ => FileTransferErrorCode::InvalidPath,
+    };
+    file_error(request_id, transfer_id, code)
+}
+
+#[cfg(windows)]
+fn file_error(
+    request_id: Option<u64>,
+    transfer_id: Option<TransferId>,
+    code: FileTransferErrorCode,
+) -> FileTransferMessage {
+    let message = match code {
+        FileTransferErrorCode::PermissionDenied => "file operation is not permitted",
+        FileTransferErrorCode::InvalidPath => "remote path is invalid",
+        FileTransferErrorCode::NotFound => "remote path or transfer was not found",
+        FileTransferErrorCode::AlreadyExists => "destination already exists",
+        FileTransferErrorCode::InvalidOffset => "transfer offset is invalid",
+        FileTransferErrorCode::InvalidChunk => "file chunk is invalid",
+        FileTransferErrorCode::ChecksumMismatch => "file checksum does not match",
+        FileTransferErrorCode::Cancelled => "file transfer was cancelled",
+        FileTransferErrorCode::Busy => "file service is busy",
+        FileTransferErrorCode::Io => "remote filesystem operation failed",
+    };
+    FileTransferMessage::Error {
+        request_id,
+        transfer_id,
+        code,
+        message: message.to_owned(),
+    }
 }
 
 #[cfg(windows)]
@@ -489,5 +964,44 @@ fn now_ms() -> anyhow::Result<u64> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("the M6 desktop agent currently supports Windows only");
+    eprintln!("the M7 desktop agent currently supports Windows only");
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn file_browsing_requires_an_explicit_permission() {
+        let mut service = AgentFileService {
+            filesystem: None,
+            upload_permission: false,
+            download_permission: false,
+            uploads: TransferRegistry::default(),
+            downloads: TransferRegistry::default(),
+        };
+        let response = service
+            .handle(FileTransferMessage::ListDirectoryRequest {
+                request_id: 4,
+                path: "/".into(),
+            })
+            .await;
+        assert!(matches!(
+            response.as_slice(),
+            [FileTransferMessage::Error {
+                request_id: Some(4),
+                code: FileTransferErrorCode::PermissionDenied,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn file_roots_use_explicit_virtual_names() {
+        let roots = parse_file_roots(Some("Documents=C:\\Users\\User\\Documents;Data=D:\\Data"))
+            .expect("parse roots");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].name, "Documents");
+        assert_eq!(roots[1].path, PathBuf::from("D:\\Data"));
+    }
 }

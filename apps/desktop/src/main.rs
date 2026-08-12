@@ -1,4 +1,4 @@
-//! `RemoteX` M6 Tauri Controller for remote video, input, and plain-text clipboard sync.
+//! `RemoteX` M7 Tauri Controller for remote desktop, clipboard, and files.
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -6,22 +6,35 @@ use bytes::Bytes;
 use quinn::{ClientConfig, Endpoint};
 use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardBackend};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
+use remotex_file_transfer::{
+    FileTransferError, IncomingTransfer, OutgoingTransfer, TransferRegistry,
+};
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    ClipboardOrigin, DisplayId, EncodedVideoFrame, InputEvent, KeyCode, Message, MessageEnvelope,
-    MouseButton, RelayClientMessage, RelayServerMessage, Role, SessionId, SessionToken, VideoCodec,
-    WheelAxis, decode_wire, encode_wire,
+    ClipboardOrigin, DisplayId, EncodedVideoFrame, FileEntry, FileEntryKind, FileTransferDirection,
+    FileTransferMessage, InputEvent, KeyCode, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope,
+    MouseButton, RelayClientMessage, RelayServerMessage, Role, SessionId, SessionToken, TransferId,
+    VideoCodec, WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{Connection, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection};
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::BufReader, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
 
 const INPUT_QUEUE_CAPACITY: usize = 128;
+const FILE_COMMAND_QUEUE_CAPACITY: usize = 8;
+const FILE_RESPONSE_QUEUE_CAPACITY: usize = 2;
 
 #[derive(Default)]
 struct StreamControl {
@@ -31,6 +44,7 @@ struct StreamControl {
 struct ActiveStream {
     cancellation: oneshot::Sender<()>,
     input: mpsc::Sender<InputEvent>,
+    files: mpsc::Sender<ControllerFileCommand>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +57,93 @@ struct ConnectRequest {
     token_hex: String,
     end_to_end_key_hex: String,
     clipboard_enabled: bool,
+    file_upload_enabled: bool,
+    file_download_enabled: bool,
+}
+
+#[derive(Debug)]
+enum ControllerFileCommand {
+    List {
+        path: String,
+    },
+    CreateDirectory {
+        path: String,
+    },
+    Upload {
+        transfer_id: Option<TransferId>,
+        local_path: PathBuf,
+        destination_path: String,
+    },
+    Download {
+        transfer_id: Option<TransferId>,
+        source_path: String,
+        local_path: PathBuf,
+    },
+    Cancel {
+        transfer_id: TransferId,
+    },
+}
+
+#[derive(Debug)]
+struct ControllerFileService {
+    upload_permission: bool,
+    download_permission: bool,
+    next_request_id: u64,
+    uploads: TransferRegistry<OutgoingTransfer>,
+    downloads: TransferRegistry<IncomingTransfer>,
+    pending_downloads: HashMap<TransferId, PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteFileEntryEvent {
+    name: String,
+    path: String,
+    entry_type: &'static str,
+    size: u64,
+    modified_ms: Option<u64>,
+}
+
+impl From<FileEntry> for RemoteFileEntryEvent {
+    fn from(entry: FileEntry) -> Self {
+        Self {
+            name: entry.name,
+            path: entry.path,
+            entry_type: match entry.kind {
+                FileEntryKind::File => "file",
+                FileEntryKind::Directory => "directory",
+            },
+            size: entry.size,
+            modified_ms: entry.modified_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum FileEvent {
+    Directory {
+        path: String,
+        entries: Vec<RemoteFileEntryEvent>,
+    },
+    DirectoryCreated {
+        path: String,
+    },
+    Progress {
+        transfer_id: String,
+        direction: &'static str,
+        transferred: u64,
+        total: u64,
+        state: &'static str,
+    },
+    Error {
+        transfer_id: Option<String>,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -182,16 +283,24 @@ fn connect_remote(
     }
     let (cancel_sender, cancel_receiver) = oneshot::channel();
     let (input_sender, input_receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+    let (file_sender, file_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
     *active = Some(ActiveStream {
         cancellation: cancel_sender,
         input: input_sender,
+        files: file_sender,
     });
     drop(active);
 
     tauri::async_runtime::spawn(async move {
         emit_status(&app, "connecting", "Connecting to relay");
-        let result =
-            run_remote_session(app.clone(), request, cancel_receiver, input_receiver).await;
+        let result = run_remote_session(
+            app.clone(),
+            request,
+            cancel_receiver,
+            input_receiver,
+            file_receiver,
+        )
+        .await;
         match result {
             Ok(()) => emit_status(&app, "disconnected", "Remote session ended"),
             Err(error) => emit_status(&app, "error", &error.to_string()),
@@ -253,11 +362,130 @@ async fn send_keyboard_input(
         .map_err(|_| "remote session input channel is closed".to_owned())
 }
 
+fn active_file_sender(
+    control: &State<'_, StreamControl>,
+) -> Result<mpsc::Sender<ControllerFileCommand>, String> {
+    control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.files.clone())
+        .ok_or_else(|| "remote session is not connected".to_owned())
+}
+
+#[tauri::command]
+async fn list_remote_files(control: State<'_, StreamControl>, path: String) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::List { path })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn create_remote_directory(
+    control: State<'_, StreamControl>,
+    path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::CreateDirectory { path })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn upload_remote_file(
+    control: State<'_, StreamControl>,
+    local_path: String,
+    destination_path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Upload {
+            transfer_id: None,
+            local_path: PathBuf::from(local_path),
+            destination_path,
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn download_remote_file(
+    control: State<'_, StreamControl>,
+    source_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Download {
+            transfer_id: None,
+            source_path,
+            local_path: PathBuf::from(local_path),
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resume_file_upload(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+    local_path: String,
+    destination_path: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Upload {
+            transfer_id: Some(transfer_id),
+            local_path: PathBuf::from(local_path),
+            destination_path,
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resume_file_download(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+    source_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Download {
+            transfer_id: Some(transfer_id),
+            source_path,
+            local_path: PathBuf::from(local_path),
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn cancel_file_transfer(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Cancel { transfer_id })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[allow(clippy::too_many_lines)]
 async fn run_remote_session(
     app: AppHandle,
     request: ConnectRequest,
     mut cancellation: oneshot::Receiver<()>,
     mut input_receiver: mpsc::Receiver<InputEvent>,
+    file_commands: mpsc::Receiver<ControllerFileCommand>,
 ) -> anyhow::Result<()> {
     let relay_address: SocketAddr = request
         .relay_address
@@ -302,12 +530,29 @@ async fn run_remote_session(
     let mut expected_inbound_sequence = 0_u64;
     let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let file_service = ControllerFileService {
+        upload_permission: request.file_upload_enabled,
+        download_permission: request.file_download_enabled,
+        next_request_id: 1,
+        uploads: TransferRegistry::default(),
+        downloads: TransferRegistry::default(),
+        pending_downloads: HashMap::new(),
+    };
+    let (remote_file_sender, remote_file_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
+    let (file_response_sender, mut file_response_receiver) =
+        mpsc::channel(FILE_RESPONSE_QUEUE_CAPACITY);
+    let file_worker = tokio::spawn(file_service.run(
+        app.clone(),
+        file_commands,
+        remote_file_receiver,
+        file_response_sender,
+    ));
     loop {
         tokio::select! {
             _ = &mut cancellation => break,
             result = transport.receive() => {
                 let relay_message = decode_wire::<RelayServerMessage>(&result?)?;
-                handle_relay_message(
+                if let Some(message) = handle_relay_message(
                     &app,
                     &mut transport,
                     relay_message,
@@ -315,7 +560,11 @@ async fn run_remote_session(
                     &inbound_cipher,
                     &mut expected_inbound_sequence,
                     &mut clipboard,
-                ).await?;
+                ).await? {
+                    remote_file_sender
+                        .try_send(message)
+                        .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+                }
             }
             event = input_receiver.recv() => {
                 let Some(event) = event else { break; };
@@ -340,8 +589,21 @@ async fn run_remote_session(
                     Err(error) => warn!(event = "clipboard_poll_failed", %error),
                 }
             }
+            response = file_response_receiver.recv() => {
+                let Some(response) = response else {
+                    anyhow::bail!("file service stopped unexpectedly");
+                };
+                send_controller_message(
+                    &mut transport,
+                    session_id,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    Message::FileTransfer(response),
+                ).await?;
+            }
         }
     }
+    file_worker.abort();
     let _result = transport
         .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
         .await;
@@ -357,7 +619,7 @@ async fn handle_relay_message(
     inbound_cipher: &XChaChaSessionCipher,
     expected_sequence: &mut u64,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<FileTransferMessage>> {
     match message {
         RelayServerMessage::Payload(payload) => handle_agent_payload(
             app,
@@ -372,11 +634,11 @@ async fn handle_relay_message(
             transport
                 .send(Bytes::from(encode_wire(&acknowledgement)?))
                 .await?;
-            Ok(())
+            Ok(None)
         }
         RelayServerMessage::HeartbeatAck { .. }
         | RelayServerMessage::WaitingForPeer { .. }
-        | RelayServerMessage::PeerReady => Ok(()),
+        | RelayServerMessage::PeerReady => Ok(None),
         RelayServerMessage::SessionClosed { reason } => {
             anyhow::bail!("relay session closed: {reason:?}");
         }
@@ -393,7 +655,10 @@ fn handle_agent_payload(
     cipher: &XChaChaSessionCipher,
     expected_sequence: &mut u64,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<FileTransferMessage>> {
+    if bytes.len() > MAX_FILE_CHUNK_SIZE as usize + 64 * 1024 {
+        anyhow::bail!("Agent data payload exceeds the M7 limit");
+    }
     if bytes.len() < 8 {
         anyhow::bail!("encrypted Agent payload is missing its sequence number");
     }
@@ -419,21 +684,28 @@ fn handle_agent_payload(
     if envelope.sequence != sequence {
         anyhow::bail!("encrypted Agent sequence does not match its envelope");
     }
-    match envelope.message {
-        Message::Video(frame) => emit_video_frame(app, sequence, frame)?,
-        Message::Clipboard(message) => match clipboard.apply(message) {
-            Ok(_) => {}
-            Err(ClipboardError::PermissionDenied) => {
-                warn!(event = "clipboard_permission_denied", %session_id);
+    let file_message = match envelope.message {
+        Message::Video(frame) => {
+            emit_video_frame(app, sequence, frame)?;
+            None
+        }
+        Message::Clipboard(message) => {
+            match clipboard.apply(message) {
+                Ok(_) => {}
+                Err(ClipboardError::PermissionDenied) => {
+                    warn!(event = "clipboard_permission_denied", %session_id);
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
-        },
+            None
+        }
+        Message::FileTransfer(message) => Some(message),
         _ => anyhow::bail!("Agent sent a message not allowed in its data direction"),
-    }
+    };
     *expected_sequence = expected_sequence
         .checked_add(1)
         .context("Agent inbound sequence space exhausted")?;
-    Ok(())
+    Ok(file_message)
 }
 
 fn emit_video_frame(
@@ -457,6 +729,433 @@ fn emit_video_frame(
         },
     )?;
     Ok(())
+}
+
+impl ControllerFileService {
+    async fn run(
+        mut self,
+        app: AppHandle,
+        mut local_commands: mpsc::Receiver<ControllerFileCommand>,
+        mut remote_commands: mpsc::Receiver<FileTransferMessage>,
+        responses: mpsc::Sender<FileTransferMessage>,
+    ) {
+        loop {
+            let response = tokio::select! {
+                command = local_commands.recv() => {
+                    let Some(command) = command else { break; };
+                    self.handle_local(&app, command).await
+                }
+                message = remote_commands.recv() => {
+                    let Some(message) = message else { break; };
+                    self.handle_remote(&app, message).await
+                }
+            };
+            if let Some(response) = response
+                && responses.send(response).await.is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_local(
+        &mut self,
+        app: &AppHandle,
+        command: ControllerFileCommand,
+    ) -> Option<FileTransferMessage> {
+        match command {
+            ControllerFileCommand::List { path } => {
+                if !self.upload_permission && !self.download_permission {
+                    emit_file_error(app, None, "file browsing is disabled");
+                    return None;
+                }
+                let request_id = self.take_request_id(app)?;
+                Some(FileTransferMessage::ListDirectoryRequest { request_id, path })
+            }
+            ControllerFileCommand::CreateDirectory { path } => {
+                if !self.upload_permission {
+                    emit_file_error(app, None, "file upload permission is disabled");
+                    return None;
+                }
+                let request_id = self.take_request_id(app)?;
+                Some(FileTransferMessage::CreateDirectoryRequest { request_id, path })
+            }
+            ControllerFileCommand::Upload {
+                transfer_id,
+                local_path,
+                destination_path,
+            } => {
+                if !self.upload_permission {
+                    emit_file_error(app, None, "file upload permission is disabled");
+                    return None;
+                }
+                let transfer_id = transfer_id.unwrap_or_default();
+                match OutgoingTransfer::open(local_path, remotex_protocol::DEFAULT_FILE_CHUNK_SIZE)
+                    .await
+                {
+                    Ok(transfer) => {
+                        let filename = match transfer.filename() {
+                            Ok(filename) => filename,
+                            Err(error) => {
+                                emit_local_file_error(app, Some(transfer_id), &error);
+                                return None;
+                            }
+                        };
+                        let message = FileTransferMessage::Start {
+                            transfer_id,
+                            direction: FileTransferDirection::Upload,
+                            filename,
+                            source_path: String::new(),
+                            destination_path,
+                            total_size: transfer.total_size(),
+                            chunk_size: transfer.chunk_size(),
+                            sha256: transfer.sha256(),
+                        };
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "upload",
+                            0,
+                            transfer.total_size(),
+                            "starting",
+                        );
+                        if let Err(error) = self.uploads.insert(transfer_id, transfer) {
+                            emit_local_file_error(app, Some(transfer_id), &error);
+                            return None;
+                        }
+                        Some(message)
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        None
+                    }
+                }
+            }
+            ControllerFileCommand::Download {
+                transfer_id,
+                source_path,
+                local_path,
+            } => {
+                if !self.download_permission {
+                    emit_file_error(app, None, "file download permission is disabled");
+                    return None;
+                }
+                let transfer_id = transfer_id.unwrap_or_default();
+                self.pending_downloads.insert(transfer_id, local_path);
+                emit_file_progress(app, transfer_id, "download", 0, 0, "starting");
+                Some(FileTransferMessage::DownloadRequest {
+                    transfer_id,
+                    source_path,
+                })
+            }
+            ControllerFileCommand::Cancel { transfer_id } => {
+                if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                }
+                if self.pending_downloads.remove(&transfer_id).is_some() {
+                    emit_file_progress(app, transfer_id, "download", 0, 0, "cancelled");
+                }
+                if self.downloads.contains(&transfer_id) {
+                    match self.downloads.remove(&transfer_id) {
+                        Ok(transfer) => {
+                            if let Err(error) = transfer.cancel().await {
+                                emit_local_file_error(app, Some(transfer_id), &error);
+                            }
+                        }
+                        Err(error) => emit_local_file_error(app, Some(transfer_id), &error),
+                    }
+                }
+                emit_file_progress(app, transfer_id, "transfer", 0, 0, "cancelled");
+                Some(FileTransferMessage::Cancel { transfer_id })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_remote(
+        &mut self,
+        app: &AppHandle,
+        message: FileTransferMessage,
+    ) -> Option<FileTransferMessage> {
+        match message {
+            FileTransferMessage::ListDirectoryResponse { path, entries, .. } => {
+                let _ = app.emit(
+                    "file-event",
+                    FileEvent::Directory {
+                        path,
+                        entries: entries.into_iter().map(Into::into).collect(),
+                    },
+                );
+                None
+            }
+            FileTransferMessage::CreateDirectoryResponse { path, .. } => {
+                let _ = app.emit("file-event", FileEvent::DirectoryCreated { path });
+                None
+            }
+            FileTransferMessage::Start {
+                transfer_id,
+                direction: FileTransferDirection::Download,
+                total_size,
+                chunk_size,
+                sha256,
+                ..
+            } => {
+                let Some(local_path) = self.pending_downloads.remove(&transfer_id) else {
+                    emit_file_error(
+                        app,
+                        Some(transfer_id),
+                        "download destination is unavailable",
+                    );
+                    return Some(FileTransferMessage::Cancel { transfer_id });
+                };
+                match IncomingTransfer::open(
+                    transfer_id,
+                    local_path,
+                    total_size,
+                    chunk_size,
+                    sha256,
+                )
+                .await
+                {
+                    Ok(transfer) => {
+                        let next_offset = transfer.next_offset();
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            next_offset,
+                            total_size,
+                            "transferring",
+                        );
+                        if let Err(error) = self.downloads.insert(transfer_id, transfer) {
+                            emit_local_file_error(app, Some(transfer_id), &error);
+                            return Some(FileTransferMessage::Cancel { transfer_id });
+                        }
+                        Some(FileTransferMessage::Accept {
+                            transfer_id,
+                            next_offset,
+                        })
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        Some(FileTransferMessage::Cancel { transfer_id })
+                    }
+                }
+            }
+            FileTransferMessage::Accept {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::ChunkAck {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::Resume {
+                transfer_id,
+                next_offset,
+            } => self.upload_chunk(app, transfer_id, next_offset).await,
+            FileTransferMessage::Chunk {
+                transfer_id,
+                offset,
+                checksum,
+                payload,
+            } => {
+                let result = match self.downloads.get_mut(&transfer_id) {
+                    Ok(transfer) => {
+                        let total = transfer.total_size();
+                        match transfer.write_chunk(offset, checksum, &payload).await {
+                            Ok(next_offset) => Ok((next_offset, total)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok((next_offset, total)) => {
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            next_offset,
+                            total,
+                            "transferring",
+                        );
+                        Some(FileTransferMessage::ChunkAck {
+                            transfer_id,
+                            next_offset,
+                        })
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        Some(FileTransferMessage::Cancel { transfer_id })
+                    }
+                }
+            }
+            FileTransferMessage::Complete {
+                transfer_id,
+                total_size,
+                sha256,
+            } => {
+                if self.downloads.contains(&transfer_id) {
+                    let result = match self.downloads.remove(&transfer_id) {
+                        Ok(transfer) => transfer.complete(total_size, sha256).await,
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            total_size,
+                            total_size,
+                            "completed",
+                        ),
+                        Err(error) => emit_local_file_error(app, Some(transfer_id), &error),
+                    }
+                } else if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                    emit_file_progress(
+                        app,
+                        transfer_id,
+                        "upload",
+                        total_size,
+                        total_size,
+                        "completed",
+                    );
+                }
+                None
+            }
+            FileTransferMessage::Cancel { transfer_id } => {
+                if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                }
+                if self.downloads.contains(&transfer_id) {
+                    let _ = self.downloads.remove(&transfer_id);
+                }
+                self.pending_downloads.remove(&transfer_id);
+                emit_file_progress(app, transfer_id, "transfer", 0, 0, "cancelled");
+                None
+            }
+            FileTransferMessage::Error {
+                transfer_id,
+                message,
+                ..
+            } => {
+                if let Some(transfer_id) = transfer_id {
+                    if self.uploads.contains(&transfer_id) {
+                        let _ = self.uploads.remove(&transfer_id);
+                    }
+                    if self.downloads.contains(&transfer_id) {
+                        let _ = self.downloads.remove(&transfer_id);
+                    }
+                    self.pending_downloads.remove(&transfer_id);
+                }
+                emit_file_error(app, transfer_id, &message);
+                None
+            }
+            FileTransferMessage::Progress {
+                transfer_id,
+                next_offset,
+            } => {
+                emit_file_progress(app, transfer_id, "transfer", next_offset, 0, "transferring");
+                None
+            }
+            FileTransferMessage::ListDirectoryRequest { .. }
+            | FileTransferMessage::CreateDirectoryRequest { .. }
+            | FileTransferMessage::DownloadRequest { .. }
+            | FileTransferMessage::Start { .. } => None,
+        }
+    }
+
+    async fn upload_chunk(
+        &mut self,
+        app: &AppHandle,
+        transfer_id: TransferId,
+        offset: u64,
+    ) -> Option<FileTransferMessage> {
+        let result = match self.uploads.get_mut(&transfer_id) {
+            Ok(transfer) => {
+                let total = transfer.total_size();
+                let sha256 = transfer.sha256();
+                match transfer.read_chunk(offset).await {
+                    Ok(chunk) => Ok((chunk, total, sha256)),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((Some((offset, checksum, payload)), total, _)) => {
+                let next = offset + payload.len() as u64;
+                emit_file_progress(app, transfer_id, "upload", next, total, "transferring");
+                Some(FileTransferMessage::Chunk {
+                    transfer_id,
+                    offset,
+                    checksum,
+                    payload,
+                })
+            }
+            Ok((None, total, sha256)) => Some(FileTransferMessage::Complete {
+                transfer_id,
+                total_size: total,
+                sha256,
+            }),
+            Err(error) => {
+                emit_local_file_error(app, Some(transfer_id), &error);
+                Some(FileTransferMessage::Cancel { transfer_id })
+            }
+        }
+    }
+
+    fn take_request_id(&mut self, app: &AppHandle) -> Option<u64> {
+        let request_id = self.next_request_id;
+        if let Some(next) = request_id.checked_add(1) {
+            self.next_request_id = next;
+            Some(request_id)
+        } else {
+            emit_file_error(app, None, "file request sequence is exhausted");
+            None
+        }
+    }
+}
+
+fn emit_file_progress(
+    app: &AppHandle,
+    transfer_id: TransferId,
+    direction: &'static str,
+    transferred: u64,
+    total: u64,
+    state: &'static str,
+) {
+    let _ = app.emit(
+        "file-event",
+        FileEvent::Progress {
+            transfer_id: transfer_id.to_string(),
+            direction,
+            transferred,
+            total,
+            state,
+        },
+    );
+}
+
+fn emit_local_file_error(
+    app: &AppHandle,
+    transfer_id: Option<TransferId>,
+    error: &FileTransferError,
+) {
+    emit_file_error(app, transfer_id, &error.to_string());
+}
+
+fn emit_file_error(app: &AppHandle, transfer_id: Option<TransferId>, message: &str) {
+    let _ = app.emit(
+        "file-event",
+        FileEvent::Error {
+            transfer_id: transfer_id.map(|id| id.to_string()),
+            message: message.to_owned(),
+        },
+    );
 }
 
 async fn send_controller_message(
@@ -574,7 +1273,14 @@ fn main() {
             connect_remote,
             disconnect_remote,
             send_mouse_input,
-            send_keyboard_input
+            send_keyboard_input,
+            list_remote_files,
+            create_remote_directory,
+            upload_remote_file,
+            download_remote_file,
+            resume_file_upload,
+            resume_file_download,
+            cancel_file_transfer
         ])
         .run(tauri::generate_context!())
         .expect("run RemoteX desktop application");

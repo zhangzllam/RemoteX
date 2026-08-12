@@ -14,6 +14,7 @@ hex.workspace = true
 quinn.workspace = true
 remotex-clipboard.workspace = true
 remotex-crypto.workspace = true
+remotex-file-transfer.workspace = true
 remotex-input.workspace = true
 remotex-protocol.workspace = true
 remotex-transport.workspace = true

@@ -2870,6 +2870,7 @@ dependencies = [
  "quinn",
  "remotex-clipboard",
  "remotex-crypto",
+ "remotex-file-transfer",
  "remotex-input",
  "remotex-protocol",
  "remotex-transport",
@@ -2887,7 +2888,9 @@ name = "remotex-file-transfer"
 version = "0.1.0"
 dependencies = [
  "remotex-protocol",
+ "sha2",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

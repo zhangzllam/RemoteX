@@ -34,7 +34,31 @@ type ConnectRequest = {
   tokenHex: string;
   endToEndKeyHex: string;
   clipboardEnabled: boolean;
+  fileUploadEnabled: boolean;
+  fileDownloadEnabled: boolean;
 };
+
+type RemoteFileEntry = {
+  name: string;
+  path: string;
+  entryType: "file" | "directory";
+  size: number;
+  modifiedMs: number | null;
+};
+
+type TransferProgress = {
+  transferId: string;
+  direction: string;
+  transferred: number;
+  total: number;
+  state: string;
+};
+
+type FileEvent =
+  | { kind: "directory"; path: string; entries: RemoteFileEntry[] }
+  | { kind: "directoryCreated"; path: string }
+  | ({ kind: "progress" } & TransferProgress)
+  | { kind: "error"; transferId: string | null; message: string };
 
 type RemoteMouseButton = "left" | "right" | "middle";
 
@@ -134,7 +158,26 @@ const initialRequest: ConnectRequest = {
   tokenHex: "",
   endToEndKeyHex: "",
   clipboardEnabled: false,
+  fileUploadEnabled: false,
+  fileDownloadEnabled: false,
 };
+
+function parentPath(path: string): string {
+  if (path === "/") return "/";
+  const end = path.lastIndexOf("/");
+  return end <= 0 ? "/" : path.slice(0, end);
+}
+
+function childPath(parent: string, name: string): string {
+  return parent === "/" ? `/${name}` : `${parent}/${name}`;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GiB`;
+}
 
 function mouseButton(button: number): RemoteMouseButton | null {
   switch (button) {
@@ -161,6 +204,16 @@ function App() {
     message: "Not connected",
   });
   const [frame, setFrame] = useState<VideoFrame | null>(null);
+  const [filePath, setFilePath] = useState("/");
+  const [fileEntries, setFileEntries] = useState<RemoteFileEntry[]>([]);
+  const [fileError, setFileError] = useState("");
+  const [newFolderName, setNewFolderName] = useState("");
+  const [uploadLocalPath, setUploadLocalPath] = useState("");
+  const [uploadDestinationPath, setUploadDestinationPath] = useState("");
+  const [downloadSourcePath, setDownloadSourcePath] = useState("");
+  const [downloadLocalPath, setDownloadLocalPath] = useState("");
+  const [resumeTransferId, setResumeTransferId] = useState("");
+  const [transfers, setTransfers] = useState<Record<string, TransferProgress>>({});
   const screenRef = useRef<HTMLDivElement>(null);
   const pressedButtons = useRef(new Set<RemoteMouseButton>());
   const pressedKeys = useRef(new Set<RemoteKeyCode>());
@@ -176,9 +229,40 @@ function App() {
       "connection-status",
       (event) => setStatus(event.payload),
     );
+    const unlistenFiles = listen<FileEvent>("file-event", (event) => {
+      const update = event.payload;
+      if (update.kind === "directory") {
+        setFilePath(update.path);
+        setFileEntries(update.entries);
+        setFileError("");
+      } else if (update.kind === "directoryCreated") {
+        setFileError("");
+        void invoke("list_remote_files", { path: parentPath(update.path) });
+      } else if (update.kind === "progress") {
+        setTransfers((current) => ({ ...current, [update.transferId]: update }));
+      } else {
+        setFileError(update.message);
+        if (update.transferId) {
+          setTransfers((current) => {
+            const previous = current[update.transferId!];
+            return {
+              ...current,
+              [update.transferId!]: {
+                transferId: update.transferId!,
+                direction: previous?.direction ?? "transfer",
+                transferred: previous?.transferred ?? 0,
+                total: previous?.total ?? 0,
+                state: "error",
+              },
+            };
+          });
+        }
+      }
+    });
     return () => {
       void unlistenFrame.then((unlisten) => unlisten());
       void unlistenStatus.then((unlisten) => unlisten());
+      void unlistenFiles.then((unlisten) => unlisten());
       if (moveAnimationFrame.current !== null) {
         cancelAnimationFrame(moveAnimationFrame.current);
       }
@@ -196,6 +280,52 @@ function App() {
     event.preventDefault();
     setFrame(null);
     await invoke("connect_remote", { request });
+  }
+
+  async function listFiles(path: string) {
+    setFileError("");
+    await invoke("list_remote_files", { path });
+  }
+
+  async function createDirectory() {
+    const name = newFolderName.trim();
+    if (!name || name.includes("/") || name.includes("\\")) return;
+    await invoke("create_remote_directory", { path: childPath(filePath, name) });
+    setNewFolderName("");
+  }
+
+  async function uploadFile() {
+    if (!uploadLocalPath || !uploadDestinationPath) return;
+    await invoke("upload_remote_file", {
+      localPath: uploadLocalPath,
+      destinationPath: uploadDestinationPath,
+    });
+  }
+
+  async function downloadFile() {
+    if (!downloadSourcePath || !downloadLocalPath) return;
+    await invoke("download_remote_file", {
+      sourcePath: downloadSourcePath,
+      localPath: downloadLocalPath,
+    });
+  }
+
+  async function resumeUpload() {
+    if (!resumeTransferId || !uploadLocalPath || !uploadDestinationPath) return;
+    await invoke("resume_file_upload", {
+      transferId: resumeTransferId,
+      localPath: uploadLocalPath,
+      destinationPath: uploadDestinationPath,
+    });
+  }
+
+  async function resumeDownload() {
+    if (!resumeTransferId || !downloadSourcePath || !downloadLocalPath) return;
+    await invoke("resume_file_download", {
+      transferId: resumeTransferId,
+      sourcePath: downloadSourcePath,
+      localPath: downloadLocalPath,
+    });
   }
 
   function enqueueInput(
@@ -419,12 +549,39 @@ function App() {
             />
             <span>Sync plain-text clipboard</span>
           </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={request.fileUploadEnabled}
+              onChange={(event) =>
+                setRequest((current) => ({
+                  ...current,
+                  fileUploadEnabled: event.target.checked,
+                }))
+              }
+            />
+            <span>Allow file upload</span>
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={request.fileDownloadEnabled}
+              onChange={(event) =>
+                setRequest((current) => ({
+                  ...current,
+                  fileDownloadEnabled: event.target.checked,
+                }))
+              }
+            />
+            <span>Allow file download</span>
+          </label>
           <div className="actions">
             <button type="submit" disabled={connected}>Connect</button>
             <button type="button" className="secondary" onClick={disconnect} disabled={!connected}>Disconnect</button>
           </div>
         </form>
 
+        <div className="content-column">
         <div
           ref={screenRef}
           className={`screen ${interactive ? "interactive" : ""}`}
@@ -451,6 +608,76 @@ function App() {
             </div>
           )}
           {frame && <div className="telemetry">{frame.width}×{frame.height} · frame {frame.sequence}</div>}
+        </div>
+
+        <section className="files-panel">
+          <div className="files-header">
+            <div>
+              <p className="eyebrow">REMOTE FILES</p>
+              <h2>{filePath}</h2>
+            </div>
+            <div className="inline-actions">
+              <button type="button" className="secondary" disabled={status.state !== "connected" || filePath === "/"} onClick={() => void listFiles(parentPath(filePath))}>Up</button>
+              <button type="button" className="secondary" disabled={status.state !== "connected"} onClick={() => void listFiles(filePath)}>Refresh</button>
+            </div>
+          </div>
+          {fileError && <p className="file-error">{fileError}</p>}
+          <div className="file-table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Type</th></tr></thead>
+              <tbody>
+                {fileEntries.map((entry) => (
+                  <tr key={entry.path} onDoubleClick={() => {
+                    if (entry.entryType === "directory") void listFiles(entry.path);
+                    else setDownloadSourcePath(entry.path);
+                  }}>
+                    <td><button type="button" className="file-link" onClick={() => entry.entryType === "directory" ? void listFiles(entry.path) : setDownloadSourcePath(entry.path)}>{entry.name}</button></td>
+                    <td>{entry.entryType === "file" ? formatBytes(entry.size) : "—"}</td>
+                    <td>{entry.modifiedMs ? new Date(entry.modifiedMs).toLocaleString() : "—"}</td>
+                    <td>{entry.entryType}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="file-tools">
+            <div>
+              <h3>New folder</h3>
+              <input value={newFolderName} onChange={(event) => setNewFolderName(event.target.value)} placeholder="Folder name" />
+              <button type="button" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void createDirectory()}>Create</button>
+            </div>
+            <div>
+              <h3>Upload</h3>
+              <input value={uploadLocalPath} onChange={(event) => setUploadLocalPath(event.target.value)} placeholder="Local source file" />
+              <input value={uploadDestinationPath} onChange={(event) => setUploadDestinationPath(event.target.value)} placeholder="Remote destination, e.g. /Data/file.zip" />
+              <button type="button" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void uploadFile()}>Upload</button>
+            </div>
+            <div>
+              <h3>Download</h3>
+              <input value={downloadSourcePath} onChange={(event) => setDownloadSourcePath(event.target.value)} placeholder="Remote source file" />
+              <input value={downloadLocalPath} onChange={(event) => setDownloadLocalPath(event.target.value)} placeholder="Local destination file" />
+              <button type="button" disabled={status.state !== "connected" || !request.fileDownloadEnabled} onClick={() => void downloadFile()}>Download</button>
+            </div>
+          </div>
+
+          <div className="resume-tools">
+            <input value={resumeTransferId} onChange={(event) => setResumeTransferId(event.target.value)} placeholder="Interrupted transfer ID" />
+            <button type="button" className="secondary" disabled={status.state !== "connected" || !request.fileUploadEnabled} onClick={() => void resumeUpload()}>Resume upload</button>
+            <button type="button" className="secondary" disabled={status.state !== "connected" || !request.fileDownloadEnabled} onClick={() => void resumeDownload()}>Resume download</button>
+          </div>
+
+          <div className="transfers">
+            {Object.values(transfers).map((transfer) => {
+              const percent = transfer.total > 0 ? Math.min(100, transfer.transferred / transfer.total * 100) : 0;
+              return <div className="transfer" key={transfer.transferId}>
+                <div><strong>{transfer.direction}</strong><span>{transfer.state} · {formatBytes(transfer.transferred)}{transfer.total > 0 ? ` / ${formatBytes(transfer.total)}` : ""}</span></div>
+                <progress max={100} value={percent} />
+                {!(["completed", "cancelled", "error"].includes(transfer.state)) && <button type="button" className="secondary" onClick={() => void invoke("cancel_file_transfer", { transferId: transfer.transferId })}>Cancel</button>}
+              </div>;
+            })}
+          </div>
+        </section>
         </div>
       </section>
     </main>

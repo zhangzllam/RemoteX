@@ -3,9 +3,10 @@ use rcgen::generate_simple_self_signed;
 use remotex_capture::{Frame, PixelFormat};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_protocol::{
-    ClientHello, ClipboardMessage, ClipboardOrigin, InputEvent, KeyCode, Message, MessageEnvelope,
-    MouseButton, RelayClientMessage, RelayProtocolErrorCode, RelayServerMessage, Role,
-    SessionCloseReason, SessionId, SessionToken, decode_wire, encode_wire,
+    ClientHello, ClipboardMessage, ClipboardOrigin, FileTransferDirection, FileTransferMessage,
+    InputEvent, KeyCode, Message, MessageEnvelope, MouseButton, RelayClientMessage,
+    RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken,
+    TransferId, decode_wire, encode_wire,
 };
 use remotex_relay::{InMemorySessionAuthenticator, RelayLimits, RelayServer};
 use remotex_transport::{read_frame, write_frame};
@@ -714,6 +715,91 @@ async fn relay_encrypted_clipboard(
     };
     assert_ne!(&relayed[8..], plaintext);
     let decoded: MessageEnvelope = decode_wire(&cipher.open(0, &relayed[8..])?)?;
+    assert_eq!(decoded, envelope);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encrypted_file_transfer_crosses_relay_bidirectionally() -> TestResult {
+    let limits = RelayLimits {
+        maximum_frame_size: 128 * 1024,
+        ..Harness::limits()
+    };
+    let harness = Harness::start(limits)?;
+    let session_id = SessionId::new();
+    let (mut controller, mut agent) = harness
+        .pair(
+            session_id,
+            SessionToken::from_bytes([30; 32]),
+            SessionToken::from_bytes([31; 32]),
+        )
+        .await?;
+    let transfer_id = TransferId::new();
+    let key = [32; 32];
+    let controller_cipher = XChaChaSessionCipher::new(
+        key,
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::ControllerToAgent,
+    );
+    let agent_cipher = XChaChaSessionCipher::new(
+        key,
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::AgentToController,
+    );
+
+    relay_encrypted_file_message(
+        &mut controller,
+        &mut agent,
+        session_id,
+        &controller_cipher,
+        0,
+        FileTransferMessage::Start {
+            transfer_id,
+            direction: FileTransferDirection::Upload,
+            filename: "hello.bin".into(),
+            source_path: String::new(),
+            destination_path: "/Data/hello.bin".into(),
+            total_size: 5,
+            chunk_size: 64 * 1024,
+            sha256: [5; 32],
+        },
+    )
+    .await?;
+    relay_encrypted_file_message(
+        &mut agent,
+        &mut controller,
+        session_id,
+        &agent_cipher,
+        0,
+        FileTransferMessage::Accept {
+            transfer_id,
+            next_offset: 0,
+        },
+    )
+    .await?;
+    harness.stop().await
+}
+
+async fn relay_encrypted_file_message(
+    sender: &mut TestPeer,
+    receiver: &mut TestPeer,
+    session_id: SessionId,
+    cipher: &XChaChaSessionCipher,
+    sequence: u64,
+    message: FileTransferMessage,
+) -> TestResult {
+    let envelope =
+        MessageEnvelope::new(session_id, sequence, 1_234, Message::FileTransfer(message));
+    let plaintext = encode_wire(&envelope)?;
+    let ciphertext = cipher.seal(sequence, &plaintext)?;
+    let mut payload = sequence.to_be_bytes().to_vec();
+    payload.extend_from_slice(&ciphertext);
+    sender.send(&RelayClientMessage::Payload(payload)).await?;
+    let RelayServerMessage::Payload(relayed) = receiver.receive_significant().await? else {
+        return Err("expected relayed file payload".into());
+    };
+    assert_ne!(&relayed[8..], plaintext);
+    let decoded: MessageEnvelope = decode_wire(&cipher.open(sequence, &relayed[8..])?)?;
     assert_eq!(decoded, envelope);
     Ok(())
 }

@@ -1,6 +1,6 @@
-# RemoteX Protocol (M0–M6)
+# RemoteX Protocol (M0–M7)
 
-This document describes the versioned data model and M1–M6 relay framing.
+This document describes the versioned data model and M1–M7 relay framing.
 
 ## Compatibility
 
@@ -38,8 +38,8 @@ their contents.
 | 5 | Audio | Reserved |
 | 6 | Telemetry | Reserved |
 
-M6 implements Control handshakes outside the envelope plus Video, mouse/keyboard
-Input, and Clipboard envelopes. File types remain modeled but are not executed.
+M7 implements Control handshakes outside the envelope plus Video, mouse/keyboard
+Input, Clipboard, and File Transfer envelopes.
 
 ## Envelope
 
@@ -55,9 +55,10 @@ MessageEnvelope {
 ```
 
 `sequence` is monotonically increasing across all encrypted logical channels in
-one direction. Video and Clipboard therefore share the Agent-to-Controller
-sequence; Input and Clipboard share the Controller-to-Agent sequence. A sequence
-must never repeat with the same directional Session key.
+one direction. Video, Clipboard, and Files therefore share the
+Agent-to-Controller sequence; Input, Clipboard, and Files share the
+Controller-to-Agent sequence. A sequence must never repeat with the same
+directional Session key.
 
 `timestamp_ms` is milliseconds since the Unix epoch and is informational; it is
 not used alone for authentication or ordering.
@@ -109,7 +110,7 @@ agent emits JPEG. Frames are scaled within 1280×720 while preserving aspect
 ratio before encoding.
 
 Before Relay `Payload` wrapping and transport framing, serialized video, input,
-and clipboard envelopes are encrypted with XChaCha20-Poly1305. The wire payload
+clipboard, and file envelopes are encrypted with XChaCha20-Poly1305. The wire payload
 is an eight-byte big-endian sequence number followed by authenticated
 ciphertext. The sequence is also present inside the encrypted envelope and the receiver requires
 both values to match. Nonces are direction-separated and derived from the
@@ -185,18 +186,40 @@ accepted.
 
 ## File-transfer messages
 
-The default chunk size is 4 MiB.
+M7 uses these request/response groups:
 
-- `Start` declares metadata, total size, chunk size, destination, and SHA-256.
-- `Chunk` carries the transfer ID, byte offset, checksum, and bounded bytes.
-- `End` declares the final size and SHA-256.
-- `Progress` reports the next expected offset.
-- `Pause`, `Resume`, and `Cancel` control transfer state.
-- `Error` reports a typed transfer failure without leaking local internals.
+- `ListDirectoryRequest` / `ListDirectoryResponse` return bounded metadata;
+- `CreateDirectoryRequest` / `CreateDirectoryResponse` create one directory;
+- `DownloadRequest` asks the Agent to open a rooted regular file;
+- `Start` declares direction, names, paths, size, chunk size, and SHA-256;
+- `Accept` reports the receiver's persisted `next_offset`;
+- `Chunk` carries a transfer ID, exact offset, SHA-256, and bounded bytes;
+- `ChunkAck` advances the sender and is the transfer backpressure mechanism;
+- `Complete` declares final size and SHA-256;
+- `Resume` requests the same transfer ID at a known offset;
+- `Cancel` stops a transfer and deletes a receiving partial;
+- `Progress` is available for peer progress reporting;
+- `Error` carries a typed, sanitized failure associated with a request or transfer.
 
-The receiver validates transfer identity, offsets, declared lengths, chunk size,
-and checksums before committing data. M0 implements only pure state validation;
-it performs no filesystem I/O.
+The default and maximum chunk size are both 4 MiB in M7. The protocol supports a
+smaller negotiated value. Only one chunk is sent between acknowledgements, so
+large files are never loaded in full and queues cannot grow with file size.
+Offsets must exactly equal the receiver's next offset and must not exceed the
+declared size. Every chunk has SHA-256 and the complete partial file is hashed
+again before it is moved to its final name. A checksum mismatch never exposes a
+completed destination.
+
+Agent paths are virtual absolute paths: `/` lists configured root names and a
+path such as `/Documents/report.pdf` maps only within that named local root.
+Paths are capped at 4 KiB. Parent traversal, backslashes, unknown roots,
+canonical symlink/junction escapes, overwrite, root mutation, and recursive
+deletion are rejected. Listings contain at most 10,000 regular file/directory
+entries. Upload and download permissions are independent on both peers.
+
+An interrupted receiving transfer leaves a hidden partial named with its
+`TransferId`. Reusing the same ID and file metadata returns the persisted length
+in `Accept`; the sender seeks directly to it. Explicit cancellation removes the
+partial, while disconnect cleanup closes file handles and preserves resumability.
 
 ## Limits
 
@@ -204,5 +227,6 @@ M1 sets and enforces a maximum frame size before allocating payload buffers.
 The handshake is separately limited to 4 KiB. Relay connection count, Session
 count, outbound queue capacity, heartbeat interval, and peer timeout are also
 bounded and configurable.
-File chunks must never exceed the negotiated chunk size. Strings and rejection
-reasons also need explicit encoded-length limits at the transport boundary.
+File chunks must never exceed the negotiated chunk size or 4 MiB. Strings and
+rejection reasons also need explicit encoded-length limits at the transport
+boundary.

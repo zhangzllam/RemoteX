@@ -14,20 +14,19 @@ tests all pass.
   recovery, and capture demo.
 - **M3 — Remote screen:** 720p JPEG stream, end-to-end encryption, relay path,
   and Tauri/React display.
-- **M4 — Remote mouse:** normalized movement, left/right/middle buttons, wheel,
-  future display identifier, explicit local input permission, Windows
-  `SendInput`, input-state cleanup, and encrypted relay integration tests.
+- **M4 — Remote mouse:** normalized movement, buttons, wheel, future display ID,
+  explicit local input permission, `SendInput`, and input-state cleanup.
 - **M5 — Remote keyboard:** platform-neutral common keys and modifiers, focused
-  Controller capture, Windows `SendInput`, ordered combinations, duplicate
-  suppression, and release on focus loss or Session cleanup.
+  Controller capture, `SendInput`, ordered combinations, duplicate suppression,
+  and release on focus loss or Session cleanup.
 - **M6 — Clipboard:** opt-in bidirectional UTF-8 text, 1 MiB limit, independent
-  permission, origin/revision loop prevention, simultaneous-change convergence,
-  and encrypted Relay integration coverage.
+  permission, loop prevention, simultaneous-change convergence, and tests.
+- **M7 — Files:** safe rooted directory browsing, directory creation, chunked
+  upload/download, bounded acknowledgement backpressure, cancellation, progress,
+  same-ID resume, and SHA-256 completion verification.
 
 ## Next
 
-- **M7 — Files:** safe rooted directory browsing plus chunked, resumable,
-  checksummed upload and download without blocking interactive traffic.
 - **M8 — Control server:** PostgreSQL-backed device registration, identity,
   presence, Session creation, and short-lived Relay credentials.
 - **M9 — Authorization:** visible accept/reject UI, per-capability permissions,

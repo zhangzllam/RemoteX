@@ -9,6 +9,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub const MAX_RELAY_HANDSHAKE_SIZE: usize = 4 * 1024;
 pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 1024 * 1024;
+pub const MAX_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+pub const MAX_FILE_PATH_SIZE: usize = 4 * 1024;
+pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -144,10 +147,29 @@ impl TransferId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    #[must_use]
+    pub const fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
 }
 impl Default for TransferId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for TransferId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for TransferId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
     }
 }
 
@@ -459,15 +481,77 @@ pub struct EncodedVideoFrame {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: FileEntryKind,
+    pub size: u64,
+    pub modified_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileTransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileTransferErrorCode {
+    PermissionDenied,
+    InvalidPath,
+    NotFound,
+    AlreadyExists,
+    InvalidOffset,
+    InvalidChunk,
+    ChecksumMismatch,
+    Cancelled,
+    Busy,
+    Io,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FileTransferMessage {
+    ListDirectoryRequest {
+        request_id: u64,
+        path: String,
+    },
+    ListDirectoryResponse {
+        request_id: u64,
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    CreateDirectoryRequest {
+        request_id: u64,
+        path: String,
+    },
+    CreateDirectoryResponse {
+        request_id: u64,
+        path: String,
+    },
+    DownloadRequest {
+        transfer_id: TransferId,
+        source_path: String,
+    },
     Start {
         transfer_id: TransferId,
+        direction: FileTransferDirection,
         filename: String,
+        source_path: String,
         destination_path: String,
         total_size: u64,
         chunk_size: u32,
         sha256: [u8; 32],
+    },
+    Accept {
+        transfer_id: TransferId,
+        next_offset: u64,
     },
     Chunk {
         transfer_id: TransferId,
@@ -475,7 +559,11 @@ pub enum FileTransferMessage {
         checksum: [u8; 32],
         payload: Vec<u8>,
     },
-    End {
+    ChunkAck {
+        transfer_id: TransferId,
+        next_offset: u64,
+    },
+    Complete {
         transfer_id: TransferId,
         total_size: u64,
         sha256: [u8; 32],
@@ -483,9 +571,6 @@ pub enum FileTransferMessage {
     Progress {
         transfer_id: TransferId,
         next_offset: u64,
-    },
-    Pause {
-        transfer_id: TransferId,
     },
     Resume {
         transfer_id: TransferId,
@@ -495,7 +580,9 @@ pub enum FileTransferMessage {
         transfer_id: TransferId,
     },
     Error {
-        transfer_id: TransferId,
+        request_id: Option<u64>,
+        transfer_id: Option<TransferId>,
+        code: FileTransferErrorCode,
         message: String,
     },
 }
@@ -716,5 +803,35 @@ mod tests {
         let bytes = encode_wire(&original).expect("encode clipboard message");
         let decoded: ClipboardMessage = decode_wire(&bytes).expect("decode clipboard message");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn resumable_file_messages_round_trip() {
+        let transfer_id = TransferId::new();
+        let messages = [
+            FileTransferMessage::Start {
+                transfer_id,
+                direction: FileTransferDirection::Upload,
+                filename: "archive.bin".into(),
+                source_path: String::new(),
+                destination_path: "/Data/archive.bin".into(),
+                total_size: 9_000_000,
+                chunk_size: DEFAULT_FILE_CHUNK_SIZE,
+                sha256: [7; 32],
+            },
+            FileTransferMessage::ChunkAck {
+                transfer_id,
+                next_offset: 4_512_366_592,
+            },
+            FileTransferMessage::Resume {
+                transfer_id,
+                next_offset: 4_512_366_592,
+            },
+        ];
+        for message in messages {
+            let encoded = encode_wire(&message).expect("encode file message");
+            let decoded: FileTransferMessage = decode_wire(&encoded).expect("decode file message");
+            assert_eq!(decoded, message);
+        }
     }
 }

@@ -16,6 +16,7 @@ h1 { margin: 2px 0 0; font-size: 30px; letter-spacing: -0.04em; }
 .status.connected { color: #7ee6ad; border-color: #245f43; }
 .status.error { color: #ff9a9a; border-color: #6b3030; }
 .workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 22px; }
+.content-column { display: grid; min-width: 0; gap: 22px; }
 form { padding: 18px; border: 1px solid #202c43; border-radius: 16px; background: rgba(15, 22, 35, 0.9); box-shadow: 0 18px 60px rgba(0,0,0,.25); }
 label { display: grid; gap: 7px; margin-bottom: 14px; color: #aebbd2; font-size: 12px; font-weight: 600; }
 label.checkbox { display: flex; align-items: center; gap: 9px; }
@@ -34,7 +35,30 @@ button:disabled { opacity: .45; cursor: default; }
 .empty span { font-size: 18px; font-weight: 700; }
 .empty small { color: #3e4a60; }
 .telemetry { position: absolute; right: 12px; bottom: 12px; padding: 6px 9px; border-radius: 7px; background: rgba(5,8,14,.75); color: #aebbd2; font: 11px ui-monospace, monospace; }
+.files-panel { padding: 18px; border: 1px solid #202c43; border-radius: 16px; background: rgba(15, 22, 35, 0.9); box-shadow: 0 18px 60px rgba(0,0,0,.25); }
+.files-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.files-header h2 { margin: 4px 0 0; font-size: 18px; word-break: break-all; }
+.inline-actions { display: flex; gap: 8px; }
+.inline-actions button { min-width: 76px; }
+.file-error { padding: 10px 12px; border: 1px solid #6b3030; border-radius: 8px; color: #ffb2b2; background: rgba(107,48,48,.18); }
+.file-table-wrap { margin-top: 16px; max-height: 340px; overflow: auto; border: 1px solid #202c43; border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #202c43; text-align: left; white-space: nowrap; }
+th { position: sticky; top: 0; z-index: 1; color: #8ea0bf; background: #101725; }
+tbody tr:hover { background: rgba(87,140,255,.08); }
+.file-link { padding: 0; color: #cfe0ff; background: transparent; font-weight: 600; }
+.file-tools { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.file-tools > div { display: grid; align-content: start; gap: 8px; padding: 12px; border: 1px solid #202c43; border-radius: 10px; background: #0b111e; }
+.file-tools h3 { margin: 0 0 2px; font-size: 13px; }
+.resume-tools { display: grid; grid-template-columns: minmax(240px, 1fr) auto auto; gap: 8px; margin-top: 10px; }
+.transfers { display: grid; gap: 8px; margin-top: 14px; }
+.transfer { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 2fr) auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #202c43; border-radius: 10px; }
+.transfer > div { display: grid; gap: 2px; font-size: 11px; color: #8ea0bf; }
+.transfer strong { color: #dce8ff; text-transform: capitalize; }
+.transfer progress { width: 100%; accent-color: #578cff; }
+.transfer button { padding: 7px 10px; }
 
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: 260px minmax(0, 1fr); }
+  .file-tools { grid-template-columns: 1fr; }
 }

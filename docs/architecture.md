@@ -1,8 +1,8 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestones 0–6 establish
+RemoteX is a self-hosted remote administration system. Milestones 0–7 establish
 the module boundaries and a working, relay-only Windows remote-video, mouse,
-keyboard control, and plain-text clipboard path.
+keyboard control, plain-text clipboard, and safe remote-file paths.
 
 ## System boundaries
 
@@ -23,7 +23,7 @@ file-transfer data later travel through QUIC, initially via the relay.
 
 ## Workspace modules
 
-| Crate | Responsibility | Still excluded through M6 |
+| Crate | Responsibility | Still excluded through M7 |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
 | `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
@@ -31,10 +31,10 @@ file-transfer data later travel through QUIC, initially via the relay.
 | `remotex-capture` | Platform-neutral capture model and Windows DXGI implementation | Networking and video encoding |
 | `remotex-clipboard` | Permissioned text revisions, size limits, loop/conflict prevention, and Windows clipboard adapter | Images, HTML, and files |
 | `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Local input capture |
-| `remotex-file-transfer` | Chunk planning and resumable-transfer state model | Filesystem I/O and networking |
+| `remotex-file-transfer` | Virtual-root resolution, directory metadata, async chunk I/O, resume state, and SHA-256 verification | Networking and destructive deletion |
 | `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows video/input plus authorized clipboard composition root | Device enrollment and file transfer |
-| `remotex-desktop` | Tauri/React video/input plus opt-in local clipboard composition root | File transfer |
+| `remotex-agent` | Windows video/input plus authorized clipboard and rooted-file composition root | Device enrollment |
+| `remotex-desktop` | Tauri/React video/input, clipboard, and Files composition root | Installer packaging |
 | `remotex-control` | Control-server composition root | HTTP APIs and database |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
@@ -111,13 +111,13 @@ and consumed once before expiry. M3 adds XChaCha20-Poly1305 authenticated
 encryption above relay TLS. Its direction-separated nonce is derived from the
 Session ID and monotonically increasing sequence, so the relay forwards only
 ciphertext. M4 uses the opposite cryptographic direction for Controller-to-Agent
-input. M6 uses one monotonically increasing envelope/nonce sequence per
-direction across video, input, and clipboard, preventing nonce reuse when a new
-logical channel is added. The temporary development key is provisioned out of
+input. M6 and M7 use one monotonically increasing envelope/nonce sequence per
+direction across video, input, clipboard, and files, preventing nonce reuse when
+a new logical channel is added. The temporary development key is provisioned out of
 band until the M8/M9 control plane distributes session keys. No home-grown
 cryptographic algorithm is used.
 
-## Implemented data paths (M6)
+## Implemented data paths (M7)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
@@ -160,6 +160,30 @@ style total order resolves simultaneous initial values deterministically and
 both peers converge. Images, HTML, file clipboard formats, and clipboard content
 logging are excluded.
 
+## M7 file path and transfer model
+
+M7 exposes only configured Agent roots under virtual names such as `/Documents`.
+Every existing path is canonicalized and checked against its root; new paths
+require an already-canonical parent inside that root. Parent traversal,
+backslashes, unknown roots, symlink/junction escapes, root mutation, overwrite,
+recursive deletion, and non-file special entries are rejected. Upload and
+download have separate Agent flags and Controller checkboxes.
+
+```text
+Controller local file -> 4 MiB chunk -> SHA-256 -> FileTransferMessage
+    -> XChaCha20-Poly1305 -> bounded QUIC/Relay path -> Agent file worker
+    -> virtual-root validation -> hidden partial file -> verified final file
+```
+
+File I/O runs in a separate async worker behind bounded command/response queues.
+Exactly one chunk is in flight per transfer: the next chunk is read only after
+`Accept`/`ChunkAck`, providing backpressure while video and input retain their
+own scheduling branches. Interrupted partial files use the transfer ID and can
+resume at their persisted length. Cancellation removes a receiving partial;
+disconnect closes handles but preserves partials for explicit same-ID resume.
+Each chunk and the completed file use SHA-256, and a destination becomes visible
+only after final verification.
+
 ## Error handling and observability
 
 Library crates expose typed errors with `thiserror`. Executables may add context
@@ -167,12 +191,13 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0–M6 acceptance criteria
+## M0–M7 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;
 - transport and platform contracts can be mocked without operating-system APIs;
-- file-transfer state validates chunk boundaries without reading files;
+- file-transfer validates virtual roots, streams bounded chunks, resumes partials,
+  and verifies SHA-256 before finalizing files;
 - `cargo fmt`, `cargo clippy --workspace --all-targets --all-features`, and
   `cargo test --workspace --all-features` pass.
 - mock controller and agent exchange frames through a real local QUIC relay;
@@ -193,4 +218,8 @@ identifiers, never secrets or payload contents.
 - clipboard text is capped at 1 MiB and independently permission-gated;
 - all encrypted logical channels share one sequence per direction, preventing
   nonce reuse;
+- directory and transfer paths cannot escape explicitly configured roots;
+- uploads and downloads are independently permission-gated, chunked, resumable,
+  cancellable, progress-reporting, and SHA-256 verified;
+- file work uses bounded queues and acknowledgement-driven backpressure;
 - the React production frontend and Tauri backend build successfully.

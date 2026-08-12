@@ -1,8 +1,7 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestone 0 establishes
-the boundaries and shared vocabulary needed by later milestones; it does not
-provide a working remote-control path.
+RemoteX is a self-hosted remote administration system. Milestones 0–3 establish
+the module boundaries and a working, relay-only Windows remote-video path.
 
 ## System boundaries
 
@@ -23,18 +22,19 @@ file-transfer data later travel through QUIC, initially via the relay.
 
 ## Workspace modules
 
-| Crate | Responsibility | Explicitly excluded in M0 |
+| Crate | Responsibility | Still excluded through M3 |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
-| `remotex-transport` | Transport-neutral async connection traits | QUIC implementation and capture |
-| `remotex-crypto` | Session cipher and identity abstractions | Custom cryptography and key persistence |
-| `remotex-capture` | Platform-neutral screen capture model | DXGI and encoding |
+| `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
+| `remotex-crypto` | XChaCha20-Poly1305 session encryption and identity abstractions | Custom cryptography and key persistence |
+| `remotex-capture` | Platform-neutral capture model and Windows DXGI implementation | Networking and video encoding |
 | `remotex-input` | Platform-neutral input execution contract | Windows `SendInput` |
 | `remotex-file-transfer` | Chunk planning and resumable-transfer state model | Filesystem I/O and networking |
-| `remotex-agent` | Agent process composition root | Device enrollment and remote execution |
-| `remotex-desktop` | Controller process composition root | Tauri/React UI and video display |
+| `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
+| `remotex-agent` | Windows capture → encode → QUIC composition root | Device enrollment and remote input |
+| `remotex-desktop` | Tauri/React controller and QUIC video receiver | Remote input and file transfer |
 | `remotex-control` | Control-server composition root | HTTP APIs and database |
-| `remotex-relay` | Relay-server composition root | Pairing and frame forwarding |
+| `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
 Platform-independent crates must not depend on application crates. Applications
 compose capabilities through traits and may select concrete implementations at
@@ -72,8 +72,25 @@ Remote access must remain visible and consensual:
 - an active connection is visibly indicated and audited;
 - the relay cannot read end-to-end encrypted payloads.
 
-M0 defines cryptographic boundaries but intentionally selects no home-grown
-algorithm. A later milestone must use reviewed libraries and standard protocols.
+The M1 transport uses QUIC/TLS through Quinn and rustls. Session credentials are
+256-bit opaque values compared in constant time, bound to one Session/Role pair,
+and consumed once before expiry. M3 adds XChaCha20-Poly1305 authenticated
+encryption above relay TLS. Its direction-separated nonce is derived from the
+Session ID and monotonically increasing sequence, so the relay forwards only
+ciphertext. The temporary development key is provisioned out of band until the
+M7/M8 control plane distributes session keys. No home-grown cryptographic
+algorithm is used.
+
+## Implemented data path (M3)
+
+```text
+Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
+             → XChaCha20-Poly1305 → QUIC/TLS → Relay (ciphertext only) → QUIC/TLS
+             → Tauri backend → data URL → React remote display
+```
+
+The default video rate is 12 FPS and can be configured from 1–30 FPS. The M3
+target remains stability at 10–15 FPS rather than high frame rate.
 
 ## Error handling and observability
 
@@ -82,7 +99,7 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0 acceptance criteria
+## M0–M3 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;
@@ -90,4 +107,8 @@ identifiers, never secrets or payload contents.
 - file-transfer state validates chunk boundaries without reading files;
 - `cargo fmt`, `cargo clippy --workspace --all-targets --all-features`, and
   `cargo test --workspace --all-features` pass.
-
+- mock controller and agent exchange frames through a real local QUIC relay;
+- the Windows demo captures 100 frames and writes a valid PNG;
+- a 1080p BGRA test frame scales to 720p, crosses the relay, and decodes;
+- relayed video remains authenticated end-to-end ciphertext until the controller;
+- the React production frontend and Tauri backend build successfully.

@@ -1,0 +1,36 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #ecf2ff;
+  background: #090d16;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 900px; min-height: 100vh; background: radial-gradient(circle at 18% 10%, #142448 0, #090d16 42%); }
+button, input { font: inherit; }
+main { padding: 28px; min-height: 100vh; }
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+h1 { margin: 2px 0 0; font-size: 30px; letter-spacing: -0.04em; }
+.eyebrow { margin: 0; color: #78a6ff; font-size: 11px; font-weight: 700; letter-spacing: 0.15em; }
+.status { border: 1px solid #26334e; border-radius: 999px; padding: 8px 13px; color: #9cabc8; background: #101725; font-size: 13px; }
+.status.connected { color: #7ee6ad; border-color: #245f43; }
+.status.error { color: #ff9a9a; border-color: #6b3030; }
+.workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 22px; }
+form { padding: 18px; border: 1px solid #202c43; border-radius: 16px; background: rgba(15, 22, 35, 0.9); box-shadow: 0 18px 60px rgba(0,0,0,.25); }
+label { display: grid; gap: 7px; margin-bottom: 14px; color: #aebbd2; font-size: 12px; font-weight: 600; }
+input { width: 100%; padding: 10px 11px; color: #edf3ff; background: #0a101c; border: 1px solid #293651; border-radius: 8px; outline: none; }
+input:focus { border-color: #578cff; box-shadow: 0 0 0 3px rgba(87,140,255,.12); }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 20px; }
+button { border: 0; border-radius: 8px; padding: 10px; color: white; background: #4f7ff1; cursor: pointer; font-weight: 700; }
+button.secondary { color: #b8c4d9; background: #202a3d; }
+button:disabled { opacity: .45; cursor: default; }
+.screen { position: relative; display: grid; place-items: center; min-height: 620px; overflow: hidden; border: 1px solid #202c43; border-radius: 16px; background: #03050a; box-shadow: 0 18px 60px rgba(0,0,0,.35); }
+.screen img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.empty { display: grid; gap: 7px; text-align: center; color: #53617a; }
+.empty span { font-size: 18px; font-weight: 700; }
+.empty small { color: #3e4a60; }
+.telemetry { position: absolute; right: 12px; bottom: 12px; padding: 6px 9px; border-radius: 7px; background: rgba(5,8,14,.75); color: #aebbd2; font: 11px ui-monospace, monospace; }
+
+@media (max-width: 1000px) {
+  .workspace { grid-template-columns: 260px minmax(0, 1fr); }
+}

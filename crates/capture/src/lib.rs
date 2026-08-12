@@ -37,6 +37,8 @@ pub enum CaptureError {
     NotRunning,
     #[error("display mode changed")]
     DisplayModeChanged,
+    #[error("no desktop update arrived before the capture timeout")]
+    Timeout,
     #[error("capture failed: {0}")]
     Other(String),
 }
@@ -47,3 +49,10 @@ pub trait ScreenCapture: Send {
     fn next_frame(&mut self) -> Result<Frame, CaptureError>;
     fn stop(&mut self) -> Result<(), CaptureError>;
 }
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+
+#[cfg(windows)]
+pub use windows::DxgiCapture;

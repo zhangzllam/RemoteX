@@ -4,7 +4,7 @@ Work proceeds milestone by milestone. A milestone is complete only after its
 design, implementation, tests, documentation, formatting, linting, and existing
 tests all pass.
 
-## M0 — Foundation (current)
+## M0 — Foundation (completed)
 
 - Cargo workspace and low-coupling crate boundaries
 - versioned protocol domain types
@@ -14,7 +14,7 @@ tests all pass.
 
 No operational remote-control functionality is included.
 
-## M1 — Relay path
+## M1 — Relay path (completed)
 
 - Controller → relay → agent mock data path
 - one-time session/role token verification
@@ -22,15 +22,22 @@ No operational remote-control functionality is included.
 - structured logging
 - end-to-end integration test with mock peers
 
-## M2 — Windows capture demo
+## M2 — Windows capture demo (completed)
 
 - DXGI monitor enumeration and capture behind `ScreenCapture`
 - cursor handling and display-mode recovery
 - capture 100 frames and save one PNG in a standalone demo
 
-## M3–M5 — Interactive desktop
+## M3 — Remote screen (completed)
 
-- **M3:** JPEG/WebP remote display at a stable 720p, 10–15 FPS
+- DXGI capture frames with cursor composition
+- software resize to no more than 1280×720
+- independently decodable JPEG frames at a configurable 10–15 FPS target
+- relay-only Agent → Controller video flow
+- Tauri 2 + React remote display
+
+## M4–M5 — Interactive input (next)
+
 - **M4:** mouse movement, buttons, and wheel through Windows `SendInput`
 - **M5:** keyboard down/up and modifiers through Windows `SendInput`
 

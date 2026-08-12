@@ -1,8 +1,6 @@
-# RemoteX Protocol (M0)
+# RemoteX Protocol (M0–M3)
 
-This document describes the initial, versioned data model. It is not yet a
-network protocol implementation. M1 will define framing, authentication, size
-limits, and QUIC behavior around these types.
+This document describes the versioned data model and M1–M3 relay framing.
 
 ## Compatibility
 
@@ -11,8 +9,10 @@ Receivers must reject unsupported versions rather than guessing. New optional
 fields may be introduced compatibly; semantic or framing changes require a new
 version.
 
-Serialization uses `serde`. Bincode is used only in unit tests to prove a compact
-binary round trip; M1 will freeze the wire codec and framing format.
+Serialization uses `serde` with bincode 2's standard configuration. Each QUIC
+application frame is prefixed by a four-byte, big-endian payload length. Readers
+reject lengths above the configured limit before allocating; the default is
+8 MiB.
 
 ## Identifiers
 
@@ -36,7 +36,8 @@ their contents.
 | 5 | Audio | Reserved |
 | 6 | Telemetry | Reserved |
 
-M0 models all reserved values but implements no channel behavior.
+M3 implements Control handshakes outside the envelope and Video envelopes.
+Input, Clipboard, and File types remain modeled but are not executed.
 
 ## Envelope
 
@@ -55,9 +56,30 @@ MessageEnvelope {
 `timestamp_ms` is milliseconds since the Unix epoch and is informational; it is
 not used alone for authentication or ordering.
 
-`Message` is a tagged union of `ControlMessage`, `InputEvent`,
-`ClipboardMessage`, and `FileTransferMessage`. The video channel value is
-reserved, but its payload model and handling are deferred.
+`Message` is a tagged union of `ControlMessage`, `EncodedVideoFrame`,
+`InputEvent`, `ClipboardMessage`, and `FileTransferMessage`.
+
+## Relay handshake
+
+The first framed message on a peer stream is a `RelayHandshake` containing the
+protocol version, Session ID, Role, and opaque 256-bit token. The relay verifies
+that the grant is unexpired, matches the Session/Role, and has not been consumed.
+Only a Controller and Agent with complementary credentials are paired.
+
+## Video frames
+
+`EncodedVideoFrame` contains width, height, source timestamp, codec, key-frame
+flag, and compressed bytes. M3 sends independently decodable JPEG frames. The
+codec enum also reserves WebP; the controller decoder accepts it, while the M3
+agent emits JPEG. Frames are scaled within 1280×720 while preserving aspect
+ratio before encoding.
+
+Before transport framing, the serialized video envelope is encrypted with
+XChaCha20-Poly1305. The wire payload is an eight-byte big-endian sequence number
+followed by authenticated ciphertext. The sequence is also present inside the
+encrypted envelope and the controller requires both values to match. Nonces are
+direction-separated and derived from the Session ID plus sequence; sequences
+must never repeat for a session key.
 
 ## Control messages
 
@@ -97,8 +119,8 @@ The receiver validates transfer identity, offsets, declared lengths, chunk size,
 and checksums before committing data. M0 implements only pure state validation;
 it performs no filesystem I/O.
 
-## Limits for later enforcement
+## Limits
 
-M1 must set and enforce a maximum frame size before allocating payload buffers.
+M1 sets and enforces a maximum frame size before allocating payload buffers.
 File chunks must never exceed the negotiated chunk size. Strings and rejection
 reasons also need explicit encoded-length limits at the transport boundary.

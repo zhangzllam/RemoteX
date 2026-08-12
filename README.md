@@ -5,16 +5,23 @@ the architecture of tools such as RustDesk, ToDesk, and MeshCentral. It is
 designed for visible, authorized access to a user's own Windows PCs and Linux
 servers.
 
-This repository currently contains **Milestone 0 only**: the Rust workspace,
-versioned protocol model, platform/transport abstractions, pure file-transfer
-state validation, tests, and architecture documentation. It does not yet
-capture screens, inject input, read files, forward relay traffic, or provide a
-usable remote-control session.
+The repository currently implements **Milestones 0–3**:
+
+- a modular Rust workspace and versioned protocol model;
+- an authenticated QUIC relay with one-time, role-bound credentials;
+- XChaCha20-Poly1305 end-to-end frame encryption, leaving the relay blind;
+- Windows DXGI Desktop Duplication with cursor composition and mode recovery;
+- 720p JPEG software encoding at a configurable 10–15 FPS target;
+- a Tauri 2 + React controller that displays relayed desktop frames.
+
+Mouse/keyboard control, clipboard synchronization, file I/O, the control-server
+API, persistent device registration, and P2P are intentionally not implemented
+yet.
 
 ## Workspace
 
 ```text
-crates/   shared protocol and capability abstractions
+crates/   shared protocol, capability, capture, and video modules
 apps/     agent and desktop composition roots
 servers/  control and relay composition roots
 docs/     architecture, protocol, and milestone specifications
@@ -30,13 +37,24 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+The desktop frontend also requires Node.js and pnpm:
+
+```bash
+pnpm --dir apps/desktop/ui install --frozen-lockfile
+pnpm --dir apps/desktop/ui build
+```
+
 See [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), and
-[Roadmap](docs/roadmap.md) for design boundaries and planned work.
+[Roadmap](docs/roadmap.md) for design boundaries and planned work. See
+[Running M3](docs/running-m3.md) for the current development-only relay, agent,
+and controller workflow.
 
 ## Security posture
 
 RemoteX is intended to be a normal, visible administration tool. Interactive
 approval is the default, unattended access will be opt-in, capabilities will be
 permissioned independently, and session activity will be visible and audited.
-No custom cryptographic algorithms will be introduced.
-
+M3 video frames use XChaCha20-Poly1305 authenticated encryption above QUIC/TLS,
+with direction-separated nonces derived from the Session ID and sequence. The
+relay forwards ciphertext and cannot decode desktop frames. No custom
+cryptographic algorithms are introduced.

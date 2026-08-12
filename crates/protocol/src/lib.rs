@@ -101,6 +101,23 @@ impl Default for TransferId {
     }
 }
 
+/// Opaque 256-bit bearer credential presented exactly once to the relay.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionToken([u8; 32]);
+
+impl SessionToken {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Channel {
@@ -113,10 +130,31 @@ pub enum Channel {
     Telemetry = 6,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Role {
     Controller,
     Agent,
+}
+
+/// First application frame sent by a peer after opening its QUIC stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayHandshake {
+    pub version: u16,
+    pub session_id: SessionId,
+    pub role: Role,
+    pub token: SessionToken,
+}
+
+impl RelayHandshake {
+    #[must_use]
+    pub const fn new(session_id: SessionId, role: Role, token: SessionToken) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            session_id,
+            role,
+            token,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -185,6 +223,23 @@ pub enum ClipboardMessage {
     Text { content: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum VideoCodec {
+    Jpeg,
+    WebP,
+}
+
+/// One independently decodable compressed desktop frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EncodedVideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub source_timestamp_ms: u64,
+    pub codec: VideoCodec,
+    pub key_frame: bool,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FileTransferMessage {
     Start {
@@ -229,6 +284,7 @@ pub enum FileTransferMessage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     Control(ControlMessage),
+    Video(EncodedVideoFrame),
     Input(InputEvent),
     Clipboard(ClipboardMessage),
     FileTransfer(FileTransferMessage),
@@ -239,6 +295,7 @@ impl Message {
     pub const fn channel(&self) -> Channel {
         match self {
             Self::Control(_) => Channel::Control,
+            Self::Video(_) => Channel::Video,
             Self::Input(_) => Channel::Input,
             Self::Clipboard(_) => Channel::Clipboard,
             Self::FileTransfer(_) => Channel::FileTransfer,

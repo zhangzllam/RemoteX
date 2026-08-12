@@ -1,5 +1,5 @@
 [package]
-name = "remotex-transport"
+name = "remotex-video"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,13 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-bytes.workspace = true
-quinn.workspace = true
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "webp"] }
+remotex-capture.workspace = true
+remotex-protocol.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-
-[dev-dependencies]
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 import {
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
   WheelEvent as ReactWheelEvent,
   useEffect,
@@ -42,6 +43,86 @@ type MouseInputRequest =
   | { kind: "buttonUp"; button: RemoteMouseButton }
   | { kind: "wheel"; horizontalDelta: number; verticalDelta: number };
 
+const REMOTE_KEY_BY_CODE = {
+  KeyA: "keyA",
+  KeyB: "keyB",
+  KeyC: "keyC",
+  KeyD: "keyD",
+  KeyE: "keyE",
+  KeyF: "keyF",
+  KeyG: "keyG",
+  KeyH: "keyH",
+  KeyI: "keyI",
+  KeyJ: "keyJ",
+  KeyK: "keyK",
+  KeyL: "keyL",
+  KeyM: "keyM",
+  KeyN: "keyN",
+  KeyO: "keyO",
+  KeyP: "keyP",
+  KeyQ: "keyQ",
+  KeyR: "keyR",
+  KeyS: "keyS",
+  KeyT: "keyT",
+  KeyU: "keyU",
+  KeyV: "keyV",
+  KeyW: "keyW",
+  KeyX: "keyX",
+  KeyY: "keyY",
+  KeyZ: "keyZ",
+  Digit0: "digit0",
+  Digit1: "digit1",
+  Digit2: "digit2",
+  Digit3: "digit3",
+  Digit4: "digit4",
+  Digit5: "digit5",
+  Digit6: "digit6",
+  Digit7: "digit7",
+  Digit8: "digit8",
+  Digit9: "digit9",
+  F1: "f1",
+  F2: "f2",
+  F3: "f3",
+  F4: "f4",
+  F5: "f5",
+  F6: "f6",
+  F7: "f7",
+  F8: "f8",
+  F9: "f9",
+  F10: "f10",
+  F11: "f11",
+  F12: "f12",
+  Enter: "enter",
+  Escape: "escape",
+  Tab: "tab",
+  Backspace: "backspace",
+  Delete: "delete",
+  Insert: "insert",
+  Home: "home",
+  End: "end",
+  PageUp: "pageUp",
+  PageDown: "pageDown",
+  ArrowLeft: "arrowLeft",
+  ArrowRight: "arrowRight",
+  ArrowUp: "arrowUp",
+  ArrowDown: "arrowDown",
+  Space: "space",
+  ShiftLeft: "shiftLeft",
+  ShiftRight: "shiftRight",
+  ControlLeft: "controlLeft",
+  ControlRight: "controlRight",
+  AltLeft: "altLeft",
+  AltRight: "altRight",
+  MetaLeft: "superLeft",
+  MetaRight: "superRight",
+} as const;
+
+type RemoteKeyCode = (typeof REMOTE_KEY_BY_CODE)[keyof typeof REMOTE_KEY_BY_CODE];
+
+type KeyboardInputRequest =
+  | { kind: "keyDown"; key: RemoteKeyCode }
+  | { kind: "keyUp"; key: RemoteKeyCode };
+
 type UnitPoint = { x: number; y: number };
 
 const initialRequest: ConnectRequest = {
@@ -80,8 +161,10 @@ function App() {
   const [frame, setFrame] = useState<VideoFrame | null>(null);
   const screenRef = useRef<HTMLDivElement>(null);
   const pressedButtons = useRef(new Set<RemoteMouseButton>());
+  const pressedKeys = useRef(new Set<RemoteKeyCode>());
   const pendingMove = useRef<UnitPoint | null>(null);
   const moveAnimationFrame = useRef<number | null>(null);
+  const inputChain = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     const unlistenFrame = listen<VideoFrame>("video-frame", (event) => {
@@ -103,6 +186,7 @@ function App() {
   useEffect(() => {
     if (status.state !== "connected") {
       pressedButtons.current.clear();
+      pressedKeys.current.clear();
     }
   }, [status.state]);
 
@@ -112,12 +196,26 @@ function App() {
     await invoke("connect_remote", { request });
   }
 
-  async function sendMouse(mouseRequest: MouseInputRequest) {
-    try {
-      await invoke("send_mouse_input", { request: mouseRequest });
-    } catch (error) {
-      console.error("Remote mouse input failed", error);
-    }
+  function enqueueInput(
+    command: "send_mouse_input" | "send_keyboard_input",
+    inputRequest: MouseInputRequest | KeyboardInputRequest,
+  ): Promise<void> {
+    const next = inputChain.current
+      .then(() => invoke(command, { request: inputRequest }))
+      .then(() => undefined)
+      .catch((error) => {
+        console.error("Remote input failed", error);
+      });
+    inputChain.current = next;
+    return next;
+  }
+
+  function sendMouse(mouseRequest: MouseInputRequest): Promise<void> {
+    return enqueueInput("send_mouse_input", mouseRequest);
+  }
+
+  function sendKeyboard(keyboardRequest: KeyboardInputRequest): Promise<void> {
+    return enqueueInput("send_keyboard_input", keyboardRequest);
   }
 
   async function releaseRemoteButtons() {
@@ -128,8 +226,18 @@ function App() {
     );
   }
 
+  async function releaseRemoteKeys() {
+    const keys = Array.from(pressedKeys.current);
+    pressedKeys.current.clear();
+    await Promise.all(keys.map((key) => sendKeyboard({ kind: "keyUp", key })));
+  }
+
+  async function releaseRemoteInputs() {
+    await Promise.all([releaseRemoteButtons(), releaseRemoteKeys()]);
+  }
+
   async function disconnect() {
-    await releaseRemoteButtons();
+    await releaseRemoteInputs();
     await invoke("disconnect_remote");
   }
 
@@ -191,6 +299,7 @@ function App() {
       return;
     }
     event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
     pressedButtons.current.add(button);
     void sendMouse({ kind: "buttonDown", button, ...point });
@@ -226,6 +335,33 @@ function App() {
     if (horizontalDelta !== 0 || verticalDelta !== 0) {
       void sendMouse({ kind: "wheel", horizontalDelta, verticalDelta });
     }
+  }
+
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (status.state !== "connected") {
+      return;
+    }
+    const key = REMOTE_KEY_BY_CODE[event.code as keyof typeof REMOTE_KEY_BY_CODE];
+    if (!key) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat || pressedKeys.current.has(key)) {
+      return;
+    }
+    pressedKeys.current.add(key);
+    void sendKeyboard({ kind: "keyDown", key });
+  }
+
+  function handleKeyUp(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const key = REMOTE_KEY_BY_CODE[event.code as keyof typeof REMOTE_KEY_BY_CODE];
+    if (!key || !pressedKeys.current.delete(key)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    void sendKeyboard({ kind: "keyUp", key });
   }
 
   const connected = status.state === "connected" || status.state === "connecting";
@@ -279,12 +415,17 @@ function App() {
           className={`screen ${interactive ? "interactive" : ""}`}
           aria-live="polite"
           aria-label="Remote desktop"
+          role="application"
+          tabIndex={interactive ? 0 : -1}
           onContextMenu={(event) => event.preventDefault()}
           onPointerMove={handlePointerMove}
           onPointerDown={handlePointerDown}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerCancel}
           onWheel={handleWheel}
+          onKeyDown={handleKeyDown}
+          onKeyUp={handleKeyUp}
+          onBlur={() => void releaseRemoteInputs()}
         >
           {imageUrl ? (
             <img src={imageUrl} alt="Remote desktop" draggable={false} />

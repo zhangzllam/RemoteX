@@ -1,6 +1,6 @@
-# RemoteX Protocol (M0–M4)
+# RemoteX Protocol (M0–M5)
 
-This document describes the versioned data model and M1–M4 relay framing.
+This document describes the versioned data model and M1–M5 relay framing.
 
 ## Compatibility
 
@@ -38,8 +38,8 @@ their contents.
 | 5 | Audio | Reserved |
 | 6 | Telemetry | Reserved |
 
-M4 implements Control handshakes outside the envelope plus Video and mouse Input
-envelopes. Keyboard, Clipboard, and File types remain modeled but are not
+M5 implements Control handshakes outside the envelope plus Video and mouse/
+keyboard Input envelopes. Clipboard and File types remain modeled but are not
 executed.
 
 ## Envelope
@@ -126,11 +126,12 @@ file download. Acceptance never implies permissions not present in its value.
 
 ## Input events
 
-M4 input events describe intent and do not contain Windows-specific values:
+Input events describe intent and do not contain Windows-specific values:
 
 - `MouseMove { display_id, normalized_x, normalized_y }`;
 - `MouseButtonDown { button }` and `MouseButtonUp { button }`;
 - `MouseWheel { axis, delta }` for vertical or horizontal movement.
+- `KeyDown { key }` and `KeyUp { key }` using `KeyCode`.
 
 Normalized pointer coordinates are unsigned 16-bit values covering the selected
 display: `0` is its left/top edge and `65535` is its right/bottom edge. The
@@ -143,8 +144,19 @@ zero. The Agent rejects missing, repeated, skipped, unauthenticated, wrong-
 Session, and non-input payloads. Decryption does not grant execution permission:
 the Agent separately requires its active Session's `control_input` permission.
 M4 obtains that permission from a local, in-memory configuration flag that is
-off by default. The `Key` model is reserved for M5 and is rejected by the M4
-input backend.
+off by default.
+
+`KeyCode` identifies physical key positions rather than text or Windows scan
+codes. M5 includes A–Z, 0–9, F1–F12, Enter, Escape, Tab, Backspace, Delete,
+Insert, Home, End, Page Up/Down, arrows, Space, and distinct left/right Shift,
+Control, Alt, and Super keys. Controller browser codes map to this enum; only
+the Windows input adapter maps it to virtual keys and extended-key flags.
+
+Pressed keys are tracked per Session. Duplicate `KeyDown` and `KeyUp` without a
+matching press do not reach the OS. Cleanup sends `KeyUp` for every key and
+mouse-button release for every injected button, attempting all releases even if
+one fails. This protocol is one-way authorized input, not a local Agent keyboard
+capture or keylogging channel.
 
 ## File-transfer messages
 

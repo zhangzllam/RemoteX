@@ -1,8 +1,8 @@
 # RemoteX Architecture
 
-RemoteX is a self-hosted remote administration system. Milestones 0–4 establish
-the module boundaries and a working, relay-only Windows remote-video and mouse
-control path.
+RemoteX is a self-hosted remote administration system. Milestones 0–5 establish
+the module boundaries and a working, relay-only Windows remote-video, mouse,
+and keyboard control path.
 
 ## System boundaries
 
@@ -23,17 +23,17 @@ file-transfer data later travel through QUIC, initially via the relay.
 
 ## Workspace modules
 
-| Crate | Responsibility | Still excluded through M4 |
+| Crate | Responsibility | Still excluded through M5 |
 | --- | --- | --- |
 | `remotex-protocol` | Versioned wire-level domain types and serialization | Networking and platform code |
 | `remotex-transport` | Transport-neutral async connection traits, framing, and QUIC stream adapter | Capture and protocol interpretation |
 | `remotex-crypto` | XChaCha20-Poly1305 session encryption and identity abstractions | Custom cryptography and key persistence |
 | `remotex-capture` | Platform-neutral capture model and Windows DXGI implementation | Networking and video encoding |
-| `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse adapter | Keyboard injection |
+| `remotex-input` | Permission enforcement, injected-state tracking, coordinate mapping, and Windows `SendInput` mouse/keyboard adapter | Clipboard and local input capture |
 | `remotex-file-transfer` | Chunk planning and resumable-transfer state model | Filesystem I/O and networking |
 | `remotex-video` | 720p software image scaling, JPEG encoding, and JPEG/WebP decoding | Capture and transport |
-| `remotex-agent` | Windows capture/video send and authorized mouse receive/execution composition root | Device enrollment and keyboard input |
-| `remotex-desktop` | Tauri/React video display and normalized mouse-event sender | Keyboard and file transfer |
+| `remotex-agent` | Windows capture/video send and authorized mouse/keyboard receive/execution composition root | Device enrollment and clipboard |
+| `remotex-desktop` | Tauri/React video display and focused mouse/keyboard sender | Clipboard and file transfer |
 | `remotex-control` | Control-server composition root | HTTP APIs and database |
 | `remotex-relay` | QUIC authentication, pairing, and opaque frame forwarding | Payload parsing and storage |
 
@@ -114,7 +114,7 @@ input and enforces an independent monotonically increasing input sequence. The
 temporary development key is provisioned out of band until the M8/M9 control
 plane distributes session keys. No home-grown cryptographic algorithm is used.
 
-## Implemented data paths (M4)
+## Implemented data paths (M5)
 
 ```text
 Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
@@ -123,8 +123,8 @@ Windows DXGI → compact BGRA → 1280×720 resize → JPEG → MessageEnvelope
 ```
 
 ```text
-React pointer/wheel event → displayed-image coordinate normalization
-    → InputEvent → XChaCha20-Poly1305 → QUIC/TLS → Relay (ciphertext only)
+Focused React pointer/wheel/keyboard event → platform-neutral InputEvent
+    → XChaCha20-Poly1305 → QUIC/TLS → Relay (ciphertext only)
     → Agent sequence/authentication check → permission gate → InputState
     → Windows SendInput
 ```
@@ -136,10 +136,12 @@ The React client accounts for `object-fit: contain` letterboxing and sends
 coordinates in the full 0–65535 protocol range. The Agent maps them first to the
 selected monitor and then to the Windows virtual-desktop absolute range. The
 protocol carries an optional validated display ID for later multi-monitor UI.
-M4 defaults `control_input` to false; the local Agent user must set
+M4/M5 default `control_input` to false; the local Agent user must set
 `REMOTEX_ALLOW_INPUT=true`. Duplicate button transitions are ignored and all
-buttons injected by a Session are released on normal shutdown, error, network
-disconnect, or controller drop.
+buttons and keys injected by a Session are released on normal shutdown, error,
+network disconnect, focus loss, or controller drop. Keyboard events originate
+only from the explicitly focused remote surface; the Agent never captures local
+keystrokes.
 
 ## Error handling and observability
 
@@ -148,7 +150,7 @@ with `anyhow`. Expected failures are returned rather than handled with `unwrap`.
 Later network services will emit structured `tracing` events containing safe
 identifiers, never secrets or payload contents.
 
-## M0–M4 acceptance criteria
+## M0–M5 acceptance criteria
 
 - the Cargo workspace builds on stable Rust;
 - shared protocol values serialize deterministically and round-trip in tests;
@@ -165,4 +167,8 @@ identifiers, never secrets or payload contents.
 - normalized coordinates map to the selected Windows monitor;
 - unauthorized input is rejected before Windows execution;
 - pressed mouse buttons are released during Session cleanup;
+- common physical keys, navigation keys, F1–F12, and left/right modifiers map
+  to Windows virtual keys without exposing Windows codes in the protocol;
+- duplicate key transitions are ignored and pressed keys are released during
+  focus and Session cleanup;
 - the React production frontend and Tauri backend build successfully.

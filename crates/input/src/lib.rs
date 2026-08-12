@@ -1,6 +1,6 @@
 //! Permissioned, platform-neutral remote input execution and pressed-state tracking.
 
-use remotex_protocol::{ButtonState, DisplayId, InputEvent, MouseButton};
+use remotex_protocol::{ButtonState, DisplayId, InputEvent, KeyCode, MouseButton};
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -91,6 +91,7 @@ pub trait InputController: Send {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InputState {
     pressed_mouse_buttons: HashSet<MouseButton>,
+    pressed_keys: HashSet<KeyCode>,
 }
 
 impl InputState {
@@ -102,6 +103,16 @@ impl InputState {
     #[must_use]
     pub fn pressed_mouse_button_count(&self) -> usize {
         self.pressed_mouse_buttons.len()
+    }
+
+    #[must_use]
+    pub fn is_key_pressed(&self, key: KeyCode) -> bool {
+        self.pressed_keys.contains(&key)
+    }
+
+    #[must_use]
+    pub fn pressed_key_count(&self) -> usize {
+        self.pressed_keys.len()
     }
 }
 
@@ -152,14 +163,52 @@ impl<B: InputBackend> PermissionedInputController<B> {
         Ok(())
     }
 
-    fn release_pressed_buttons(&mut self) -> Result<(), InputError> {
+    fn transition_key(&mut self, key: KeyCode, state: ButtonState) -> Result<(), InputError> {
+        let pressed = self.state.pressed_keys.contains(&key);
+        if (state == ButtonState::Down && pressed) || (state == ButtonState::Up && !pressed) {
+            return Ok(());
+        }
+        let event = match state {
+            ButtonState::Down => InputEvent::KeyDown { key },
+            ButtonState::Up => InputEvent::KeyUp { key },
+        };
+        self.backend.execute(&event)?;
+        match state {
+            ButtonState::Down => {
+                self.state.pressed_keys.insert(key);
+            }
+            ButtonState::Up => {
+                self.state.pressed_keys.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_pressed_inputs(&mut self) -> Result<(), InputError> {
         let mut first_error = None;
         for button in MOUSE_BUTTONS {
-            if !self.state.pressed_mouse_buttons.remove(&button) {
+            if !self.state.pressed_mouse_buttons.contains(&button) {
                 continue;
             }
-            if let Err(error) = self.backend.execute(&InputEvent::MouseButtonUp { button }) {
-                first_error.get_or_insert(error);
+            match self.backend.execute(&InputEvent::MouseButtonUp { button }) {
+                Ok(()) => {
+                    self.state.pressed_mouse_buttons.remove(&button);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let mut pressed_keys = self.state.pressed_keys.iter().copied().collect::<Vec<_>>();
+        pressed_keys.sort_unstable();
+        for key in pressed_keys {
+            match self.backend.execute(&InputEvent::KeyUp { key }) {
+                Ok(()) => {
+                    self.state.pressed_keys.remove(&key);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -179,18 +228,19 @@ impl<B: InputBackend> InputController for PermissionedInputController<B> {
             InputEvent::MouseMove { .. } | InputEvent::MouseWheel { .. } => {
                 self.backend.execute(&event)
             }
-            InputEvent::Key { .. } => Err(InputError::Unsupported),
+            InputEvent::KeyDown { key } => self.transition_key(key, ButtonState::Down),
+            InputEvent::KeyUp { key } => self.transition_key(key, ButtonState::Up),
         }
     }
 
     fn release_all(&mut self) -> Result<(), InputError> {
-        self.release_pressed_buttons()
+        self.release_pressed_inputs()
     }
 }
 
 impl<B: InputBackend> Drop for PermissionedInputController<B> {
     fn drop(&mut self) {
-        let _result = self.release_pressed_buttons();
+        let _result = self.release_pressed_inputs();
     }
 }
 
@@ -199,7 +249,7 @@ impl<B: InputBackend> Drop for PermissionedInputController<B> {
 mod windows;
 
 #[cfg(windows)]
-pub use windows::WindowsMouseBackend;
+pub use windows::WindowsInputBackend;
 
 #[cfg(test)]
 mod tests {
@@ -313,7 +363,54 @@ mod tests {
     }
 
     #[test]
-    fn dropping_controller_releases_pressed_buttons() {
+    fn key_state_ignores_duplicate_down_and_up_without_down() {
+        let mut controller = PermissionedInputController::new(RecordingBackend::default(), true);
+        controller
+            .apply(InputEvent::KeyUp { key: KeyCode::KeyA })
+            .expect("orphan key up");
+        controller
+            .apply(InputEvent::KeyDown { key: KeyCode::KeyA })
+            .expect("key down");
+        controller
+            .apply(InputEvent::KeyDown { key: KeyCode::KeyA })
+            .expect("duplicate key down");
+
+        assert!(controller.state().is_key_pressed(KeyCode::KeyA));
+        assert_eq!(controller.state().pressed_key_count(), 1);
+        assert_eq!(
+            controller.backend.events,
+            vec![InputEvent::KeyDown { key: KeyCode::KeyA }]
+        );
+    }
+
+    #[test]
+    fn release_all_releases_keys_and_modifiers() {
+        let mut controller = PermissionedInputController::new(RecordingBackend::default(), true);
+        for key in [KeyCode::ControlLeft, KeyCode::KeyC] {
+            controller
+                .apply(InputEvent::KeyDown { key })
+                .expect("key down");
+        }
+        controller.release_all().expect("release all");
+
+        assert_eq!(controller.state().pressed_key_count(), 0);
+        assert_eq!(
+            controller.backend.events,
+            vec![
+                InputEvent::KeyDown {
+                    key: KeyCode::ControlLeft
+                },
+                InputEvent::KeyDown { key: KeyCode::KeyC },
+                InputEvent::KeyUp { key: KeyCode::KeyC },
+                InputEvent::KeyUp {
+                    key: KeyCode::ControlLeft
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_controller_releases_pressed_inputs() {
         struct SharedRecordingBackend(Arc<Mutex<Vec<InputEvent>>>);
 
         impl InputBackend for SharedRecordingBackend {
@@ -335,6 +432,11 @@ mod tests {
                     button: MouseButton::Right,
                 })
                 .expect("button down");
+            controller
+                .apply(InputEvent::KeyDown {
+                    key: KeyCode::ShiftLeft,
+                })
+                .expect("key down");
         }
         assert_eq!(
             *events.lock().expect("event recording lock"),
@@ -342,9 +444,15 @@ mod tests {
                 InputEvent::MouseButtonDown {
                     button: MouseButton::Right
                 },
+                InputEvent::KeyDown {
+                    key: KeyCode::ShiftLeft
+                },
                 InputEvent::MouseButtonUp {
                     button: MouseButton::Right
-                }
+                },
+                InputEvent::KeyUp {
+                    key: KeyCode::ShiftLeft
+                },
             ]
         );
     }

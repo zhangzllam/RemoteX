@@ -1,4 +1,4 @@
-//! `RemoteX` M4 Tauri Controller for remote video and permissioned mouse input.
+//! `RemoteX` M5 Tauri Controller for remote video and permissioned mouse/keyboard input.
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -7,7 +7,7 @@ use quinn::{ClientConfig, Endpoint};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
-    DisplayId, InputEvent, Message, MessageEnvelope, MouseButton, RelayClientMessage,
+    DisplayId, InputEvent, KeyCode, Message, MessageEnvelope, MouseButton, RelayClientMessage,
     RelayServerMessage, Role, SessionId, SessionToken, VideoCodec, WheelAxis, decode_wire,
     encode_wire,
 };
@@ -146,6 +146,22 @@ impl MouseInputRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum KeyboardInputRequest {
+    KeyDown { key: KeyCode },
+    KeyUp { key: KeyCode },
+}
+
+impl From<KeyboardInputRequest> for InputEvent {
+    fn from(value: KeyboardInputRequest) -> Self {
+        match value {
+            KeyboardInputRequest::KeyDown { key } => Self::KeyDown { key },
+            KeyboardInputRequest::KeyUp { key } => Self::KeyUp { key },
+        }
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn connect_remote(
@@ -212,6 +228,24 @@ async fn send_mouse_input(
             .map_err(|_| "remote session input channel is closed".to_owned())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn send_keyboard_input(
+    control: State<'_, StreamControl>,
+    request: KeyboardInputRequest,
+) -> Result<(), String> {
+    let sender = control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.input.clone())
+        .ok_or_else(|| "remote session is not connected".to_owned())?;
+    sender
+        .send(request.into())
+        .await
+        .map_err(|_| "remote session input channel is closed".to_owned())
 }
 
 async fn receive_video(
@@ -459,7 +493,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             connect_remote,
             disconnect_remote,
-            send_mouse_input
+            send_mouse_input,
+            send_keyboard_input
         ])
         .run(tauri::generate_context!())
         .expect("run RemoteX desktop application");
@@ -515,6 +550,22 @@ mod tests {
                     delta: 120,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn keyboard_requests_preserve_physical_keys_and_state() {
+        assert_eq!(
+            InputEvent::from(KeyboardInputRequest::KeyDown {
+                key: KeyCode::ControlLeft,
+            }),
+            InputEvent::KeyDown {
+                key: KeyCode::ControlLeft,
+            }
+        );
+        assert_eq!(
+            InputEvent::from(KeyboardInputRequest::KeyUp { key: KeyCode::KeyV }),
+            InputEvent::KeyUp { key: KeyCode::KeyV }
         );
     }
 }

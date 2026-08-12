@@ -17,11 +17,12 @@ tests all pass.
 - **M4 — Remote mouse:** normalized movement, left/right/middle buttons, wheel,
   future display identifier, explicit local input permission, Windows
   `SendInput`, input-state cleanup, and encrypted relay integration tests.
+- **M5 — Remote keyboard:** platform-neutral common keys and modifiers, focused
+  Controller capture, Windows `SendInput`, ordered combinations, duplicate
+  suppression, and release on focus loss or Session cleanup.
 
 ## Next
 
-- **M5 — Remote keyboard:** platform-neutral keys and modifiers, Windows
-  injection, pressed-key tracking, and release on disconnect.
 - **M6 — Clipboard:** bounded bidirectional UTF-8 text with independent
   permission and revision-based loop prevention.
 - **M7 — Files:** safe rooted directory browsing plus chunked, resumable,

@@ -3,7 +3,7 @@ use rcgen::generate_simple_self_signed;
 use remotex_capture::{Frame, PixelFormat};
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 use remotex_protocol::{
-    ClientHello, InputEvent, Message, MessageEnvelope, MouseButton, RelayClientMessage,
+    ClientHello, InputEvent, KeyCode, Message, MessageEnvelope, MouseButton, RelayClientMessage,
     RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken,
     decode_wire, encode_wire,
 };
@@ -602,5 +602,49 @@ async fn encrypted_mouse_input_crosses_relay_as_opaque_payload() -> TestResult {
     let received: MessageEnvelope = decode_wire(&plaintext)?;
     received.validate()?;
     assert_eq!(received, envelope);
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn encrypted_keyboard_combination_crosses_relay_in_order() -> TestResult {
+    let harness = Harness::start(Harness::limits())?;
+    let session_id = SessionId::new();
+    let (mut controller, mut agent) = harness
+        .pair(
+            session_id,
+            SessionToken::from_bytes([24; 32]),
+            SessionToken::from_bytes([25; 32]),
+        )
+        .await?;
+    let cipher = XChaChaSessionCipher::new(
+        [26; 32],
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::ControllerToAgent,
+    );
+    let events = [
+        InputEvent::KeyDown {
+            key: KeyCode::ControlLeft,
+        },
+        InputEvent::KeyDown { key: KeyCode::KeyC },
+    ];
+
+    for (sequence, event) in (0_u64..).zip(events) {
+        let envelope = MessageEnvelope::new(session_id, sequence, 1_234, Message::Input(event));
+        let encoded = encode_wire(&envelope)?;
+        let encrypted = cipher.seal(sequence, &encoded)?;
+        let mut wire_payload = sequence.to_be_bytes().to_vec();
+        wire_payload.extend_from_slice(&encrypted);
+        controller
+            .send(&RelayClientMessage::Payload(wire_payload))
+            .await?;
+        let RelayServerMessage::Payload(relayed) = agent.receive_significant().await? else {
+            return Err("expected relayed keyboard payload".into());
+        };
+        let received_sequence = u64::from_be_bytes(relayed[..8].try_into()?);
+        assert_eq!(received_sequence, sequence);
+        let plaintext = cipher.open(received_sequence, &relayed[8..])?;
+        let received: MessageEnvelope = decode_wire(&plaintext)?;
+        assert_eq!(received, envelope);
+    }
     harness.stop().await
 }

@@ -1,4 +1,4 @@
-//! `RemoteX` M4 Windows remote-screen and permissioned mouse-input Agent.
+//! `RemoteX` M5 Windows remote-screen and permissioned mouse/keyboard-input Agent.
 
 #[cfg(windows)]
 use anyhow::Context;
@@ -12,7 +12,7 @@ use remotex_capture::{CaptureError, DxgiCapture, MonitorId, MonitorInfo, ScreenC
 use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
 #[cfg(windows)]
 use remotex_input::{
-    DisplayGeometry, InputController, InputError, PermissionedInputController, WindowsMouseBackend,
+    DisplayGeometry, InputController, InputError, PermissionedInputController, WindowsInputBackend,
 };
 #[cfg(windows)]
 use remotex_protocol::{
@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut capture = DxgiCapture::new();
     let monitor = start_capture(&mut capture)?;
-    let input_backend = WindowsMouseBackend::new(DisplayGeometry {
+    let input_backend = WindowsInputBackend::new(DisplayGeometry {
         id: DisplayId::new(monitor.id.0.clone())?,
         origin_x: monitor.origin_x,
         origin_y: monitor.origin_y,
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         event = "input_permission_configured",
         control_input = input_permission,
-        "local M4 input permission loaded"
+        "local M5 input permission loaded"
     );
 
     let client_endpoint = client_endpoint(Path::new(&certificate_path))?;
@@ -415,5 +415,5 @@ fn parse_switch(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("the M4 desktop agent currently supports Windows only");
+    eprintln!("the M5 desktop agent currently supports Windows only");
 }

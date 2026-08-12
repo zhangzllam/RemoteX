@@ -297,3 +297,16 @@ bounded and configurable.
 File chunks must never exceed the negotiated chunk size or 4 MiB. Strings and
 rejection reasons also need explicit encoded-length limits at the transport
 boundary.
+
+## Linux terminal and system messages
+
+M12 adds separate encrypted `Terminal` and `System` channels. A Controller may
+open, resize, write to, interrupt, and close a PTY only when the accepted Session
+contains the terminal permission. PTY IDs are random and Session-scoped. Input
+and output frames are bounded by `MAX_TERMINAL_DATA_SIZE`; sizes outside 2–1000
+rows or columns and more than four concurrent terminals are rejected.
+
+`SystemMessage::Request` returns one `SystemSnapshot` only when the independent
+system-information permission is granted. Disk and network lists and optional
+GPU discovery are bounded. The snapshot is informational and contains no
+command, process-control, or mutation operation.

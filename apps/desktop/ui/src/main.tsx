@@ -2,6 +2,7 @@ import {
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
+  type ReactNode,
   WheelEvent as ReactWheelEvent,
   useEffect,
   useRef,
@@ -34,6 +35,58 @@ type ConnectionStatus = {
   state: string;
   message: string;
 };
+
+type TerminalEvent =
+  | { kind: "output"; terminalId: string; data: string }
+  | { kind: "closed"; terminalId: string; exitCode: number | null }
+  | { kind: "error"; terminalId: string | null; message: string };
+
+type SystemSnapshot = {
+  hostname: string;
+  operatingSystem: string;
+  kernelVersion: string;
+  cpuModel: string;
+  cpuCount: number;
+  totalMemoryBytes: number;
+  usedMemoryBytes: number;
+  uptimeSeconds: number;
+  disks: { name: string; mountPoint: string; totalBytes: number; availableBytes: number }[];
+  networkInterfaces: { name: string; receivedBytes: number; transmittedBytes: number }[];
+  gpus: { name: string; utilizationPercent: number | null; memoryUsedBytes: number | null; memoryTotalBytes: number | null; temperatureCelsius: number | null }[];
+};
+
+const ANSI_COLORS: Record<number, string> = {
+  30: "#1b1f27", 31: "#ff6b6b", 32: "#78dba9", 33: "#ffd166",
+  34: "#6fa8ff", 35: "#d58cff", 36: "#67d9df", 37: "#e6edf7",
+  90: "#7d8798", 91: "#ff8e8e", 92: "#9bf0c3", 93: "#ffe29a",
+  94: "#94bdff", 95: "#e3b0ff", 96: "#91edf1", 97: "#ffffff",
+};
+
+function renderAnsi(text: string): ReactNode[] {
+  const output: ReactNode[] = [];
+  const pattern = /\u001b\[([0-9;?]*)([A-Za-z])/g;
+  let offset = 0;
+  let color: string | undefined;
+  let bold = false;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > offset) {
+      output.push(<span key={`${offset}-${match.index}`} style={{ color, fontWeight: bold ? 700 : undefined }}>{text.slice(offset, match.index)}</span>);
+    }
+    if (match[2] === "m") {
+      for (const value of (match[1] || "0").split(";").map(Number)) {
+        if (value === 0) { color = undefined; bold = false; }
+        else if (value === 1) bold = true;
+        else if (value === 22) bold = false;
+        else if (value === 39) color = undefined;
+        else if (ANSI_COLORS[value]) color = ANSI_COLORS[value];
+      }
+    }
+    offset = pattern.lastIndex;
+  }
+  if (offset < text.length) output.push(<span key={offset} style={{ color, fontWeight: bold ? 700 : undefined }}>{text.slice(offset)}</span>);
+  return output;
+}
 
 type ConnectRequest = {
   controlServerUrl: string;
@@ -231,6 +284,10 @@ function App() {
   const [downloadLocalPath, setDownloadLocalPath] = useState("");
   const [resumeTransferId, setResumeTransferId] = useState("");
   const [transfers, setTransfers] = useState<Record<string, TransferProgress>>({});
+  const [terminalId, setTerminalId] = useState("");
+  const [terminalOutput, setTerminalOutput] = useState("");
+  const [terminalInput, setTerminalInput] = useState("");
+  const [systemInfo, setSystemInfo] = useState<SystemSnapshot | null>(null);
   const screenRef = useRef<HTMLDivElement>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement>(null);
   const pressedButtons = useRef(new Set<RemoteMouseButton>());
@@ -277,10 +334,26 @@ function App() {
         }
       }
     });
+    const unlistenTerminal = listen<TerminalEvent>("terminal-event", (event) => {
+      const update = event.payload;
+      if (update.kind === "output") {
+        setTerminalOutput((current) => (current + update.data).slice(-1_000_000));
+      } else if (update.kind === "closed") {
+        setTerminalOutput((current) => `${current}\n[terminal closed: ${update.exitCode ?? "signal"}]\n`);
+        setTerminalId("");
+      } else {
+        setTerminalOutput((current) => `${current}\n[error: ${update.message}]\n`);
+      }
+    });
+    const unlistenSystem = listen<SystemSnapshot>("system-info", (event) => {
+      setSystemInfo(event.payload);
+    });
     return () => {
       void unlistenFrame.then((unlisten) => unlisten());
       void unlistenStatus.then((unlisten) => unlisten());
       void unlistenFiles.then((unlisten) => unlisten());
+      void unlistenTerminal.then((unlisten) => unlisten());
+      void unlistenSystem.then((unlisten) => unlisten());
       if (moveAnimationFrame.current !== null) {
         cancelAnimationFrame(moveAnimationFrame.current);
       }
@@ -314,6 +387,19 @@ function App() {
     event.preventDefault();
     setFrame(null);
     await invoke("connect_remote", { request });
+  }
+
+  async function startTerminal() {
+    const id = await invoke<string>("open_terminal");
+    setTerminalId(id);
+    setTerminalOutput("");
+  }
+
+  async function submitTerminal(event: FormEvent) {
+    event.preventDefault();
+    if (!terminalId || !terminalInput) return;
+    await invoke("send_terminal_input", { terminalId, data: `${terminalInput}\n` });
+    setTerminalInput("");
   }
 
   async function listFiles(path: string) {
@@ -737,6 +823,39 @@ function App() {
               </div>;
             })}
           </div>
+        </section>
+
+        <section className="server-panel">
+          <div className="files-header">
+            <div><p className="eyebrow">LINUX SERVER</p><h2>Terminal</h2></div>
+            <div className="inline-actions">
+              <button type="button" disabled={status.state !== "connected" || Boolean(terminalId)} onClick={() => void startTerminal()}>Open terminal</button>
+              <button type="button" className="secondary" disabled={!terminalId} onClick={() => void invoke("resize_terminal", { terminalId, columns: 160, rows: 40 })}>Resize 160×40</button>
+              <button type="button" className="secondary" disabled={!terminalId} onClick={() => {
+                void invoke("close_terminal", { terminalId });
+                setTerminalId("");
+              }}>Close</button>
+            </div>
+          </div>
+          <pre className="terminal" aria-live="polite">{terminalOutput ? renderAnsi(terminalOutput) : "Connect to an authorized Linux Agent, then open a PTY."}</pre>
+          <form className="terminal-input" onSubmit={submitTerminal}>
+            <input value={terminalInput} onChange={(event) => setTerminalInput(event.target.value)} disabled={!terminalId} placeholder="Command or UTF-8 terminal input" />
+            <button type="submit" disabled={!terminalId || !terminalInput}>Send</button>
+            <button type="button" className="secondary" disabled={!terminalId} onClick={() => void invoke("send_terminal_input", { terminalId, data: "\u0003" })}>Ctrl+C</button>
+          </form>
+
+          <div className="files-header system-header">
+            <div><p className="eyebrow">SYSTEM</p><h2>{systemInfo?.hostname ?? "System information"}</h2></div>
+            <button type="button" className="secondary" disabled={status.state !== "connected"} onClick={() => void invoke("request_system_info")}>Refresh</button>
+          </div>
+          {systemInfo && <div className="system-grid">
+            <div><span>OS</span><strong>{systemInfo.operatingSystem}</strong><small>{systemInfo.kernelVersion}</small></div>
+            <div><span>CPU</span><strong>{systemInfo.cpuModel}</strong><small>{systemInfo.cpuCount} logical CPUs</small></div>
+            <div><span>Memory</span><strong>{formatBytes(systemInfo.usedMemoryBytes)} / {formatBytes(systemInfo.totalMemoryBytes)}</strong><small>Uptime {Math.floor(systemInfo.uptimeSeconds / 3600)}h</small></div>
+            <div><span>Storage</span><strong>{systemInfo.disks.length} mounts</strong><small>{systemInfo.disks.map((disk) => disk.mountPoint).join(", ") || "None"}</small></div>
+            <div><span>Network</span><strong>{systemInfo.networkInterfaces.length} interfaces</strong><small>{systemInfo.networkInterfaces.map((network) => network.name).join(", ") || "None"}</small></div>
+            <div><span>GPU</span><strong>{systemInfo.gpus.map((gpu) => gpu.name).join(", ") || "Optional / not detected"}</strong><small>NVIDIA metrics use nvidia-smi when available</small></div>
+          </div>}
         </section>
         </div>
       </section>

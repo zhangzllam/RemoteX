@@ -60,6 +60,15 @@ tbody tr:hover { background: rgba(87,140,255,.08); }
 .transfer strong { color: #dce8ff; text-transform: capitalize; }
 .transfer progress { width: 100%; accent-color: #578cff; }
 .transfer button { padding: 7px 10px; }
+.server-panel { padding: 18px; border: 1px solid #202c43; border-radius: 16px; background: rgba(15, 22, 35, 0.9); box-shadow: 0 18px 60px rgba(0,0,0,.25); }
+.terminal { min-height: 320px; max-height: 520px; overflow: auto; padding: 14px; border: 1px solid #202c43; border-radius: 10px; color: #cfe5d7; background: #030704; font: 13px/1.5 "Cascadia Mono", "Liberation Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+.terminal-input { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.terminal-input input { margin: 0; }
+.system-header { margin-top: 26px; }
+.system-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.system-grid > div { display: grid; gap: 5px; min-width: 0; padding: 12px; border: 1px solid #202c43; border-radius: 10px; background: #0b111e; }
+.system-grid span, .system-grid small { color: #8392ad; font-size: 11px; }
+.system-grid strong { overflow: hidden; color: #e2ecff; font-size: 13px; text-overflow: ellipsis; }
 
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: 260px minmax(0, 1fr); }

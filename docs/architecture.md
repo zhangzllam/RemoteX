@@ -229,6 +229,21 @@ bound to fresh nonces and the Session ID. Direct and Relay paths expose the same
 bounded `Connection` interface, so video, input, clipboard, and files cannot
 bypass their existing permission or encryption boundaries.
 
+## M12 Linux server Agent
+
+The Linux Agent shares the M8–M11 enrollment, authorization, E2EE, Relay, and
+direct-transport path. It deliberately exposes server-oriented capabilities
+instead of a Linux desktop: bounded PTYs, the existing M7 rooted file service,
+and a bounded read-only system snapshot. Terminal and system-information grants
+are explicit fields in the Agent-enforced Session permissions.
+
+Each authorized PTY is owned by the Session and runs as the unprivileged Agent
+OS account. A bounded reader queue prevents a fast process from accumulating
+unlimited output. Explicit close and Session teardown kill PTY children. Default
+foreground mode shows an accept/reject prompt and active-session banner; systemd
+operation is possible only after an administrator installs the provided unit,
+and unattended authorization remains separately opt-in.
+
 ## M10 video pipeline
 
 After the E2EE path is ready, the Controller advertises H.264, JPEG, and WebP.

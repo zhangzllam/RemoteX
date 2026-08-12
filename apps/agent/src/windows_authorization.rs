@@ -76,6 +76,8 @@ mod tests {
             clipboard: true,
             file_upload: false,
             file_download: true,
+            terminal: false,
+            system_info: false,
         });
         assert!(summary.contains("[x] View screen"));
         assert!(summary.contains("[ ] Keyboard and mouse"));

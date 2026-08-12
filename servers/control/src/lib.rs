@@ -1271,6 +1271,8 @@ mod tests {
             clipboard: true,
             file_upload: true,
             file_download: true,
+            terminal: true,
+            system_info: true,
         }
     }
 
@@ -1589,6 +1591,8 @@ mod tests {
             clipboard: true,
             file_upload: false,
             file_download: false,
+            terminal: false,
+            system_info: true,
         };
         let action = format!("authorize_session:{}", controller.session_id);
         let response = service

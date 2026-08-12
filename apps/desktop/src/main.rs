@@ -14,9 +14,10 @@ use remotex_protocol::{
     ClipboardOrigin, ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind,
     ControlMessage, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame, FileEntry,
     FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
-    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, MouseButton, RelayClientMessage,
-    RelayServerMessage, Role, SessionCredentials, SessionId, SessionPermissions, SessionToken,
-    TransferId, VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
+    MAX_FILE_CHUNK_SIZE, MAX_TERMINAL_DATA_SIZE, Message, MessageEnvelope, MouseButton,
+    RelayClientMessage, RelayServerMessage, Role, SessionCredentials, SessionId,
+    SessionPermissions, SessionToken, SystemMessage, TerminalId, TerminalMessage, TransferId,
+    VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{
     Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection,
@@ -51,6 +52,7 @@ struct ActiveStream {
     cancellation: oneshot::Sender<()>,
     input: mpsc::Sender<InputEvent>,
     files: mpsc::Sender<ControllerFileCommand>,
+    server: mpsc::Sender<ControllerServerCommand>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -106,6 +108,12 @@ enum ControllerFileCommand {
     Cancel {
         transfer_id: TransferId,
     },
+}
+
+#[derive(Debug)]
+enum ControllerServerCommand {
+    Terminal(TerminalMessage),
+    SystemInfo,
 }
 
 #[derive(Debug)]
@@ -188,6 +196,27 @@ struct VideoFrameEvent {
     key_frame: bool,
     mime_type: &'static str,
     data: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum TerminalEvent {
+    Output {
+        terminal_id: String,
+        data: String,
+    },
+    Closed {
+        terminal_id: String,
+        exit_code: Option<u32>,
+    },
+    Error {
+        terminal_id: Option<String>,
+        message: String,
+    },
 }
 
 #[derive(Default)]
@@ -323,10 +352,12 @@ fn connect_remote(
     let (cancel_sender, cancel_receiver) = oneshot::channel();
     let (input_sender, input_receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
     let (file_sender, file_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
+    let (terminal_sender, terminal_receiver) = mpsc::channel(32);
     *active = Some(ActiveStream {
         cancellation: cancel_sender,
         input: input_sender,
         files: file_sender,
+        server: terminal_sender,
     });
     drop(active);
 
@@ -338,6 +369,7 @@ fn connect_remote(
             cancel_receiver,
             input_receiver,
             file_receiver,
+            terminal_receiver,
         )
         .await;
         match result {
@@ -518,6 +550,94 @@ async fn cancel_file_transfer(
         .map_err(|_| "remote file service is closed".to_owned())
 }
 
+fn active_terminal_sender(
+    control: &State<'_, StreamControl>,
+) -> Result<mpsc::Sender<ControllerServerCommand>, String> {
+    control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.server.clone())
+        .ok_or_else(|| "remote Session is not connected".to_owned())
+}
+
+#[tauri::command]
+async fn open_terminal(control: State<'_, StreamControl>) -> Result<String, String> {
+    let terminal_id = TerminalId::new();
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Open {
+            terminal_id,
+            columns: 120,
+            rows: 32,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())?;
+    Ok(terminal_id.to_string())
+}
+
+#[tauri::command]
+async fn send_terminal_input(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+    data: String,
+) -> Result<(), String> {
+    if data.is_empty() || data.len() > MAX_TERMINAL_DATA_SIZE {
+        return Err("terminal input is empty or too large".to_owned());
+    }
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Input {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+            data: data.into_bytes(),
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resize_terminal(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+    columns: u16,
+    rows: u16,
+) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Resize {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+            columns,
+            rows,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn close_terminal(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Close {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn request_system_info(control: State<'_, StreamControl>) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::SystemInfo)
+        .await
+        .map_err(|_| "system information channel is closed".to_owned())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_remote_session(
     app: AppHandle,
@@ -525,6 +645,7 @@ async fn run_remote_session(
     mut cancellation: oneshot::Receiver<()>,
     mut input_receiver: mpsc::Receiver<InputEvent>,
     file_commands: mpsc::Receiver<ControllerFileCommand>,
+    mut terminal_receiver: mpsc::Receiver<ControllerServerCommand>,
 ) -> anyhow::Result<()> {
     if !request.control_server_url.trim().is_empty() {
         emit_status(
@@ -691,6 +812,20 @@ async fn run_remote_session(
                     Message::Input(event),
                 ).await?;
             }
+            command = terminal_receiver.recv() => {
+                let Some(command) = command else { break; };
+                let message = match command {
+                    ControllerServerCommand::Terminal(message) => Message::Terminal(message),
+                    ControllerServerCommand::SystemInfo => Message::System(SystemMessage::Request),
+                };
+                send_controller_message(
+                    transport.as_mut(),
+                    session_id,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    message,
+                ).await?;
+            }
             _ = clipboard_interval.tick(), if clipboard.is_enabled() => {
                 match clipboard.poll() {
                     Ok(Some(message)) => send_controller_message(
@@ -733,6 +868,8 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
         clipboard: request.clipboard_enabled,
         file_upload: request.file_upload_enabled,
         file_download: request.file_download_enabled,
+        terminal: true,
+        system_info: true,
     };
     if request.control_server_url.trim().is_empty() {
         return Ok(ResolvedSession {
@@ -874,12 +1011,56 @@ fn handle_agent_payload(
             Err(error) => return Err(error.into()),
         },
         Message::FileTransfer(message) => outcome.file_message = Some(message),
+        Message::Terminal(message) => emit_terminal_event(app, message)?,
+        Message::System(SystemMessage::Snapshot(snapshot)) => {
+            app.emit("system-info", snapshot)?;
+        }
+        Message::System(SystemMessage::Error { message }) => {
+            app.emit(
+                "terminal-event",
+                TerminalEvent::Error {
+                    terminal_id: None,
+                    message,
+                },
+            )?;
+        }
         _ => anyhow::bail!("Agent sent a message not allowed in its data direction"),
     }
     *expected_sequence = expected_sequence
         .checked_add(1)
         .context("Agent inbound sequence space exhausted")?;
     Ok(outcome)
+}
+
+fn emit_terminal_event(app: &AppHandle, message: TerminalMessage) -> anyhow::Result<()> {
+    let event = match message {
+        TerminalMessage::Output { terminal_id, data } => TerminalEvent::Output {
+            terminal_id: terminal_id.to_string(),
+            data: String::from_utf8_lossy(&data).into_owned(),
+        },
+        TerminalMessage::Closed {
+            terminal_id,
+            exit_code,
+        } => TerminalEvent::Closed {
+            terminal_id: terminal_id.to_string(),
+            exit_code,
+        },
+        TerminalMessage::Error {
+            terminal_id,
+            message,
+        } => TerminalEvent::Error {
+            terminal_id: terminal_id.map(|id| id.to_string()),
+            message,
+        },
+        TerminalMessage::Open { .. }
+        | TerminalMessage::Input { .. }
+        | TerminalMessage::Resize { .. }
+        | TerminalMessage::Close { .. } => {
+            anyhow::bail!("Agent sent a Controller-only terminal message")
+        }
+    };
+    app.emit("terminal-event", event)?;
+    Ok(())
 }
 
 fn emit_video_frame(
@@ -1480,7 +1661,12 @@ fn main() {
             download_remote_file,
             resume_file_upload,
             resume_file_download,
-            cancel_file_transfer
+            cancel_file_transfer,
+            open_terminal,
+            send_terminal_input,
+            resize_terminal,
+            close_terminal,
+            request_system_info
         ])
         .run(tauri::generate_context!())
         .expect("run RemoteX desktop application");

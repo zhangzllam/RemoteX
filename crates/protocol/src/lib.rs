@@ -12,6 +12,7 @@ pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 1024 * 1024;
 pub const MAX_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub const MAX_FILE_PATH_SIZE: usize = 4 * 1024;
 pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+pub const MAX_TERMINAL_DATA_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -173,6 +174,37 @@ impl FromStr for TransferId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TerminalId(Uuid);
+
+impl TerminalId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TerminalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TerminalId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for TerminalId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
 /// Opaque 256-bit bearer credential presented exactly once to the relay.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -200,6 +232,8 @@ pub enum Channel {
     FileTransfer = 4,
     Audio = 5,
     Telemetry = 6,
+    Terminal = 7,
+    System = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -314,6 +348,10 @@ pub struct SessionPermissions {
     pub clipboard: bool,
     pub file_upload: bool,
     pub file_download: bool,
+    #[serde(default)]
+    pub terminal: bool,
+    #[serde(default)]
+    pub system_info: bool,
 }
 
 impl SessionPermissions {
@@ -325,6 +363,8 @@ impl SessionPermissions {
             clipboard: self.clipboard && available.clipboard,
             file_upload: self.file_upload && available.file_upload,
             file_download: self.file_download && available.file_download,
+            terminal: self.terminal && available.terminal,
+            system_info: self.system_info && available.system_info,
         }
     }
 
@@ -335,6 +375,8 @@ impl SessionPermissions {
             && (!self.clipboard || available.clipboard)
             && (!self.file_upload || available.file_upload)
             && (!self.file_download || available.file_download)
+            && (!self.terminal || available.terminal)
+            && (!self.system_info || available.system_info)
     }
 }
 
@@ -810,12 +852,97 @@ pub enum FileTransferMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TerminalMessage {
+    Open {
+        terminal_id: TerminalId,
+        columns: u16,
+        rows: u16,
+    },
+    Input {
+        terminal_id: TerminalId,
+        data: Vec<u8>,
+    },
+    Resize {
+        terminal_id: TerminalId,
+        columns: u16,
+        rows: u16,
+    },
+    Output {
+        terminal_id: TerminalId,
+        data: Vec<u8>,
+    },
+    Close {
+        terminal_id: TerminalId,
+    },
+    Closed {
+        terminal_id: TerminalId,
+        exit_code: Option<u32>,
+    },
+    Error {
+        terminal_id: Option<TerminalId>,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SystemMessage {
+    Request,
+    Snapshot(SystemSnapshot),
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemSnapshot {
+    pub hostname: String,
+    pub operating_system: String,
+    pub kernel_version: String,
+    pub cpu_model: String,
+    pub cpu_count: u32,
+    pub total_memory_bytes: u64,
+    pub used_memory_bytes: u64,
+    pub uptime_seconds: u64,
+    pub disks: Vec<SystemDisk>,
+    pub network_interfaces: Vec<SystemNetworkInterface>,
+    pub gpus: Vec<SystemGpu>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemDisk {
+    pub name: String,
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemNetworkInterface {
+    pub name: String,
+    pub received_bytes: u64,
+    pub transmitted_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemGpu {
+    pub name: String,
+    pub utilization_percent: Option<u8>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
+    pub temperature_celsius: Option<i16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     Control(ControlMessage),
     Video(EncodedVideoFrame),
     Input(InputEvent),
     Clipboard(ClipboardMessage),
     FileTransfer(FileTransferMessage),
+    Terminal(TerminalMessage),
+    System(SystemMessage),
 }
 
 impl Message {
@@ -827,6 +954,8 @@ impl Message {
             Self::Input(_) => Channel::Input,
             Self::Clipboard(_) => Channel::Clipboard,
             Self::FileTransfer(_) => Channel::FileTransfer,
+            Self::Terminal(_) => Channel::Terminal,
+            Self::System(_) => Channel::System,
         }
     }
 }

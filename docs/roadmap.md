@@ -30,18 +30,17 @@ tests all pass.
 - **M9 — Authorization:** foreground local accept/reject, Agent-enforced
   per-capability grants, secret-gated opt-in unattended access, visible active
   state with local disconnect, and signed lifecycle audit records.
+- **M10 — Adaptive video:** negotiated OpenH264 software encoding, JPEG
+  fallback, persistent decoding, bounded quality adaptation, and telemetry.
+- **M11 — Direct connectivity:** validated candidates, mutually authenticated
+  direct QUIC, bounded upgrade attempts, telemetry, and Relay fallback.
+- **M12 — Linux server Agent:** authorized bounded PTY terminals, M7 Files
+  reuse, read-only system information, visible operation, and opt-in systemd.
 
 ## Next
 
-M10 is complete: negotiated OpenH264 software encoding, JPEG fallback,
-persistent decoding, bounded adaptive quality, frame telemetry, and a Controller
-debug overlay are implemented. M11 is also complete: validated LAN/public
-candidates, mutually authenticated direct QUIC, bounded upgrade attempts, audit
-telemetry, and automatic Relay fallback are implemented. The remaining
-milestones start at M12.
+The remaining milestones start at M13.
 
-- **M12 — Linux server Agent:** authorized PTY terminal, M7 Files reuse, system
-  information, and documented visible service operation.
 - **M13 — Self-hosting:** Docker images, Compose stack, PostgreSQL isolation,
   reverse-proxy TLS, health checks, and deployment documentation.
 - **M14 — Windows usability:** Tauri installer, Agent packaging, opt-in startup,

@@ -903,6 +903,8 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         clipboard: parse_switch("REMOTEX_ALLOW_CLIPBOARD", false)?,
         file_upload: parse_switch("REMOTEX_ALLOW_FILE_UPLOAD", false)?,
         file_download: parse_switch("REMOTEX_ALLOW_FILE_DOWNLOAD", false)?,
+        terminal: false,
+        system_info: false,
     };
     let file_roots = parse_file_roots(std::env::var("REMOTEX_FILE_ROOTS").ok().as_deref())?;
     if (local_permissions.file_upload || local_permissions.file_download) && file_roots.is_empty() {
@@ -1777,6 +1779,8 @@ mod tests {
             clipboard: true,
             file_upload: true,
             file_download: true,
+            terminal: false,
+            system_info: false,
         };
         let local = SessionPermissions {
             view_desktop: true,
@@ -1784,6 +1788,8 @@ mod tests {
             clipboard: true,
             file_upload: false,
             file_download: true,
+            terminal: false,
+            system_info: false,
         };
         assert_eq!(
             requested.intersect(local),
@@ -1793,6 +1799,8 @@ mod tests {
                 clipboard: true,
                 file_upload: false,
                 file_download: true,
+                terminal: false,
+                system_info: false,
             }
         );
     }

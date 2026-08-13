@@ -25,8 +25,10 @@ jobs:
           set -euo pipefail
           test -n "$RELEASE_SIGNING_PUBLIC_KEY"
           printf '%s' "$RELEASE_SIGNING_PUBLIC_KEY" | gpg --batch --import
-          test "$(git cat-file -t "${GITHUB_REF_NAME}")" = tag
-          git verify-tag "${GITHUB_REF_NAME}"
+          tag_ref="refs/tags/${GITHUB_REF_NAME}"
+          git fetch --force origin "${tag_ref}:${tag_ref}"
+          test "$(git cat-file -t "${tag_ref}")" = tag
+          git verify-tag "${tag_ref}"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install pnpm

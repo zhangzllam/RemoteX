@@ -3599,7 +3599,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remotex-agent"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3627,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-capture"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "image",
  "thiserror 2.0.20",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-clipboard"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "remotex-protocol",
  "thiserror 2.0.20",
@@ -3645,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-control"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-crypto"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-desktop"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-file-transfer"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "remotex-protocol",
  "sha2",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-input"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "remotex-protocol",
  "thiserror 2.0.20",
@@ -3732,7 +3732,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-linux-agent"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3757,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bincode",
  "serde",
@@ -3767,7 +3767,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-relay"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-transport"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "remotex-video"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "image",
  "openh264",

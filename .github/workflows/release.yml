@@ -106,7 +106,10 @@ jobs:
       - name: Verify optional Authenticode signature
         if: env.REMOTEX_WINDOWS_CERTIFICATE_THUMBPRINT != ''
         shell: powershell
-        run: Get-AuthenticodeSignature target/release/bundle/nsis/RemoteX_*_x64-setup.exe | Where-Object Status -ne Valid | ForEach-Object { throw "Invalid Authenticode signature: $($_.StatusMessage)" }
+        run: |
+          Get-AuthenticodeSignature target/release/bundle/nsis/RemoteX_*_x64-setup.exe |
+            Where-Object Status -ne Valid |
+            ForEach-Object { throw "Invalid Authenticode signature: $($_.StatusMessage)" }
       - name: Upload Windows assets
         uses: actions/upload-artifact@v4
         with:

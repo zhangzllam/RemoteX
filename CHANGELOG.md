@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1 — 2026-08-13
+
+- Fixed the GitHub Actions release workflow YAML so signed release tags can
+  build and publish verified artifacts.
+
 ## 1.2.0 — 2026-08-13
 
 ### Performance and polish

@@ -47,17 +47,11 @@ Controller tokens, Session keys, and unattended secrets are never written to
 browser local storage. The Agent identity stays per-user and its private key is
 not sent to the Control Server.
 
-## Secure update preparation
+## Signed application updates
 
-M14 does not activate an updater endpoint because no production signing identity
-has been provided. `packaging/windows/tauri.updater.conf.example.json` documents
-the official Tauri updater shape. Before enabling it:
-
-1. generate and protect a Tauri updater signing key outside the repository;
-2. embed only its public key in the release configuration;
-3. use the official updater plugin and signed artifacts;
-4. publish an HTTPS manifest and test upgrade/rollback behavior;
-5. keep `TAURI_SIGNING_PRIVATE_KEY` and its password only in protected CI secrets.
-
-Tauri requires updater signatures and does not permit disabling verification.
-RemoteX does not implement a custom download-and-execute updater.
+RemoteX 1.2 and newer use Tauri's signed updater. The release workflow creates
+the signed NSIS artifact and a static `latest.json` manifest in each GitHub
+Release. Update checks and downloads can happen in the background; installation
+is always explicit and is blocked while an inbound or outbound remote session
+is active. See the [signed update guide](signed-updates.md) for key custody,
+local builds, and release verification.

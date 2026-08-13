@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! `RemoteX` M7 Windows Agent with remote screen, input, clipboard, and files.
 
 #[cfg(windows)]

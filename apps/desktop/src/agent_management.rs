@@ -119,6 +119,11 @@ pub struct AgentRuntimeStatus {
     pub start_with_windows: bool,
 }
 
+pub(super) struct LegacyServerConfig {
+    pub server_url: String,
+    pub ca_certificate_path: String,
+}
+
 #[derive(Default)]
 pub struct AgentRuntime {
     child: Mutex<Option<CommandChild>>,
@@ -305,12 +310,24 @@ fn agent_environment(
     stored: &StoredAgentSettings,
 ) -> Result<HashMap<String, String>, String> {
     let settings = &stored.public;
+    let unified = crate::server_config::read_server_config(app)?;
+    let server_url = unified
+        .as_ref()
+        .filter(|config| config.configured)
+        .map_or_else(
+            || settings.server_url.clone(),
+            |config| config.control_server_url.clone(),
+        );
+    let ca_certificate_path = unified
+        .as_ref()
+        .filter(|config| config.configured)
+        .map_or_else(
+            || settings.ca_certificate_path.clone(),
+            |config| config.ca_certificate_path.clone(),
+        );
     let data_directory = data_directory(app)?;
     let mut environment = HashMap::from([
-        (
-            "REMOTEX_CONTROL_URL".to_owned(),
-            settings.server_url.clone(),
-        ),
+        ("REMOTEX_CONTROL_URL".to_owned(), server_url),
         (
             "REMOTEX_IDENTITY_PATH".to_owned(),
             data_directory.join("identity.json").display().to_string(),
@@ -319,10 +336,7 @@ fn agent_environment(
             "REMOTEX_STATUS_PATH".to_owned(),
             status_path(app)?.display().to_string(),
         ),
-        (
-            "REMOTEX_RELAY_CA_CERT".to_owned(),
-            settings.ca_certificate_path.clone(),
-        ),
+        ("REMOTEX_RELAY_CA_CERT".to_owned(), ca_certificate_path),
         (
             "REMOTEX_DEVICE_NAME".to_owned(),
             settings.device_name.clone(),
@@ -360,6 +374,30 @@ fn agent_environment(
         );
     }
     Ok(environment)
+}
+
+pub(super) fn legacy_server_config(app: &AppHandle) -> Result<LegacyServerConfig, String> {
+    let stored = read_settings(app)?;
+    Ok(LegacyServerConfig {
+        server_url: stored.public.server_url,
+        ca_certificate_path: stored.public.ca_certificate_path,
+    })
+}
+
+pub(super) fn sync_server_fields(
+    app: &AppHandle,
+    config: &crate::server_config::ServerConfig,
+) -> Result<(), String> {
+    let mut stored = read_settings(app)?;
+    stored
+        .public
+        .server_url
+        .clone_from(&config.control_server_url);
+    stored
+        .public
+        .ca_certificate_path
+        .clone_from(&config.ca_certificate_path);
+    write_settings(app, &stored)
 }
 
 fn validate_settings(settings: &AgentSettings, existing_secret: bool) -> Result<(), String> {

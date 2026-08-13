@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 — 2026-08-13
+
+### Performance and polish
+
+- Unified incoming and outgoing server configuration with conservative v1.1
+  migration and an explicit conflict choice.
+- Added resumable first-run server verification and a settings entry for
+  running setup again, without requiring device registration during setup.
+- Controller-only use no longer presents local-device registration as a
+  prerequisite; incoming Remote Access remains an explicit optional setting.
+- Replaced the default RGBA base64 event path with a Tauri binary Channel,
+  latest-frame scheduling, and received/rendered/dropped diagnostics.
+- Split typed API, setup, video, diagnostics, tokens, layout, components, and
+  session concerns out of the former single frontend module and CSS cascade.
+- Added categorized connection feedback and an Apple-inspired graphite desktop
+  hierarchy while retaining Windows behavior and explicit permission controls.
+- Added an immediately applied, persisted interface-language setting for
+  English and Simplified Chinese, with system-language detection on first use.
+- Added signed-tag validation, version/artifact gates, optional Authenticode
+  signing, performance guidance, and v1.2 release checks.
+
 ## 1.0.0 — 2026-08-12
 
 First complete V1 release.

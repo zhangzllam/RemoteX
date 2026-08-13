@@ -309,7 +309,36 @@ and Agent process creation. The visible tray remains the local control surface
 when the main window is hidden: it reports online/active state and Device ID and
 can disconnect, disable access, reopen Settings, or quit. The NSIS package is a
 current-user installation and contains both binaries; no service, administrator
-privilege, hidden startup entry, or custom updater is introduced.
+privilege or hidden startup entry is introduced. v1.2 adds Tauri's signed
+updater plugin; installation is deferred while a remote session is active.
+
+## v1.2 desktop configuration and video IPC
+
+The desktop owns one persisted `server-config.json` for the HTTPS Control URL,
+Relay fallback endpoint/server name, and Relay CA certificate path. Both local
+device registration and outgoing sessions consume it. On first v1.2 launch the
+desktop inspects the old local-device JSON and the old WebView controller
+settings. A single custom value is migrated; matching values are merged; two
+different custom values are returned to the setup UI for an explicit choice.
+Placeholder defaults are not treated as user configuration.
+
+The first-run UI verifies `/ready` and saves the server configuration. It does
+not name or register the computer, enable remote access, start the packaged
+component, or wait for a Device ID. Existing configured users skip the flow;
+remote access remains an explicit setting. No private identity or unattended
+secret crosses into the WebView.
+
+Decoded video uses a Tauri binary Channel by default:
+
+```text
+persistent decoder -> 68-byte metadata header + RGBA bytes -> Tauri Channel
+                   -> one latest-frame slot -> requestAnimationFrame -> canvas
+```
+
+The base64 event path exists only when no Channel subscriber is registered.
+The WebView never queues more than one pending frame and the root React
+component does not receive per-frame state updates. Local diagnostics count
+received, rendered, and replaced frames without recording content.
 
 ## Error handling and observability
 

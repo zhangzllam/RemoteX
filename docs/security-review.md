@@ -31,6 +31,10 @@ This is an internal engineering review, not a third-party penetration test.
 - Deployment secrets are mounted from ignored, read-only files. Logs were
   scanned for token/key/secret values; only metadata-safe identifiers, state,
   and outcomes are emitted.
+- The v1.2 unified server file contains endpoints and a CA certificate path,
+  but no device private key, unattended secret, Session credential, or updater
+  private key. Legacy configuration migration never copies secret fields into
+  the WebView.
 
 ## Parser and resource limits
 
@@ -79,3 +83,8 @@ known production frontend vulnerabilities.
   elevation policy, and multiple physical host/network combinations depend on
   the operator environment and must be validated with the release checklist.
 - OpenH264 is software encoding. Performance and power use vary by machine.
+- The video diagnostics overlay contains only counters, dimensions, codec, and
+  latency. Frame bytes stay transient and are neither logged nor persisted.
+- In-app updates require the configured updater signature. Authenticode is a
+  separate optional publisher signature; release jobs require a signed tag and
+  exact source/artifact version agreement before publication.

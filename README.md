@@ -1,11 +1,11 @@
 # RemoteX
 
 RemoteX is a self-hosted remote-control system for visibly and explicitly
-accessing your own Windows PCs and Linux servers. Version 1.0 includes a Windows
-Tauri controller/Agent application, a headless Linux Agent, an HTTPS Control
-Server, and an end-to-end encrypted QUIC Relay.
+accessing your own Windows PCs and Linux servers. The project includes a Windows
+desktop application, a headless Linux component, an HTTPS Control Server, and
+an end-to-end encrypted QUIC Relay.
 
-## V1 capabilities
+## Capabilities
 
 - Windows desktop capture with cursor composition, monitor selection, adaptive
   H.264/JPEG video, mouse, keyboard, clipboard, and resumable file transfer.
@@ -28,10 +28,18 @@ Download the Windows NSIS installer or Linux Agent archive from the latest
 installer is current-user scoped. Windows may show an unknown-publisher warning
 until a trusted code-signing certificate is configured.
 
+Current RemoteX builds can check and download cryptographically signed updates in
+the background from **Settings > General**, then install them from **About**.
+Installing waits until active remote sessions have ended. Users on 1.1 or older
+must install 1.2 manually once because those builds do not contain the updater.
+
 For a production deployment, follow [Running M13](docs/running-m13.md). For the
 Windows packaged application, follow [Running M14](docs/running-m14.md). Linux
 Agent environment variables and systemd setup are covered in
-[Running M12](docs/running-m12.md).
+[Running M12](docs/running-m12.md). Maintainers should also read the
+[signed update guide](docs/signed-updates.md). Release maintainers should also
+read [signed tags](docs/signed-tags.md), [Windows signing](docs/windows-signing.md),
+and the [v1.2 release checklist](docs/v1.2-release-checklist.md).
 
 ## Development
 
@@ -44,6 +52,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 pnpm --dir apps/desktop/ui install --frozen-lockfile
 pnpm --dir apps/desktop/ui build
+pnpm --dir apps/desktop/ui benchmark:video
 cargo audit
 pnpm --dir apps/desktop/ui audit --prod
 ```
@@ -66,9 +75,9 @@ system information, and unattended access stay independently permissioned. File
 paths are confined to named roots and completed uploads are committed only after
 SHA-256 verification. RemoteX does not invent cryptographic primitives.
 
-## V1 boundaries
+## Current boundaries
 
-V1 does not include mobile or macOS clients, audio, camera/printing, account
+RemoteX does not include mobile or macOS clients, audio, camera/printing, account
 management, or a complete ICE/STUN/TURN NAT traversal stack. Self-hosters remain
 responsible for host patching, TLS keys, backups, network policy, and public-edge
 rate limiting.

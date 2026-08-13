@@ -1,0 +1,23 @@
+/* Window, navigation, and page-level composition. */
+body {
+  margin: 0;
+  min-width: 900px;
+  min-height: 600px;
+  background: var(--canvas);
+}
+
+.app-shell { background: radial-gradient(circle at 82% 0, var(--hero-glow), transparent 30%), radial-gradient(circle at 42% 100%, var(--ambient-purple), transparent 28%), var(--canvas); }
+.sidebar { background: linear-gradient(180deg, color-mix(in srgb, var(--sidebar) 96%, var(--accent)), var(--sidebar)); }
+.topbar { background: transparent; }
+.page-content { padding: 0 var(--space-8) var(--space-8); background: radial-gradient(circle at 94% 4%, var(--hero-glow), transparent 27%); }
+.panel {
+  border-color: var(--separator);
+  background: var(--surface);
+  box-shadow: var(--card-shadow);
+}
+.settings-layout { grid-template-columns: 220px minmax(0, 1fr); }
+
+@media (max-width: 1050px) {
+  .page-content { padding-inline: var(--space-5); }
+  .settings-layout { grid-template-columns: 190px minmax(0, 1fr); }
+}

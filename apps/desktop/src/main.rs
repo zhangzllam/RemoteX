@@ -1,6 +1,12 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! `RemoteX` Tauri Controller and visible Windows Agent host.
 
 mod agent_management;
+mod server_config;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -38,6 +44,7 @@ use std::{
 };
 use tauri::{
     AppHandle, Emitter, Manager, State,
+    ipc::Channel as IpcChannel,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
@@ -52,6 +59,11 @@ const FILE_RESPONSE_QUEUE_CAPACITY: usize = 2;
 #[derive(Default)]
 struct StreamControl {
     active: std::sync::Mutex<Option<ActiveStream>>,
+}
+
+#[derive(Default)]
+struct VideoIpc {
+    channel: std::sync::Mutex<Option<IpcChannel<Vec<u8>>>>,
 }
 
 struct ActiveStream {
@@ -202,6 +214,19 @@ struct VideoFrameEvent {
     key_frame: bool,
     mime_type: &'static str,
     data: String,
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn subscribe_video(
+    channel: IpcChannel<Vec<u8>>,
+    video_ipc: State<'_, VideoIpc>,
+) -> Result<(), String> {
+    *video_ipc
+        .channel
+        .lock()
+        .map_err(|_| "video IPC lock is unavailable".to_owned())? = Some(channel);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -368,7 +393,11 @@ fn connect_remote(
     drop(active);
 
     tauri::async_runtime::spawn(async move {
-        emit_status(&app, "connecting", "Connecting to relay");
+        if request.control_server_url.trim().is_empty() {
+            emit_status(&app, "connecting", "Establishing a secure connection");
+        } else {
+            emit_status(&app, "contacting", "Contacting your RemoteX server");
+        }
         let result = run_remote_session(
             app.clone(),
             request,
@@ -380,7 +409,10 @@ fn connect_remote(
         .await;
         match result {
             Ok(()) => emit_status(&app, "disconnected", "Remote session ended"),
-            Err(error) => emit_status(&app, "error", &error.to_string()),
+            Err(error) => {
+                warn!(event = "remote_session_failed", %error);
+                emit_status(&app, "error", friendly_connection_error(&error));
+            }
         }
     });
     Ok(())
@@ -661,6 +693,7 @@ async fn run_remote_session(
         );
     }
     let resolved = resolve_session(&request).await?;
+    emit_status(&app, "connecting", "Establishing an encrypted path");
     let relay_address: SocketAddr = resolved
         .relay_address
         .parse()
@@ -702,7 +735,7 @@ async fn run_remote_session(
             emit_status(
                 &app,
                 "connecting",
-                "Relay ready · trying authenticated direct path",
+                "Secure path ready · trying a faster direct connection",
             );
             match connect_direct_candidates(
                 &endpoint,
@@ -730,9 +763,9 @@ async fn run_remote_session(
         &app,
         "connected",
         match connection_type {
-            ConnectionType::Lan => "Remote peer ready · Connection: LAN",
-            ConnectionType::Direct => "Remote peer ready · Connection: Direct",
-            ConnectionType::Relay => "Remote peer ready · Connection: Relay",
+            ConnectionType::Lan => "Connected securely over the local network",
+            ConnectionType::Direct => "Connected securely over a direct path",
+            ConnectionType::Relay => "Connected securely through your server",
         },
     );
 
@@ -1076,6 +1109,7 @@ fn emit_video_frame(
     decoder: &mut StreamDecoder,
 ) -> anyhow::Result<VideoFeedback> {
     let decoded_frame = decoder.decode_frame(frame)?;
+    let decode_latency_ms = decoded_frame.decode_latency_ms;
     let frame_budget_ms = 1_000 / frame.frames_per_second.max(1);
     let queue_percent = decoded_frame
         .decode_latency_ms
@@ -1089,33 +1123,71 @@ fn emit_video_frame(
         VideoCodec::WebP => "WebP",
     };
     let end_to_end_latency_ms = now_ms()?.saturating_sub(frame.source_timestamp_ms);
-    app.emit(
-        "video-frame",
-        VideoFrameEvent {
-            sequence,
-            frame_id: frame.frame_id,
-            width: frame.width,
-            height: frame.height,
-            frames_per_second: frame.frames_per_second,
-            bitrate_bps: frame.bitrate_bps,
-            source_timestamp_ms: frame.source_timestamp_ms,
-            capture_latency_ms: frame.capture_latency_ms,
-            encode_latency_ms: frame.encode_latency_ms,
-            decode_latency_ms: decoded_frame.decode_latency_ms,
-            end_to_end_latency_ms,
-            codec,
-            key_frame: frame.key_frame,
-            mime_type: "application/x-remotex-rgba",
-            data: STANDARD.encode(decoded_frame.rgba),
-        },
-    )?;
+    let mut event = VideoFrameEvent {
+        sequence,
+        frame_id: frame.frame_id,
+        width: frame.width,
+        height: frame.height,
+        frames_per_second: frame.frames_per_second,
+        bitrate_bps: frame.bitrate_bps,
+        source_timestamp_ms: frame.source_timestamp_ms,
+        capture_latency_ms: frame.capture_latency_ms,
+        encode_latency_ms: frame.encode_latency_ms,
+        decode_latency_ms,
+        end_to_end_latency_ms,
+        codec,
+        key_frame: frame.key_frame,
+        mime_type: "application/x-remotex-rgba",
+        data: String::new(),
+    };
+    let channel = app
+        .state::<VideoIpc>()
+        .channel
+        .lock()
+        .map_err(|_| anyhow::anyhow!("video IPC lock is unavailable"))?
+        .clone();
+    if let Some(channel) = channel {
+        let packet = encode_video_packet(&event, &decoded_frame.rgba);
+        channel.send(packet)?;
+    } else {
+        event.data = STANDARD.encode(decoded_frame.rgba);
+        app.emit("video-frame", event)?;
+    }
     Ok(VideoFeedback {
         rtt_ms: 0,
         packet_loss_per_mille: 0,
         send_queue_percent: queue_percent,
-        decoder_latency_ms: decoded_frame.decode_latency_ms,
+        decoder_latency_ms: decode_latency_ms,
         render_latency_ms: 0,
     })
+}
+
+fn encode_video_packet(event: &VideoFrameEvent, rgba: &[u8]) -> Vec<u8> {
+    const HEADER_SIZE: usize = 68;
+    let mut packet = Vec::with_capacity(HEADER_SIZE + rgba.len());
+    packet.extend_from_slice(b"RXVF");
+    packet.push(1);
+    packet.push(match event.codec {
+        "H.264" => 1,
+        "JPEG" => 2,
+        _ => 3,
+    });
+    packet.push(u8::from(event.key_frame));
+    packet.push(0);
+    packet.extend_from_slice(&event.sequence.to_le_bytes());
+    packet.extend_from_slice(&event.frame_id.to_le_bytes());
+    packet.extend_from_slice(&event.source_timestamp_ms.to_le_bytes());
+    packet.extend_from_slice(&event.end_to_end_latency_ms.to_le_bytes());
+    packet.extend_from_slice(&event.width.to_le_bytes());
+    packet.extend_from_slice(&event.height.to_le_bytes());
+    packet.extend_from_slice(&event.frames_per_second.to_le_bytes());
+    packet.extend_from_slice(&event.bitrate_bps.to_le_bytes());
+    packet.extend_from_slice(&event.capture_latency_ms.to_le_bytes());
+    packet.extend_from_slice(&event.encode_latency_ms.to_le_bytes());
+    packet.extend_from_slice(&event.decode_latency_ms.to_le_bytes());
+    debug_assert_eq!(packet.len(), HEADER_SIZE);
+    packet.extend_from_slice(rgba);
+    packet
 }
 
 impl ControllerFileService {
@@ -1575,7 +1647,8 @@ async fn wait_for_peer(app: &AppHandle, transport: &mut QuicFrameConnection) -> 
         let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
         match message {
             RelayServerMessage::WaitingForPeer { role } => {
-                emit_status(app, "connecting", &format!("Waiting for {role:?}"));
+                let _ = role;
+                emit_status(app, "connecting", "Waiting for the remote device");
             }
             RelayServerMessage::PeerReady => return Ok(()),
             RelayServerMessage::Heartbeat { nonce } => {
@@ -1653,6 +1726,37 @@ fn emit_status(app: &AppHandle, state: &'static str, message: &str) {
     );
 }
 
+fn friendly_connection_error(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("certificate")
+        || message.contains("tls")
+        || message.contains("unknown issuer")
+    {
+        "The server certificate could not be verified. Check Network settings and the CA certificate."
+    } else if message.contains("timed out")
+        || message.contains("connect")
+        || message.contains("dns")
+    {
+        "The server could not be reached. Check your network and try again."
+    } else if message.contains("reject")
+        || message.contains("authoriz")
+        || message.contains("approval")
+    {
+        "The remote device did not approve this request. Ask someone there to try again."
+    } else if message.contains("device")
+        && (message.contains("offline") || message.contains("not found"))
+    {
+        "That device is unavailable. Check its ID and make sure RemoteX is open there."
+    } else if message.contains("relay")
+        || message.contains("peer")
+        || message.contains("session closed")
+    {
+        "The secure connection was interrupted. Try again or check the server's Relay settings."
+    } else {
+        "RemoteX could not complete the secure connection. Try again or open Diagnostics for details."
+    }
+}
+
 struct TrayUi {
     agent_status: MenuItem<tauri::Wry>,
     device_id: MenuItem<tauri::Wry>,
@@ -1678,13 +1782,7 @@ fn disconnect_from_tray(app: &AppHandle) {
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let agent_status =
         MenuItem::with_id(app, "agent_status", "Status: Offline", false, None::<&str>)?;
-    let device_id = MenuItem::with_id(
-        app,
-        "device_id",
-        "Device ID: Not registered",
-        false,
-        None::<&str>,
-    )?;
+    let device_id = MenuItem::with_id(app, "device_id", "Device ID: —", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open RemoteX", true, None::<&str>)?;
     let disable = MenuItem::with_id(
         app,
@@ -1759,7 +1857,7 @@ fn monitor_agent_status(app: AppHandle) {
                 let _result = tray.agent_status.set_text(label);
                 let _result = tray.device_id.set_text(format!(
                     "Device ID: {}",
-                    status.device_id.as_deref().unwrap_or("Not registered")
+                    status.device_id.as_deref().unwrap_or("—")
                 ));
             }
         }
@@ -1770,12 +1868,15 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .arg("--background")
                 .build(),
         )
         .manage(StreamControl::default())
+        .manage(VideoIpc::default())
         .manage(agent_management::AgentRuntime::default())
         .setup(|app| {
             setup_tray(app)?;
@@ -1813,11 +1914,16 @@ fn main() {
             resize_terminal,
             close_terminal,
             request_system_info,
+            subscribe_video,
             agent_management::load_agent_settings,
             agent_management::save_agent_settings,
             agent_management::start_agent,
             agent_management::stop_agent,
-            agent_management::agent_status
+            agent_management::agent_status,
+            server_config::load_server_config,
+            server_config::save_server_config,
+            server_config::check_server_connection,
+            server_config::reset_first_run
         ])
         .run(tauri::generate_context!())
         .expect("run RemoteX desktop application");

@@ -29,8 +29,11 @@ jobs:
           git fetch --force origin "${tag_ref}:${tag_ref}"
           test "$(git cat-file -t "${tag_ref}")" = tag
           git verify-tag "${tag_ref}"
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -66,8 +69,11 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -129,8 +135,11 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
       - name: Build Linux Agent
         run: cargo build --locked --release -p remotex-linux-agent
       - name: Package Linux Agent

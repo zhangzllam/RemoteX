@@ -522,6 +522,10 @@ async fn handle_relay(
                 .await?;
             Ok(Vec::new())
         }
+        RelayServerMessage::PathControl(_) => {
+            // This Agent advertises no direct candidates and remains on Relay.
+            Ok(Vec::new())
+        }
         RelayServerMessage::HeartbeatAck { .. }
         | RelayServerMessage::WaitingForPeer { .. }
         | RelayServerMessage::PeerReady => Ok(Vec::new()),
@@ -1033,6 +1037,9 @@ async fn wait_for_peer(transport: &mut QuicFrameConnection) -> anyhow::Result<()
                         &RelayClientMessage::HeartbeatAck { nonce },
                     )?))
                     .await?;
+            }
+            RelayServerMessage::PathControl(_) => {
+                anyhow::bail!("Relay delivered path control before PeerReady");
             }
             RelayServerMessage::HeartbeatAck { .. } => {}
             RelayServerMessage::SessionClosed { reason } => {

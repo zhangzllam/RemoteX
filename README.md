@@ -8,7 +8,7 @@ an end-to-end encrypted QUIC Relay.
 ## 在其他电脑上下载安装
 
 打开 [最新版下载页](https://github.com/zhangzllam/RemoteX/releases/latest)，
-在 **Assets** 中下载 `RemoteX_1.3.1_x64-setup.exe`，适用于 Windows x64。
+在 **Assets** 中下载 `RemoteX_1.3.2_x64-setup.exe`，适用于 Windows x64。
 无需下载 Source code，也无需复制开发项目。
 
 两台电脑都安装 RemoteX。在被控电脑开启「允许远程访问」，等待设备 ID
@@ -16,7 +16,7 @@ an end-to-end encrypted QUIC Relay.
 需要远程操作键鼠时，在被控电脑的「设置 → 权限」开启键盘和鼠标权限。
 可在安全设置中改为每次手动确认。升级前请从托盘退出旧版 RemoteX。
 
-v1.3.1 已包含本项目的默认服务器配置。完整跨网络会话仍需按
+v1.3.2 已包含本项目的默认服务器配置。完整跨网络会话仍需按
 [测试矩阵](docs/v1.3-network-test-matrix.md) 实测，服务器就绪不代表所有网络
 场景都已通过验收。
 

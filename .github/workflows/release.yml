@@ -60,7 +60,6 @@ jobs:
 
   windows:
     name: Windows installer
-    needs: validation
     runs-on: windows-latest
     env:
       WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
@@ -130,7 +129,6 @@ jobs:
 
   linux:
     name: Linux Agent
-    needs: validation
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
@@ -140,6 +138,8 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
+      - name: Test Linux Agent
+        run: cargo test --locked -p remotex-linux-agent
       - name: Build Linux Agent
         run: cargo build --locked --release -p remotex-linux-agent
       - name: Package Linux Agent
@@ -160,7 +160,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [windows, linux]
+    needs: [validation, windows, linux]
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets

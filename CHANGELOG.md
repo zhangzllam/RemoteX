@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.2 – 2026-09-10
+
+- Handle path-control messages in the relay-only Linux Agent and run native Linux tests during releases. Includes 1.3.0 UI, password and icon improvements.
+
 ## 1.3.1 – 2026-09-10
 
 - Pin release Rust to the locally validated 1.97.1 toolchain. Includes all 1.3.0 changes; the 1.3.0 CI run did not publish binaries.

@@ -5,7 +5,7 @@ use std::{fmt, str::FromStr};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_FILE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 pub const MAX_RELAY_HANDSHAKE_SIZE: usize = 4 * 1024;
 pub const MAX_CLIPBOARD_TEXT_SIZE: usize = 1024 * 1024;
@@ -251,6 +251,8 @@ pub struct ClientHello {
     pub session_id: SessionId,
     pub role: Role,
     pub token: SessionToken,
+    #[serde(default)]
+    pub credential_kind: RelayCredentialKind,
 }
 
 impl ClientHello {
@@ -261,8 +263,28 @@ impl ClientHello {
             session_id,
             role,
             token,
+            credential_kind: RelayCredentialKind::Initial,
         }
     }
+
+    #[must_use]
+    pub const fn recovery(session_id: SessionId, role: Role, token: SessionToken) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            session_id,
+            role,
+            token,
+            credential_kind: RelayCredentialKind::Recovery,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayCredentialKind {
+    #[default]
+    Initial,
+    Recovery,
 }
 
 /// Compatibility name retained for the M3 composition roots.
@@ -275,7 +297,28 @@ pub enum RelayClientMessage {
     Payload(Vec<u8>),
     Heartbeat { nonce: u64 },
     HeartbeatAck { nonce: u64 },
+    PathControl(PathControlMessage),
     Close,
+}
+
+/// Ordered transport-only barrier for activating an already authenticated
+/// direct QUIC stream without overtaking Relay application payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PathControlMessage {
+    SwitchRequest {
+        nonce: u64,
+    },
+    SwitchAck {
+        nonce: u64,
+    },
+    SwitchCommit {
+        nonce: u64,
+    },
+    /// Agent-to-controller barrier proving that all earlier Agent Relay
+    /// payloads arrived before both peers activate the Direct stream.
+    SwitchCommitted {
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -317,6 +360,7 @@ pub enum RelayServerMessage {
     HeartbeatAck {
         nonce: u64,
     },
+    PathControl(PathControlMessage),
     SessionClosed {
         reason: SessionCloseReason,
     },
@@ -458,6 +502,8 @@ pub struct SessionCredentials {
     pub relay_server_name: String,
     pub role_token_hex: String,
     pub end_to_end_key_hex: String,
+    pub recovery_token_hex: String,
+    pub recovery_expires_at_ms: u64,
     pub expires_at_ms: u64,
     pub permissions: SessionPermissions,
     #[serde(default)]
@@ -469,8 +515,10 @@ pub const MAX_CONNECTIVITY_CANDIDATES: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectivityCandidateKind {
-    Lan,
+    #[serde(alias = "lan")]
+    Host,
     ServerReflexive,
+    ConfiguredPublic,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -479,9 +527,63 @@ pub struct ConnectivityCandidate {
     pub address: String,
     pub server_name: String,
     pub priority: u16,
+    /// Local wall-clock time when this candidate was gathered. A zero value is
+    /// accepted for v1.2 persisted Host/ConfiguredPublic candidate migration.
+    #[serde(default)]
+    pub gathered_at_ms: u64,
+    /// Short-lived discovered mappings must carry an expiry. Static Host and
+    /// operator-configured candidates may omit it.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
 }
 
 impl ConnectivityCandidate {
+    #[must_use]
+    pub fn host(address: impl Into<String>, server_name: impl Into<String>, priority: u16) -> Self {
+        Self {
+            kind: ConnectivityCandidateKind::Host,
+            address: address.into(),
+            server_name: server_name.into(),
+            priority,
+            gathered_at_ms: 0,
+            expires_at_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn configured_public(
+        address: impl Into<String>,
+        server_name: impl Into<String>,
+        priority: u16,
+    ) -> Self {
+        Self {
+            kind: ConnectivityCandidateKind::ConfiguredPublic,
+            address: address.into(),
+            server_name: server_name.into(),
+            priority,
+            gathered_at_ms: 0,
+            expires_at_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn server_reflexive(
+        address: impl Into<String>,
+        server_name: impl Into<String>,
+        priority: u16,
+        gathered_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            kind: ConnectivityCandidateKind::ServerReflexive,
+            address: address.into(),
+            server_name: server_name.into(),
+            priority,
+            gathered_at_ms,
+            expires_at_ms: Some(expires_at_ms),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.address
             .parse::<std::net::SocketAddr>()
@@ -492,8 +594,52 @@ impl ConnectivityCandidate {
         {
             return Err(ProtocolError::InvalidConnectivityCandidate);
         }
+        if self.kind == ConnectivityCandidateKind::ServerReflexive
+            && (self.gathered_at_ms == 0 || self.expires_at_ms.is_none())
+        {
+            return Err(ProtocolError::InvalidConnectivityCandidate);
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= self.gathered_at_ms)
+        {
+            return Err(ProtocolError::InvalidConnectivityCandidate);
+        }
         Ok(())
     }
+
+    #[must_use]
+    pub fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+    }
+
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.is_expired_at(now_ms) {
+            return Err(ProtocolError::ExpiredConnectivityCandidate);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricProvenance {
+    Measured,
+    Estimated,
+}
+
+/// A diagnostic value never uses a numeric sentinel for missing data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum DiagnosticValue<T> {
+    Available {
+        value: T,
+        provenance: MetricProvenance,
+    },
+    #[default]
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -749,11 +895,12 @@ pub struct EncodedVideoFrame {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VideoFeedback {
-    pub rtt_ms: u32,
-    pub packet_loss_per_mille: u16,
-    pub send_queue_percent: u8,
-    pub decoder_latency_ms: u32,
-    pub render_latency_ms: u32,
+    pub rtt_ms: DiagnosticValue<u32>,
+    pub packet_loss_per_mille: DiagnosticValue<u16>,
+    pub send_queue_percent: DiagnosticValue<u8>,
+    pub decoder_latency_ms: DiagnosticValue<u32>,
+    pub render_latency_ms: DiagnosticValue<u32>,
+    pub dropped_frames_per_mille: DiagnosticValue<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1012,6 +1159,8 @@ pub enum ProtocolError {
     InvalidDisplayId,
     #[error("connectivity candidate contains an invalid address or TLS server name")]
     InvalidConnectivityCandidate,
+    #[error("connectivity candidate has expired")]
+    ExpiredConnectivityCandidate,
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u16),
     #[error("message type does not match envelope channel")]
@@ -1076,6 +1225,46 @@ mod tests {
         envelope.version = PROTOCOL_VERSION;
         envelope.channel = Channel::Input;
         assert_eq!(envelope.validate(), Err(ProtocolError::ChannelMismatch));
+    }
+
+    #[test]
+    fn candidate_validation_requires_fresh_discovered_mapping() {
+        let host = ConnectivityCandidate::host("192.168.1.20:7444", "direct.example.test", 200);
+        assert_eq!(host.validate_at(10_000), Ok(()));
+
+        let discovered = ConnectivityCandidate::server_reflexive(
+            "203.0.113.7:41000",
+            "direct.example.test",
+            150,
+            10_000,
+            70_000,
+        );
+        assert_eq!(discovered.validate_at(69_999), Ok(()));
+        assert_eq!(
+            discovered.validate_at(70_000),
+            Err(ProtocolError::ExpiredConnectivityCandidate)
+        );
+
+        let mut missing_expiry = discovered;
+        missing_expiry.expires_at_ms = None;
+        assert_eq!(
+            missing_expiry.validate(),
+            Err(ProtocolError::InvalidConnectivityCandidate)
+        );
+    }
+
+    #[test]
+    fn legacy_lan_json_candidate_kind_migrates_to_host() {
+        let kind: ConnectivityCandidateKind =
+            serde_json::from_str("\"lan\"").expect("legacy candidate kind");
+        assert_eq!(kind, ConnectivityCandidateKind::Host);
+    }
+
+    #[test]
+    fn unavailable_diagnostic_has_no_numeric_sentinel() {
+        let value = DiagnosticValue::<u32>::Unavailable;
+        let json = serde_json::to_string(&value).expect("serialize diagnostic");
+        assert_eq!(json, r#"{"availability":"unavailable"}"#);
     }
 
     #[test]

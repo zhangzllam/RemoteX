@@ -83,7 +83,8 @@ impl MockPeer {
                 }
                 RelayServerMessage::HeartbeatAck { .. }
                 | RelayServerMessage::WaitingForPeer { .. }
-                | RelayServerMessage::PeerReady => {}
+                | RelayServerMessage::PeerReady
+                | RelayServerMessage::PathControl(_) => {}
                 RelayServerMessage::SessionClosed { reason } => {
                     anyhow::bail!("relay session closed: {reason:?}");
                 }
@@ -118,6 +119,9 @@ impl MockPeer {
                         .await?;
                 }
                 RelayServerMessage::HeartbeatAck { .. } => {}
+                RelayServerMessage::PathControl(_) => {
+                    anyhow::bail!("relay delivered path control before PeerReady");
+                }
                 RelayServerMessage::SessionClosed { reason } => {
                     anyhow::bail!("relay session closed before pairing: {reason:?}");
                 }

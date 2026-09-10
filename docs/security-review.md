@@ -1,6 +1,6 @@
 # RemoteX V1 security and resource review
 
-Review date: 2026-08-12. Scope: the V1 workspace, Windows and Linux Agents,
+Review date: 2026-08-13. Scope: the V1 workspace through v1.3, Windows and Linux Agents,
 desktop controller, Control Server, Relay, packaging, and deployment assets.
 This is an internal engineering review, not a third-party penetration test.
 
@@ -88,3 +88,39 @@ known production frontend vulnerabilities.
 - In-app updates require the configured updater signature. Authenticode is a
   separate optional publisher signature; release jobs require a signed tag and
   exact source/artifact version agreement before publication.
+
+## v1.3 connectivity and recovery threat review
+
+- **Candidate injection/replay:** candidates remain inside signed Agent presence
+  and the authorized Session response. Numeric address validation, a bounded set,
+  gather/expiry timestamps, deterministic priority, and endpoint deduplication
+  reject malformed, stale, or repeated data. A candidate never grants authority.
+- **Public endpoint spoofing/NAT traversal abuse:** a standards-compliant STUN
+  Binding response supplies only an observed UDP address on the persistent QUIC
+  socket. It receives no E2EE payload and cannot approve a Session. The Direct
+  handshake still binds Session ID, role, fresh client/server nonces, and session
+  key. There is no unrestricted UDP forwarding service.
+- **Direct replay/wrong role:** HMAC proof verification and replay tests retain
+  the original role/session/nonce binding. STUN knowledge is insufficient to
+  complete a Direct handshake.
+- **Recovery credential replay:** recovery uses distinct random role hashes,
+  expiry, accepted authorization status, and Session ID. Initial one-time tokens
+  remain consumed. End, rejection, expiry, and revocation make recovery invalid;
+  it cannot widen permissions or bypass interactive authorization.
+- **Path downgrade/switch race:** Relay remains E2EE rather than a lower-security
+  mode. Four ordered path-control messages form the activation barrier. The live
+  direction-separated cipher and monotonically increasing envelope sequences
+  survive the switch, so no nonce is reused. A missing ordered envelope is a
+  terminal error rather than silently skipping clipboard/input/file data.
+- **Reconnect races:** bounded attempts are cancelled by explicit Disconnect and
+  constrained by recovery expiry. Relay registry removal checks connection IDs,
+  preventing an obsolete peer task from deleting a newer recovery connection.
+- **Metrics leakage:** endpoint addresses are absent from normal Relay connection
+  logs and aggregate labels. Locally displayed path/RTT/video details are not
+  uploaded. Relay counters contain no payload content, key, token, proof, or IP.
+
+The Relay still cannot decrypt application payloads; the Control Server still
+does not receive remote desktop content; and STUN sees neither authorization
+secrets nor RemoteX session content. Remaining limitations are documented: this
+is ICE-lite-like traversal, not full ICE/TURN, and exact sequence enforcement can
+turn an ambiguous in-flight loss into a clear reconnect failure.

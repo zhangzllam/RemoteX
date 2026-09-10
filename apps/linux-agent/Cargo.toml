@@ -14,6 +14,7 @@ portable-pty.workspace = true
 quinn.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+remotex-control-client.workspace = true
 remotex-crypto.workspace = true
 remotex-file-transfer.workspace = true
 remotex-protocol.workspace = true

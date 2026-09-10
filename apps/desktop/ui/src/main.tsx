@@ -16,8 +16,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AppUpdatePanel, AppUpdaterSettings, useAppUpdater } from "./app-updater";
 import { useAppearance, type AppearancePreference } from "./appearance";
 import { DiagnosticsOverlay } from "./diagnostics-overlay";
+import { ConnectionQualityIndicator } from "./connection-quality";
 import { friendlyError, friendlyFailure } from "./friendly-errors";
 import { HomePage, type HomeRecentDevice } from "./home-page";
+import { AccessPassword } from "./access-password";
 import { I18nProvider, useI18n, type AppLanguage } from "./i18n";
 import { remoteXApi } from "./remote-api";
 import { RemoteVideoRenderer } from "./remote-video-renderer";
@@ -33,6 +35,8 @@ import "./session.css";
 type ConnectionStatus = {
   state: string;
   message: string;
+  path?: "direct" | "relay";
+  transport?: "quic";
 };
 
 type TerminalEvent =
@@ -290,7 +294,7 @@ const defaultAgentSettings: AgentSettings = {
   unattendedSecret: "",
   secretConfigured: false,
   startWithWindows: false,
-  videoQuality: "balanced",
+  videoQuality: "auto",
 };
 
 function loadControllerSettings(): ConnectRequest {
@@ -356,6 +360,8 @@ function App() {
   const [page, setPage] = useState<Page>("home");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [recentDevices, setRecentDevices] = useState<RecentDevice[]>(loadRecentDevices);
+  const [deviceQuery, setDeviceQuery] = useState("");
+  const [forgottenDevice, setForgottenDevice] = useState<RecentDevice | null>(null);
   const [copied, setCopied] = useState(false);
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [uiError, setUiError] = useState("");
@@ -552,7 +558,11 @@ function App() {
       await invoke("save_agent_settings", { settings: next });
       const loaded = await invoke<AgentSettings>("load_agent_settings");
       setAgentSettings(loaded); setAgentMessage(message); return loaded;
-    } catch (error) { setUiError(friendlyError(error)); throw error; }
+    } catch (error) {
+      setUiError(friendlyError(error));
+      try { setAgentSettings(await remoteXApi.loadAgentSettings()); } catch { /* preserve the original error */ }
+      throw error;
+    }
     finally { setSaving(false); }
   }
 
@@ -585,9 +595,15 @@ function App() {
   async function toggleRemoteAccess(enabled: boolean) {
     const previous = agentSettings;
     try {
+      if (enabled) {
+        setSaving(true); setAgentMessage("Verifying the secure server…"); setUiError("");
+        const check = await remoteXApi.checkControlServerConnection(serverConfig);
+        if (!check.ok) throw new Error(check.message);
+      }
       const saved = await persistAgent({ ...agentSettings, remoteAccessEnabled: enabled }, enabled ? "Remote access enabled." : "Remote access disabled.");
       setAgentRuntime(await invoke<AgentRuntimeStatus>(enabled ? "start_agent" : "stop_agent")); setAgentSettings(saved);
-    } catch { setAgentSettings(previous); void invoke<AgentSettings>("load_agent_settings").then(setAgentSettings).catch(() => undefined); }
+    } catch (error) { setUiError(friendlyError(error)); setAgentSettings(previous); void invoke<AgentSettings>("load_agent_settings").then(setAgentSettings).catch(() => undefined); }
+    finally { setSaving(false); }
   }
 
   async function chooseCertificate(target: "agent" | "controller") {
@@ -859,6 +875,16 @@ function App() {
   const folders = parseFolders(agentSettings.fileRoots);
   const remoteEnabled = agentSettings.remoteAccessEnabled;
   const agentReady = Boolean(agentRuntime?.running && agentRuntime.deviceId);
+  const accessPasswordPanel = <AccessPassword
+    configured={agentSettings.secretConfigured}
+    enabled={agentSettings.unattendedAccess}
+    busy={saving}
+    activeSession={Boolean(agentRuntime?.sessionId)}
+    onChanged={async () => {
+      setAgentSettings(await remoteXApi.loadAgentSettings());
+      setAgentRuntime(await remoteXApi.agentStatus());
+    }}
+  />;
   const topTitle = page === "session" ? "Active Session" : NAV_ITEMS.find((item) => item.page === page)?.label ?? "RemoteX";
   const duration = `${String(Math.floor(sessionSeconds / 60)).padStart(2, "0")}:${String(sessionSeconds % 60).padStart(2, "0")}`;
 
@@ -897,6 +923,8 @@ function App() {
           {page === "home" && <HomePage
             deviceId={request.deviceId}
             accessPassword={request.unattendedSecret}
+            accessPasswordPanel={accessPasswordPanel}
+            passwordAccessEnabled={agentSettings.unattendedAccess}
             recentDevices={recentDevices}
             localDeviceName={agentSettings.deviceName}
             localDeviceId={agentRuntime?.deviceId ?? null}
@@ -923,11 +951,11 @@ function App() {
           {page === "devices" && <div className="standard-page devices-page">
             <section className="panel local-device-panel"><span className="local-device-label"><Icon name="monitor" size={14} />This Device</span><span className="device-avatar"><Icon name="monitor" size={25} /></span><div className="grow"><strong>{agentSettings.deviceName || "This Windows PC"}</strong><small>{agentReady ? "Online and ready for secure access" : remoteEnabled ? "Remote access is starting" : "Remote access is disabled"}</small></div><StatusPill tone={agentReady ? "success" : remoteEnabled ? "warning" : "neutral"}>{agentReady ? "Ready" : remoteEnabled ? "Starting" : "Offline"}</StatusPill><div className="local-device-meta"><span><small>Device ID</small><strong>{agentRuntime?.deviceId ? formatDeviceId(agentRuntime.deviceId) : "Available after Remote Access starts"}</strong></span><button type="button" className="secondary-button" onClick={() => { setPage("settings"); setSettingsSection("remote"); }}><Icon name="settings" size={15} />Device settings</button></div><span className="device-hero-art" aria-hidden="true"><Icon name="monitor" size={88} /></span></section>
             {isConnected && <section className="active-session-panel"><i className="live-dot" /><div><strong>Active session · {formatDeviceId(request.deviceId)}</strong><small>Connected for {duration}</small></div><button type="button" className="danger-quiet" onClick={() => void disconnect()}><Icon name="disconnect" size={15} />Disconnect</button></section>}
-            <section className="panel recent-devices-panel"><div className="section-heading"><div><h3>Recent devices</h3><p>Created from successful connections on this PC.</p></div><Icon name="refresh" size={17} /></div>{recentDevices.length ? <div className="device-list">{recentDevices.map((device, index) => <div className="device-list-row" key={device.deviceId}><span className={`device-avatar small tone-${index % 4}`}><Icon name="monitor" size={16} /></span><div className="grow"><strong>{formatDeviceId(device.deviceId)}</strong><small>Last connected {new Date(device.connectedAt).toLocaleString()}</small></div><span className="device-last-used">{new Date(device.connectedAt).toLocaleDateString()}</span><button type="button" className="secondary-button" onClick={() => { update("deviceId", device.deviceId); setPage("home"); }}>Connect<Icon name="chevron" size={13} /></button></div>)}</div> : <div className="empty-state compact"><span className="empty-state-symbol"><Icon name="devices" size={28} /></span><h3>No recent devices</h3><p>Devices appear here after your first successful connection.</p><button type="button" className="secondary-button" onClick={() => setPage("home")}>Connect a device</button></div>}</section>
+            <section className="panel recent-devices-panel"><div className="section-heading"><div><h3>Recent devices</h3><p>Created from successful connections on this PC.</p></div><input className="device-search" aria-label={t("Search recent devices", "搜索最近设备")} placeholder={t("Search by device ID", "按设备 ID 搜索")} value={deviceQuery} onChange={(event) => setDeviceQuery(event.target.value)} /></div>{recentDevices.length ? <div className="device-list">{recentDevices.filter((device) => device.deviceId.includes(deviceQuery.replace(/\s/g, ""))).map((device, index) => <div className="device-list-row" key={device.deviceId}><span className={`device-avatar small tone-${index % 4}`}><Icon name="monitor" size={16} /></span><div className="grow"><strong>{formatDeviceId(device.deviceId)}</strong><small>Last connected {new Date(device.connectedAt).toLocaleString()}</small></div><span className="device-last-used">{new Date(device.connectedAt).toLocaleDateString()}</span><button type="button" className="secondary-button" onClick={() => { update("deviceId", device.deviceId); update("unattendedSecret", ""); setPage("home"); }}>Connect<Icon name="chevron" size={13} /></button><button type="button" className="icon-button" aria-label={t("Remove recent device", "移除最近设备记录")} title={t("Remove recent device", "移除最近设备记录")} onClick={() => { setForgottenDevice(device); setRecentDevices((items) => items.filter((item) => item.deviceId !== device.deviceId)); }}><Icon name="trash" size={15} /></button></div>)}</div> : <div className="empty-state compact"><span className="empty-state-symbol"><Icon name="devices" size={28} /></span><h3>No recent devices</h3><p>Devices appear here after your first successful connection.</p><button type="button" className="secondary-button" onClick={() => setPage("home")}>Connect a device</button></div>}{recentDevices.length > 0 && !recentDevices.some((device) => device.deviceId.includes(deviceQuery.replace(/\s/g, ""))) && <p className="empty-inline">{t("No matching devices.", "没有匹配的设备。")}</p>}{forgottenDevice && <div className="inline-message" role="status">{t("Recent entry removed.", "已移除最近记录。")}<button type="button" className="text-button" onClick={() => { setRecentDevices((items) => [forgottenDevice, ...items.filter((item) => item.deviceId !== forgottenDevice.deviceId)].sort((a, b) => b.connectedAt - a.connectedAt).slice(0, 5)); setForgottenDevice(null); }}>{t("Undo", "撤销")}</button></div>}</section>
           </div>}
 
           {page === "session" && <div className="session-page">
-            <div className="session-toolbar"><div><i className="live-dot" /><span><strong>{formatDeviceId(request.deviceId)}</strong><small>Secure session · {duration}</small></span></div><div className="session-actions"><button type="button" className="secondary-button" onClick={() => setPage("files")}><Icon name="files" size={15} />Files</button><button type="button" className="danger-quiet" onClick={() => void disconnect()}><Icon name="disconnect" size={15} />Disconnect</button></div></div>
+            <div className="session-toolbar"><div><i className="live-dot" /><span><strong>{formatDeviceId(request.deviceId)}</strong><small>Secure session · {duration}</small></span></div><div className="session-actions"><ConnectionQualityIndicator path={status.path} /><button type="button" className="secondary-button" onClick={() => setPage("files")}><Icon name="files" size={15} />Files</button><button type="button" className="danger-quiet" onClick={() => void disconnect()}><Icon name="disconnect" size={15} />Disconnect</button></div></div>
             <div ref={screenRef} className={`screen ${isConnected && hasVideoFrame ? "interactive" : ""}`} aria-label="Remote desktop" role="application" tabIndex={isConnected && hasVideoFrame ? 0 : -1} onContextMenu={(event) => event.preventDefault()} onPointerMove={handlePointerMove} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerCancel} onWheel={handleWheel} onKeyDown={handleKeyDown} onKeyUp={handleKeyUp} onBlur={() => void releaseRemoteInputs()}>
               <RemoteVideoRenderer connected={isConnected} statusMessage={status.message} onFrame={handleVideoFrame} />
             </div>
@@ -950,10 +978,11 @@ function App() {
               {settingsSection === "appearance" && <section className="settings-group appearance-settings"><div className="setting-copy"><strong>Color mode</strong><small>Choose how RemoteX and its Windows title bar appear.</small></div><div className="appearance-options" role="radiogroup" aria-label="Color mode">{APPEARANCE_OPTIONS.map((option) => <button key={option.id} type="button" role="radio" aria-checked={appearance === option.id} className={appearance === option.id ? "selected" : ""} onClick={() => setAppearance(option.id)}><span className={`appearance-preview ${option.id}`}><Icon name={option.icon} size={18} /></span><span><strong>{option.label}</strong><small>{option.detail}</small></span>{appearance === option.id && <Icon name="check" size={15} />}</button>)}</div><p className="settings-note"><Icon name="sun" size={14} />Changes apply immediately and are saved on this PC.</p></section>}
               {settingsSection === "remote" && <section className="settings-group"><div className="setting-row emphasized"><span><strong>Allow remote access</strong><small>Makes this computer available through your configured server.</small></span><Toggle label="Allow remote access" checked={remoteEnabled} disabled={saving} onChange={(value) => void toggleRemoteAccess(value)} /></div></section>}
               {settingsSection === "permissions" && <><section className="settings-group">{([["allowInput","Keyboard and mouse","Allow remote input"],["allowClipboard","Plain-text clipboard","Allow clipboard synchronization"],["allowFileUpload","File upload","Allow files to be sent to this PC"],["allowFileDownload","File download","Allow files to be downloaded from this PC"]] as const).map(([key,title,detail]) => <div className="setting-row" key={key}><span><strong>{title}</strong><small>{detail}</small></span><Toggle label={title} checked={agentSettings[key]} onChange={(value) => immediateAgent(key, value)} /></div>)}</section><section className="settings-group"><div className="section-heading"><div><h3>Allowed folders</h3><p>Remote file access stays inside these locations.</p></div><button type="button" className="secondary-button" onClick={() => void addAllowedFolder()}><Icon name="plus" size={15} />Add folder</button></div>{folders.length ? <div className="folder-list">{folders.map((folder, index) => <div className="folder-row" key={folder.path}><span className="folder-icon"><Icon name="folder" size={16} /></span><div className="grow"><input aria-label={`Folder ${index + 1} label`} value={folder.label} onChange={(event) => updateAgent("fileRoots", serializeFolders(folders.map((item, itemIndex) => itemIndex === index ? { ...item, label: event.target.value } : item)))} /><small>{folder.path}</small></div><button type="button" className="icon-button danger" aria-label={`Remove ${folder.label}`} onClick={() => updateAgent("fileRoots", serializeFolders(folders.filter((_, itemIndex) => itemIndex !== index)))}><Icon name="trash" size={15} /></button></div>)}</div> : <div className="empty-inline"><Icon name="folder" /><span><strong>No folders allowed</strong><small>File permissions remain unavailable until you add one.</small></span></div>}</section></>}
-              {settingsSection === "video" && <section className="settings-group"><label className="field-label">Video quality<select value={agentSettings.videoQuality} onChange={(event) => immediateAgent("videoQuality", event.target.value as AgentSettings["videoQuality"])}><option value="low">Low · up to 10 FPS</option><option value="balanced">Balanced · up to 20 FPS</option><option value="high">High · up to 30 FPS</option></select><small>Balanced is recommended for most networks.</small></label></section>}
+              {settingsSection === "video" && <section className="settings-group"><label className="field-label">Video profile<select value={agentSettings.videoQuality} onChange={(event) => immediateAgent("videoQuality", event.target.value as AgentSettings["videoQuality"])}><option value="auto">Auto · adaptive</option><option value="quality">Quality · up to 30 FPS</option><option value="balanced">Balanced · up to 20 FPS</option><option value="lowBandwidth">Low bandwidth · up to 10 FPS</option></select><small>Auto adapts quality to current network conditions.</small></label></section>}
               {settingsSection === "network" && <><section className="settings-group"><label className="field-label">RemoteX server<input value={serverConfig.controlServerUrl} onChange={(event) => setServerConfig((current) => ({ ...current, controlServerUrl: event.target.value, configured: false }))} placeholder="https://remote.example.com" /><small>Used by this computer and every outgoing connection.</small></label><label className="field-label">Relay CA certificate<div className="path-picker"><input value={serverConfig.caCertificatePath} onChange={(event) => setServerConfig((current) => ({ ...current, caCertificatePath: event.target.value, configured: false }))} placeholder="Select a PEM, CRT, or CER file" /><button type="button" className="secondary-button" onClick={() => void chooseCertificate("controller")}>Choose…</button></div></label><details className="advanced-details"><summary>Advanced endpoints</summary><div className="options-grid"><label>Relay address<input value={serverConfig.relayAddress} onChange={(event) => setServerConfig((current) => ({ ...current, relayAddress: event.target.value, configured: false }))} placeholder="Optional managed-session fallback" /></label><label>TLS server name<input value={serverConfig.relayServerName} onChange={(event) => setServerConfig((current) => ({ ...current, relayServerName: event.target.value, configured: false }))} /></label></div></details><div className="network-actions"><button type="button" disabled={saving} onClick={() => void saveNetworkSettings()}>Save and check</button><button type="button" className="secondary-button" onClick={() => void runSetupAgain()}>Run setup again</button></div>{networkMessage && <p className="inline-message success" role="status">{networkMessage}</p>}</section><section className="settings-group"><div className="setting-row"><span><strong>Clipboard for outgoing sessions</strong><small>Request clipboard permission when connecting.</small></span><Toggle label="Request clipboard access" checked={request.clipboardEnabled} onChange={(value) => setRequest((current) => ({ ...current, clipboardEnabled: value }))} /></div><div className="setting-row"><span><strong>File upload for outgoing sessions</strong></span><Toggle label="Request file upload" checked={request.fileUploadEnabled} onChange={(value) => setRequest((current) => ({ ...current, fileUploadEnabled: value }))} /></div><div className="setting-row"><span><strong>File download for outgoing sessions</strong></span><Toggle label="Request file download" checked={request.fileDownloadEnabled} onChange={(value) => setRequest((current) => ({ ...current, fileDownloadEnabled: value }))} /></div></section></>}
-              {settingsSection === "security" && <section className="settings-group"><div className="setting-row"><span><strong>Unattended access</strong><small>Requires an explicit secret of at least 12 characters.</small></span><Toggle label="Unattended access" checked={agentSettings.unattendedAccess} onChange={(value) => updateAgent("unattendedAccess", value)} /></div>{agentSettings.unattendedAccess && <label className="field-label">Unattended secret<input type="password" value={agentSettings.unattendedSecret} onChange={(event) => updateAgent("unattendedSecret", event.target.value)} minLength={12} maxLength={128} placeholder={agentSettings.secretConfigured ? "Leave blank to keep the protected secret" : "At least 12 characters"} /></label>}</section>}
+              {settingsSection === "security" && <section className="settings-group"><div className="setting-row"><span><strong>{t("Allow password access", "允许密码访问")}</strong><small>{t("A correct password approves connections within your allowed permissions. Turn off to require local confirmation.", "正确密码可批准权限范围内的连接；关闭后每次都需本机确认。")}</small></span><Toggle label={t("Allow password access", "允许密码访问")} checked={agentSettings.unattendedAccess} disabled={saving || Boolean(agentRuntime?.sessionId) || !agentSettings.secretConfigured} onChange={(value) => immediateAgent("unattendedAccess", value)} /></div>{accessPasswordPanel}<button type="button" className="card-footer-link" onClick={() => setSettingsSection("permissions")}><Icon name="shield" size={16} />{t("Review access permissions", "查看访问权限")}<Icon name="chevron" size={14} /></button></section>}
               {settingsSection === "advanced" && <><section className="settings-group"><label className="field-label">Agent CA certificate<div className="path-picker"><input value={agentSettings.caCertificatePath} onChange={(event) => updateAgent("caCertificatePath", event.target.value)} placeholder="Select a PEM, CRT, or CER file" /><button type="button" className="secondary-button" onClick={() => void chooseCertificate("agent")}>Choose…</button></div></label><label className="field-label">Controller CA certificate<div className="path-picker"><input value={request.caCertificatePath} onChange={(event) => update("caCertificatePath", event.target.value)} /><button type="button" className="secondary-button" onClick={() => void chooseCertificate("controller")}>Choose…</button></div></label></section><details className="advanced-details"><summary>Manual relay session fallback</summary><div className="options-grid"><label>Relay address<input value={request.relayAddress} onChange={(event) => update("relayAddress", event.target.value)} /></label><label>TLS server name<input value={request.serverName} onChange={(event) => update("serverName", event.target.value)} /></label><label>Session ID<input value={request.sessionId} onChange={(event) => update("sessionId", event.target.value)} /></label><label>One-time token<input type="password" value={request.tokenHex} onChange={(event) => update("tokenHex", event.target.value)} /></label><label>End-to-end key<input type="password" value={request.endToEndKeyHex} onChange={(event) => update("endToEndKeyHex", event.target.value)} /></label></div></details></>}
+              {settingsSection === "network" && <section className="settings-group"><details className="advanced-details"><summary>Public endpoint discovery</summary><label className="field-label">STUN address<input value={serverConfig.stunAddress} onChange={(event) => setServerConfig((current) => ({ ...current, stunAddress: event.target.value, configured: false }))} placeholder="Optional numeric IP:port" /><small>Advanced self-hosted UDP mapping discovery. Relay remains available if discovery fails.</small></label></details></section>}
               {(["general","permissions","security","advanced"] as SettingsSection[]).includes(settingsSection) && <button type="submit" disabled={saving}>Apply</button>}
             </div></form>
           </div>}
@@ -961,7 +990,7 @@ function App() {
           {page === "about" && <div className="about-page"><div className="about-stars" aria-hidden="true"><i /><i /><i /><i /><i /></div><span className="about-mark"><img src="/app-icon.png" alt="RemoteX icon" /></span><h2>RemoteX</h2><p className="version">Version {appUpdater.appVersion}</p><p>A private remote desktop for your own Windows PCs and Linux servers, designed around explicit permissions and end-to-end encryption.</p><AppUpdatePanel updater={appUpdater} /><div className="about-grid"><div className="tone-blue"><span className="about-feature-icon"><Icon name="shield" /></span><span><strong>Private</strong><small>Self-hosted coordination keeps session data under your control.</small></span></div><div className="tone-green"><span className="about-feature-icon"><Icon name="wifi" /></span><span><strong>Responsive</strong><small>Adaptive remote video balances quality and latency.</small></span></div><div className="tone-purple"><span className="about-feature-icon"><Icon name="server" /></span><span><strong>Capable</strong><small>Desktop, file, clipboard, and server tools in one app.</small></span></div><div className="tone-amber"><span className="about-feature-icon"><Icon name="power" /></span><span><strong>Reliable</strong><small>Signed updates and explicit authorization protect every connection.</small></span></div></div><small className="copyright">© 2026 RemoteX</small></div>}
         </div>
       </main>
-      <DiagnosticsOverlay connectionState={status.state} />
+      <DiagnosticsOverlay connectionState={status.state} connectionPath={status.path} transport={status.transport} />
     </div>
   );
 

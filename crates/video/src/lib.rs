@@ -11,7 +11,7 @@ use openh264::{
     formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
 use remotex_capture::{Frame, PixelFormat};
-use remotex_protocol::{EncodedVideoFrame, VideoCodec, VideoFeedback};
+use remotex_protocol::{DiagnosticValue, EncodedVideoFrame, VideoCodec, VideoFeedback};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -185,11 +185,20 @@ impl VideoEncoder for H264Encoder {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QualityLevel {
     Poor,
     Medium,
     Good,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoPerformanceProfile {
+    #[default]
+    Auto,
+    Quality,
+    Balanced,
+    LowBandwidth,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,18 +235,45 @@ pub struct AdaptiveQualityController {
     maximum_fps: u32,
     poor_streak: u8,
     good_streak: u8,
+    minimum_level: QualityLevel,
+    maximum_level: QualityLevel,
 }
 
 impl AdaptiveQualityController {
     pub fn new(maximum_fps: u32) -> Result<Self, VideoError> {
+        Self::for_profile(maximum_fps, VideoPerformanceProfile::Auto)
+    }
+
+    pub fn for_profile(
+        maximum_fps: u32,
+        profile: VideoPerformanceProfile,
+    ) -> Result<Self, VideoError> {
         if !(1..=60).contains(&maximum_fps) {
             return Err(VideoError::InvalidFrameRate);
         }
+        let (level, minimum_level, maximum_level) = match profile {
+            VideoPerformanceProfile::Auto => {
+                (QualityLevel::Good, QualityLevel::Poor, QualityLevel::Good)
+            }
+            VideoPerformanceProfile::Quality => {
+                (QualityLevel::Good, QualityLevel::Medium, QualityLevel::Good)
+            }
+            VideoPerformanceProfile::Balanced => (
+                QualityLevel::Medium,
+                QualityLevel::Poor,
+                QualityLevel::Medium,
+            ),
+            VideoPerformanceProfile::LowBandwidth => {
+                (QualityLevel::Poor, QualityLevel::Poor, QualityLevel::Poor)
+            }
+        };
         Ok(Self {
-            level: QualityLevel::Good,
+            level,
             maximum_fps,
             poor_streak: 0,
             good_streak: 0,
+            minimum_level,
+            maximum_level,
         })
     }
 
@@ -252,14 +288,34 @@ impl AdaptiveQualityController {
     }
 
     pub fn observe(&mut self, feedback: VideoFeedback) -> bool {
-        let poor = feedback.packet_loss_per_mille >= 50
-            || feedback.rtt_ms >= 180
-            || feedback.send_queue_percent >= 75
-            || feedback.decoder_latency_ms >= 80;
-        let good = feedback.packet_loss_per_mille <= 10
-            && feedback.rtt_ms <= 80
-            && feedback.send_queue_percent <= 30
-            && feedback.decoder_latency_ms <= 30;
+        let rtt = diagnostic_value(feedback.rtt_ms);
+        let loss = diagnostic_value(feedback.packet_loss_per_mille);
+        let queue = diagnostic_value(feedback.send_queue_percent);
+        let decode = diagnostic_value(feedback.decoder_latency_ms);
+        let render = diagnostic_value(feedback.render_latency_ms);
+        let dropped = diagnostic_value(feedback.dropped_frames_per_mille);
+        let poor = loss.is_some_and(|value| value >= 50)
+            || rtt.is_some_and(|value| value >= 180)
+            || queue.is_some_and(|value| value >= 75)
+            || decode.is_some_and(|value| value >= 80)
+            || render.is_some_and(|value| value >= 50)
+            || dropped.is_some_and(|value| value >= 100);
+        let available = [
+            rtt.is_some(),
+            loss.is_some(),
+            queue.is_some(),
+            decode.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+        let good = available >= 2
+            && loss.is_none_or(|value| value <= 10)
+            && rtt.is_none_or(|value| value <= 80)
+            && queue.is_none_or(|value| value <= 30)
+            && decode.is_none_or(|value| value <= 30)
+            && render.is_none_or(|value| value <= 20)
+            && dropped.is_none_or(|value| value <= 20);
         if poor {
             self.poor_streak = self.poor_streak.saturating_add(1);
             self.good_streak = 0;
@@ -275,16 +331,25 @@ impl AdaptiveQualityController {
             self.level = match self.level {
                 QualityLevel::Good => QualityLevel::Medium,
                 QualityLevel::Medium | QualityLevel::Poor => QualityLevel::Poor,
-            };
+            }
+            .max(self.minimum_level);
             self.poor_streak = 0;
         } else if self.good_streak >= 6 {
             self.level = match self.level {
                 QualityLevel::Poor => QualityLevel::Medium,
                 QualityLevel::Medium | QualityLevel::Good => QualityLevel::Good,
-            };
+            }
+            .min(self.maximum_level);
             self.good_streak = 0;
         }
         self.level != previous
+    }
+}
+
+fn diagnostic_value<T: Copy>(value: DiagnosticValue<T>) -> Option<T> {
+    match value {
+        DiagnosticValue::Available { value, .. } => Some(value),
+        DiagnosticValue::Unavailable => None,
     }
 }
 
@@ -299,7 +364,14 @@ pub struct SessionVideoEncoder {
 
 impl SessionVideoEncoder {
     pub fn new(maximum_fps: u32) -> Result<Self, VideoError> {
-        let adaptive = AdaptiveQualityController::new(maximum_fps)?;
+        Self::with_profile(maximum_fps, VideoPerformanceProfile::Auto)
+    }
+
+    pub fn with_profile(
+        maximum_fps: u32,
+        performance_profile: VideoPerformanceProfile,
+    ) -> Result<Self, VideoError> {
+        let adaptive = AdaptiveQualityController::for_profile(maximum_fps, performance_profile)?;
         let profile = adaptive.profile();
         Ok(Self {
             codec: VideoCodec::Jpeg,
@@ -663,6 +735,7 @@ pub enum VideoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remotex_protocol::MetricProvenance;
 
     fn solid_frame(width: u32, height: u32) -> Frame {
         let mut data = vec![0_u8; width as usize * height as usize * 4];
@@ -733,28 +806,67 @@ mod tests {
     fn adaptive_quality_uses_hysteresis() {
         let mut adaptive = AdaptiveQualityController::new(30).expect("adaptive");
         let poor = VideoFeedback {
-            rtt_ms: 250,
-            packet_loss_per_mille: 80,
-            send_queue_percent: 90,
-            decoder_latency_ms: 100,
-            render_latency_ms: 30,
+            rtt_ms: measured(250),
+            packet_loss_per_mille: measured(80),
+            send_queue_percent: measured(90),
+            decoder_latency_ms: measured(100),
+            render_latency_ms: measured(30),
+            dropped_frames_per_mille: measured(150),
         };
         assert!(!adaptive.observe(poor));
         assert!(!adaptive.observe(poor));
         assert!(adaptive.observe(poor));
         assert_eq!(adaptive.level(), QualityLevel::Medium);
         let good = VideoFeedback {
-            rtt_ms: 20,
-            packet_loss_per_mille: 0,
-            send_queue_percent: 5,
-            decoder_latency_ms: 5,
-            render_latency_ms: 5,
+            rtt_ms: measured(20),
+            packet_loss_per_mille: measured(0),
+            send_queue_percent: measured(5),
+            decoder_latency_ms: measured(5),
+            render_latency_ms: measured(5),
+            dropped_frames_per_mille: measured(0),
         };
         for _ in 0..5 {
             assert!(!adaptive.observe(good));
         }
         assert!(adaptive.observe(good));
         assert_eq!(adaptive.level(), QualityLevel::Good);
+    }
+
+    #[test]
+    fn user_profiles_bound_the_adaptive_ladder() {
+        let quality = AdaptiveQualityController::for_profile(30, VideoPerformanceProfile::Quality)
+            .expect("quality profile");
+        assert_eq!(quality.level(), QualityLevel::Good);
+
+        let balanced =
+            AdaptiveQualityController::for_profile(20, VideoPerformanceProfile::Balanced)
+                .expect("balanced profile");
+        assert_eq!(balanced.level(), QualityLevel::Medium);
+        assert_eq!(balanced.profile().frames_per_second, 20);
+
+        let mut low =
+            AdaptiveQualityController::for_profile(10, VideoPerformanceProfile::LowBandwidth)
+                .expect("low bandwidth profile");
+        assert_eq!(low.level(), QualityLevel::Poor);
+        let good = VideoFeedback {
+            rtt_ms: measured(10),
+            packet_loss_per_mille: measured(0),
+            send_queue_percent: measured(0),
+            decoder_latency_ms: measured(1),
+            render_latency_ms: measured(1),
+            dropped_frames_per_mille: measured(0),
+        };
+        for _ in 0..12 {
+            assert!(!low.observe(good));
+        }
+        assert_eq!(low.level(), QualityLevel::Poor);
+    }
+
+    fn measured<T>(value: T) -> DiagnosticValue<T> {
+        DiagnosticValue::Available {
+            value,
+            provenance: MetricProvenance::Measured,
+        }
     }
 
     #[test]

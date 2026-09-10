@@ -148,6 +148,19 @@ All protocol serialization goes through `encode_wire` and `decode_wire`, which
 use bincode 2 standard configuration and reject trailing bytes. A malformed
 message closes only the offending Session, never the Relay process.
 
+### v1.3 recovery and path barriers
+
+`ClientHello.credential_kind` distinguishes one-time `Initial` credentials from
+role-bound `Recovery` credentials. Recovery is accepted only for the same
+accepted Session and role before its recovery expiry. Ending/revoking a Session
+invalidates recovery without changing its permissions.
+
+`PathControl` is Relay-visible transport control, never application content:
+`SwitchRequest`, `SwitchAck`, `SwitchCommit`, and `SwitchCommitted` share a fresh
+nonce. The final acknowledgement is ordered after all earlier Agent-to-Controller
+Relay payloads. Only then do both peers activate the already authenticated Direct
+stream. E2EE envelope counters continue across the switch.
+
 ## Video frames
 
 `EncodedVideoFrame` contains width, height, source timestamp, codec, key-frame
@@ -167,9 +180,11 @@ direction.
 ## M11 connectivity extension
 
 `DeviceHeartbeatRequest` publishes at most 16 validated `Lan` or
-`ServerReflexive` candidates. `SessionCredentials.peer_candidates` returns the
+`ServerReflexive` and `ConfiguredPublic` candidates. `SessionCredentials.peer_candidates` returns the
 current Agent candidates only to the requesting Controller. Each candidate has
-a numeric socket address, TLS server name, and priority; LAN candidates are
+a numeric socket address, TLS server name, priority, gather time, and optional
+expiry. Host candidates rank before discovered mappings and configured public
+mappings; malformed, expired, and duplicate endpoints are removed before dialing.
 attempted first.
 
 After Relay authorization, `DirectClientHello` and `DirectServerHello` perform

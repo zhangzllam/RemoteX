@@ -9,12 +9,30 @@ use remotex_protocol::{
     decode_wire, encode_wire,
 };
 use sha2::Sha256;
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Default maximum application frame accepted by transport readers (8 MiB).
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+pub const MAX_RECONNECT_ATTEMPTS: usize = 5;
+
+/// Bounded exponential reconnect delay with deterministic ±20% jitter.
+#[must_use]
+pub fn reconnect_delay(attempt: usize, jitter_seed: u64) -> Option<Duration> {
+    const BASE_MS: [u64; MAX_RECONNECT_ATTEMPTS] = [500, 1_000, 2_000, 4_000, 8_000];
+    let base = *BASE_MS.get(attempt)?;
+    let spread = base / 5;
+    let slots = spread.saturating_mul(2).saturating_add(1);
+    let offset = jitter_seed % slots;
+    Some(Duration::from_millis(
+        base.saturating_sub(spread).saturating_add(offset),
+    ))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Endpoint {
@@ -45,16 +63,58 @@ pub enum TransportError {
     InvalidCandidate,
     #[error("direct protocol failed: {0}")]
     DirectProtocol(String),
+    #[error("invalid connection path transition from {from:?} to {to:?}")]
+    InvalidPathTransition {
+        from: PathSelectionState,
+        to: PathSelectionState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectivityState {
-    SessionCreated,
-    ConnectingRelay,
+pub enum PathSelectionState {
+    Negotiating,
     RelayConnected,
-    TryingDirect,
+    DirectChecking,
     DirectConnected,
-    DirectFailed,
+    RelayFallback,
+    Reconnecting,
+    Failed,
+}
+
+impl PathSelectionState {
+    pub fn transition(self, next: Self) -> Result<Self, TransportError> {
+        #[allow(clippy::unnested_or_patterns)]
+        let valid = matches!(
+            (self, next),
+            (
+                Self::Negotiating,
+                Self::RelayConnected | Self::Reconnecting | Self::Failed
+            ) | (
+                Self::RelayConnected,
+                Self::DirectChecking | Self::Reconnecting | Self::Failed
+            ) | (
+                Self::DirectChecking,
+                Self::DirectConnected | Self::RelayFallback | Self::Reconnecting | Self::Failed
+            ) | (
+                Self::DirectConnected,
+                Self::RelayFallback | Self::Reconnecting | Self::Failed
+            ) | (
+                Self::RelayFallback,
+                Self::DirectChecking | Self::Reconnecting | Self::Failed
+            ) | (
+                Self::Reconnecting,
+                Self::RelayConnected | Self::DirectConnected | Self::RelayFallback | Self::Failed
+            )
+        );
+        if valid || self == next {
+            Ok(next)
+        } else {
+            Err(TransportError::InvalidPathTransition {
+                from: self,
+                to: next,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,10 +123,25 @@ pub struct ResolvedCandidate {
     pub address: SocketAddr,
     pub server_name: String,
     pub priority: u16,
+    pub gathered_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
 }
 
 pub fn resolve_candidates(
     candidates: &[ConnectivityCandidate],
+) -> Result<Vec<ResolvedCandidate>, TransportError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| TransportError::Other(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| TransportError::Other("system time is out of range".to_owned()))?;
+    resolve_candidates_at(candidates, now_ms)
+}
+
+pub fn resolve_candidates_at(
+    candidates: &[ConnectivityCandidate],
+    now_ms: u64,
 ) -> Result<Vec<ResolvedCandidate>, TransportError> {
     if candidates.len() > remotex_protocol::MAX_CONNECTIVITY_CANDIDATES {
         return Err(TransportError::InvalidCandidate);
@@ -85,18 +160,28 @@ pub fn resolve_candidates(
                     .map_err(|_| TransportError::InvalidCandidate)?,
                 server_name: candidate.server_name.clone(),
                 priority: candidate.priority,
+                gathered_at_ms: candidate.gathered_at_ms,
+                expires_at_ms: candidate.expires_at_ms,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    resolved.retain(|candidate| {
+        candidate
+            .expires_at_ms
+            .is_none_or(|expires_at_ms| expires_at_ms > now_ms)
+    });
     resolved.sort_by_key(|candidate| {
         (
             match candidate.kind {
-                ConnectivityCandidateKind::Lan => 0_u8,
+                ConnectivityCandidateKind::Host => 0_u8,
                 ConnectivityCandidateKind::ServerReflexive => 1,
+                ConnectivityCandidateKind::ConfiguredPublic => 2,
             },
             std::cmp::Reverse(candidate.priority),
         )
     });
+    let mut seen = HashSet::new();
+    resolved.retain(|candidate| seen.insert((candidate.address, candidate.server_name.clone())));
     Ok(resolved)
 }
 
@@ -144,6 +229,7 @@ where
 
 /// A single framed bidirectional stream carried by a QUIC connection.
 pub struct QuicFrameConnection {
+    connection: Option<quinn::Connection>,
     send: quinn::SendStream,
     receive: quinn::RecvStream,
     maximum: usize,
@@ -153,6 +239,22 @@ impl QuicFrameConnection {
     #[must_use]
     pub const fn new(send: quinn::SendStream, receive: quinn::RecvStream, maximum: usize) -> Self {
         Self {
+            connection: None,
+            send,
+            receive,
+            maximum,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_connection(
+        connection: quinn::Connection,
+        send: quinn::SendStream,
+        receive: quinn::RecvStream,
+        maximum: usize,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
             send,
             receive,
             maximum,
@@ -173,6 +275,16 @@ impl Connection for QuicFrameConnection {
     async fn close(&mut self) -> Result<(), TransportError> {
         self.send.finish()?;
         Ok(())
+    }
+
+    fn metrics(&self) -> Option<ConnectionMetrics> {
+        let connection = self.connection.as_ref()?;
+        let path = connection.stats().path;
+        Some(ConnectionMetrics {
+            rtt: connection.rtt(),
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+        })
     }
 }
 
@@ -200,6 +312,7 @@ impl Connection for DirectPeerConnection {
             | RelayClientMessage::HeartbeatAck { nonce } => {
                 RelayServerMessage::HeartbeatAck { nonce }
             }
+            RelayClientMessage::PathControl(message) => RelayServerMessage::PathControl(message),
             RelayClientMessage::Close => RelayServerMessage::SessionClosed {
                 reason: SessionCloseReason::ClientClosed,
             },
@@ -220,6 +333,10 @@ impl Connection for DirectPeerConnection {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         self.inner.close().await
+    }
+
+    fn metrics(&self) -> Option<ConnectionMetrics> {
+        self.inner.metrics()
     }
 }
 
@@ -331,7 +448,8 @@ async fn connect_direct_candidate(
         .open_bi()
         .await
         .map_err(|error| TransportError::Other(error.to_string()))?;
-    let mut framed = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut framed =
+        QuicFrameConnection::with_connection(connection, send, receive, DEFAULT_MAX_FRAME_SIZE);
     authenticate_direct_client(&mut framed, session_id, session_key).await?;
     Ok(DirectPeerConnection::new(framed))
 }
@@ -384,6 +502,16 @@ pub trait Connection: Send {
     async fn send(&mut self, frame: Bytes) -> Result<(), TransportError>;
     async fn receive(&mut self) -> Result<Bytes, TransportError>;
     async fn close(&mut self) -> Result<(), TransportError>;
+    fn metrics(&self) -> Option<ConnectionMetrics> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionMetrics {
+    pub rtt: Duration,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
 }
 
 #[async_trait]
@@ -468,21 +596,17 @@ mod tests {
     #[test]
     fn candidates_prefer_lan_and_reject_invalid_addresses() {
         let candidates = vec![
-            ConnectivityCandidate {
-                kind: ConnectivityCandidateKind::ServerReflexive,
-                address: "203.0.113.7:7444".to_owned(),
-                server_name: "direct.example.test".to_owned(),
-                priority: 200,
-            },
-            ConnectivityCandidate {
-                kind: ConnectivityCandidateKind::Lan,
-                address: "192.168.1.20:7444".to_owned(),
-                server_name: "direct.example.test".to_owned(),
-                priority: 100,
-            },
+            ConnectivityCandidate::server_reflexive(
+                "203.0.113.7:7444",
+                "direct.example.test",
+                200,
+                1_000,
+                2_000,
+            ),
+            ConnectivityCandidate::host("192.168.1.20:7444", "direct.example.test", 100),
         ];
-        let resolved = resolve_candidates(&candidates).expect("resolve");
-        assert_eq!(resolved[0].kind, ConnectivityCandidateKind::Lan);
+        let resolved = resolve_candidates_at(&candidates, 1_500).expect("resolve");
+        assert_eq!(resolved[0].kind, ConnectivityCandidateKind::Host);
 
         let mut invalid = candidates;
         invalid[0].address = "not-an-address".to_owned();
@@ -490,6 +614,67 @@ mod tests {
             resolve_candidates(&invalid),
             Err(TransportError::InvalidCandidate)
         ));
+    }
+
+    #[test]
+    fn candidates_drop_expired_and_duplicate_endpoints() {
+        let candidates = vec![
+            ConnectivityCandidate::server_reflexive(
+                "203.0.113.7:7444",
+                "direct.example.test",
+                250,
+                1_000,
+                1_500,
+            ),
+            ConnectivityCandidate::configured_public(
+                "203.0.113.7:7444",
+                "direct.example.test",
+                100,
+            ),
+            ConnectivityCandidate::host("192.168.1.20:7444", "direct.example.test", 200),
+            ConnectivityCandidate::host("192.168.1.20:7444", "direct.example.test", 100),
+        ];
+        let resolved = resolve_candidates_at(&candidates, 2_000).expect("resolve");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].kind, ConnectivityCandidateKind::Host);
+        assert_eq!(
+            resolved[1].kind,
+            ConnectivityCandidateKind::ConfiguredPublic
+        );
+    }
+
+    #[test]
+    fn path_selection_rejects_unsafe_or_impossible_transitions() {
+        assert_eq!(
+            PathSelectionState::Negotiating
+                .transition(PathSelectionState::RelayConnected)
+                .expect("relay ready"),
+            PathSelectionState::RelayConnected
+        );
+        assert!(
+            PathSelectionState::Negotiating
+                .transition(PathSelectionState::DirectConnected)
+                .is_err()
+        );
+        assert_eq!(
+            PathSelectionState::DirectConnected
+                .transition(PathSelectionState::RelayFallback)
+                .expect("direct failure fallback"),
+            PathSelectionState::RelayFallback
+        );
+        assert!(
+            PathSelectionState::Failed
+                .transition(PathSelectionState::RelayConnected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_jittered() {
+        assert_eq!(reconnect_delay(0, 0), Some(Duration::from_millis(400)));
+        assert_eq!(reconnect_delay(0, 200), Some(Duration::from_millis(600)));
+        assert!(reconnect_delay(4, 0).is_some());
+        assert_eq!(reconnect_delay(5, 0), None);
     }
 
     #[test]
@@ -548,7 +733,7 @@ mod tests {
             )
             .await
             .expect("connect authenticated LAN candidate");
-            assert_eq!(kind, ConnectivityCandidateKind::Lan);
+            assert_eq!(kind, ConnectivityCandidateKind::Host);
             server_task.await.expect("join direct server");
         }
     }
@@ -601,12 +786,11 @@ mod tests {
         let mut client = QuinnEndpoint::client("127.0.0.1:0".parse().expect("client bind"))
             .expect("client endpoint");
         client.set_default_client_config(client_config);
-        let candidate = ConnectivityCandidate {
-            kind: ConnectivityCandidateKind::Lan,
-            address: server.local_addr().expect("server address").to_string(),
-            server_name: "localhost".to_owned(),
-            priority: 100,
-        };
+        let candidate = ConnectivityCandidate::host(
+            server.local_addr().expect("server address").to_string(),
+            "localhost",
+            100,
+        );
         (server, client, candidate)
     }
 }

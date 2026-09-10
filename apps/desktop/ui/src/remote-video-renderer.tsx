@@ -12,7 +12,8 @@ type Props = {
 
 const emptyStats: VideoStats = {
   received: 0, rendered: 0, dropped: 0, renderFps: 0,
-  decodeLatencyMs: 0, endToEndLatencyMs: 0, width: 0, height: 0, codec: "-",
+  bitrateBps: 0, captureLatencyMs: 0, encodeLatencyMs: 0, decodeLatencyMs: 0,
+  renderLatencyMs: null, frameAgeMs: null, width: 0, height: 0, codec: "-",
 };
 
 export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props) {
@@ -22,6 +23,8 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
   const stats = useRef<VideoStats>({ ...emptyStats });
   const onFrameRef = useRef(onFrame);
   const renderedThisWindow = useRef(0);
+  const receivedThisWindow = useRef(0);
+  const droppedThisWindow = useRef(0);
   const [hasFrame, setHasFrame] = useState(false);
   const [summary, setSummary] = useState<VideoStats>({ ...emptyStats });
   useEffect(() => { onFrameRef.current = onFrame; }, [onFrame]);
@@ -30,9 +33,15 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
     let disposed = false;
     const acceptFrame = (payload: VideoFrame) => {
       stats.current.received += 1;
-      if (latestFrame.current) stats.current.dropped += 1;
+      receivedThisWindow.current += 1;
+      if (latestFrame.current) {
+        stats.current.dropped += 1;
+        droppedThisWindow.current += 1;
+      }
       stats.current.decodeLatencyMs = payload.decodeLatencyMs;
-      stats.current.endToEndLatencyMs = payload.endToEndLatencyMs;
+      stats.current.bitrateBps = payload.bitrateBps;
+      stats.current.captureLatencyMs = payload.captureLatencyMs;
+      stats.current.encodeLatencyMs = payload.encodeLatencyMs;
       stats.current.width = payload.width;
       stats.current.height = payload.height;
       stats.current.codec = payload.codec;
@@ -48,6 +57,7 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
       const context = canvas?.getContext("2d", { alpha: false });
       if (!canvas || !context) return;
       try {
+        const renderStarted = performance.now();
         if (frame.mimeType === "application/x-remotex-rgba") {
           const rgba: Uint8ClampedArray<ArrayBuffer> = frame.bytes
             ? copyBytes(frame.bytes)
@@ -56,6 +66,7 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
           if (canvas.width !== frame.width) canvas.width = frame.width;
           if (canvas.height !== frame.height) canvas.height = frame.height;
           context.putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+          stats.current.renderLatencyMs = Math.max(0, performance.now() - renderStarted);
           stats.current.rendered += 1;
           renderedThisWindow.current += 1;
           setHasFrame(true);
@@ -77,6 +88,14 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
       const next = { ...stats.current };
       setSummary(next);
       window.dispatchEvent(new CustomEvent<VideoStats>(VIDEO_STATS_EVENT, { detail: next }));
+      const windowReceived = receivedThisWindow.current;
+      const windowDropped = droppedThisWindow.current;
+      receivedThisWindow.current = 0;
+      droppedThisWindow.current = 0;
+      void invoke("report_video_render_metrics", {
+        renderLatencyMs: next.renderLatencyMs,
+        droppedFramesPerMille: windowReceived ? Math.min(1000, Math.round(windowDropped * 1000 / windowReceived)) : null,
+      });
     }, 500);
     return () => {
       disposed = true;
@@ -91,6 +110,8 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
       latestFrame.current = null;
       stats.current = { ...emptyStats };
       renderedThisWindow.current = 0;
+      receivedThisWindow.current = 0;
+      droppedThisWindow.current = 0;
       setHasFrame(false);
       setSummary({ ...emptyStats });
     }
@@ -99,7 +120,7 @@ export function RemoteVideoRenderer({ connected, statusMessage, onFrame }: Props
   return <>
     <canvas ref={canvasRef} aria-label="Remote desktop video" className={hasFrame ? "" : "video-pending"} />
     {!hasFrame && <div className="empty screen-empty">{connected ? <><span className="spinner large" /><strong>Waiting for the first frame</strong><small>{statusMessage}</small></> : <><strong>Session ended</strong><small>Return Home to connect again.</small></>}</div>}
-    {hasFrame && <div className="telemetry">{summary.width}×{summary.height} · {summary.codec} · {summary.renderFps} FPS · {summary.endToEndLatencyMs} ms</div>}
+    {hasFrame && <div className="telemetry">{summary.width}×{summary.height} · {summary.codec} · {summary.renderFps} FPS · {(summary.bitrateBps / 1_000_000).toFixed(1)} Mbps</div>}
   </>;
 }
 
@@ -127,7 +148,7 @@ function parseVideoPacket(value: Uint8Array | number[] | ArrayBuffer): VideoFram
   const codec = bytes[5] === 1 ? "H.264" : bytes[5] === 2 ? "JPEG" : "WebP";
   return {
     sequence: Number(view.getBigUint64(8, true)), frameId: Number(view.getBigUint64(16, true)),
-    sourceTimestampMs: Number(view.getBigUint64(24, true)), endToEndLatencyMs: Number(view.getBigUint64(32, true)),
+    sourceTimestampMs: Number(view.getBigUint64(24, true)),
     width, height, framesPerSecond: view.getUint32(48, true), bitrateBps: view.getUint32(52, true),
     captureLatencyMs: view.getUint32(56, true), encodeLatencyMs: view.getUint32(60, true), decodeLatencyMs: view.getUint32(64, true),
     codec, keyFrame: bytes[6] === 1, mimeType: "application/x-remotex-rgba", data: "", bytes: rgba,

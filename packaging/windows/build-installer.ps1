@@ -8,6 +8,7 @@ $uiDirectory = Join-Path $desktopDirectory "ui"
 $binaryDirectory = Join-Path $desktopDirectory "binaries"
 $releaseConfig = Join-Path $scriptDirectory "tauri.release.conf.json"
 $generatedSigningConfig = $null
+$generatedUpdaterConfig = $null
 
 function Assert-WindowsGuiSubsystem([string]$Path) {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
@@ -42,6 +43,13 @@ try {
     Push-Location $desktopDirectory
     try {
         $tauriArguments = @("build", "--ci", "--config", $releaseConfig)
+        if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            $generatedUpdaterConfig = Join-Path ([System.IO.Path]::GetTempPath()) "remotex-tauri-local-$PID.json"
+            @{
+                bundle = @{ createUpdaterArtifacts = $false }
+            } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $generatedUpdaterConfig -Encoding utf8
+            $tauriArguments += @("--config", $generatedUpdaterConfig)
+        }
         if ($env:REMOTEX_WINDOWS_CERTIFICATE_THUMBPRINT) {
             $generatedSigningConfig = Join-Path ([System.IO.Path]::GetTempPath()) "remotex-tauri-signing-$PID.json"
             @{
@@ -66,6 +74,9 @@ finally {
     Pop-Location
     if ($generatedSigningConfig -and (Test-Path -LiteralPath $generatedSigningConfig)) {
         Remove-Item -LiteralPath $generatedSigningConfig -Force
+    }
+    if ($generatedUpdaterConfig -and (Test-Path -LiteralPath $generatedUpdaterConfig)) {
+        Remove-Item -LiteralPath $generatedUpdaterConfig -Force
     }
 }
 

@@ -7,6 +7,7 @@
 
 mod agent_management;
 mod server_config;
+mod taskbar_icon;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -20,16 +21,16 @@ use remotex_file_transfer::{
 use remotex_input::normalize_unit_coordinate;
 use remotex_protocol::{
     ClipboardOrigin, ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind,
-    ControlMessage, CreateSessionRequest, DeviceId, DisplayId, EncodedVideoFrame, FileEntry,
-    FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
-    MAX_FILE_CHUNK_SIZE, MAX_TERMINAL_DATA_SIZE, Message, MessageEnvelope, MouseButton,
-    RelayClientMessage, RelayServerMessage, Role, SessionCredentials, SessionId,
-    SessionPermissions, SessionToken, SystemMessage, TerminalId, TerminalMessage, TransferId,
-    VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
+    ControlMessage, CreateSessionRequest, DeviceId, DiagnosticValue, DisplayId, EncodedVideoFrame,
+    FileEntry, FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
+    MAX_FILE_CHUNK_SIZE, MAX_TERMINAL_DATA_SIZE, Message, MessageEnvelope, MetricProvenance,
+    MouseButton, PathControlMessage, RelayClientMessage, RelayServerMessage, Role,
+    SessionCredentials, SessionId, SessionPermissions, SessionToken, SystemMessage, TerminalId,
+    TerminalMessage, TransferId, VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
 };
 use remotex_transport::{
     Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection,
-    connect_direct_candidates,
+    connect_direct_candidates, reconnect_delay,
 };
 use remotex_video::{StreamDecoder, VideoDecoder};
 use rustls::RootCertStore;
@@ -41,6 +42,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tauri::{
     AppHandle, Emitter, Manager, State,
@@ -64,6 +66,35 @@ struct StreamControl {
 #[derive(Default)]
 struct VideoIpc {
     channel: std::sync::Mutex<Option<IpcChannel<Vec<u8>>>>,
+    render_feedback: std::sync::Mutex<RenderFeedback>,
+    connection_timing: std::sync::Mutex<Option<ConnectionTiming>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionTiming {
+    started: Instant,
+    authorization_ms: Option<u64>,
+    relay_ready_ms: Option<u64>,
+    first_frame_ms: Option<u64>,
+    direct_attempt_ms: Option<u64>,
+    direct_established_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)]
+struct ConnectionPerformanceEvent {
+    authorization_ms: Option<u64>,
+    relay_ready_ms: Option<u64>,
+    first_frame_ms: Option<u64>,
+    direct_attempt_ms: Option<u64>,
+    direct_established_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderFeedback {
+    render_latency_ms: Option<u32>,
+    dropped_frames_per_mille: Option<u16>,
 }
 
 struct ActiveStream {
@@ -100,6 +131,8 @@ struct ResolvedSession {
     server_name: String,
     session_id: String,
     token_hex: String,
+    recovery_token_hex: String,
+    recovery_expires_at_ms: u64,
     end_to_end_key_hex: String,
     permissions: SessionPermissions,
     peer_candidates: Vec<ConnectivityCandidate>,
@@ -209,7 +242,6 @@ struct VideoFrameEvent {
     capture_latency_ms: u32,
     encode_latency_ms: u32,
     decode_latency_ms: u32,
-    end_to_end_latency_ms: u64,
     codec: &'static str,
     key_frame: bool,
     mime_type: &'static str,
@@ -226,6 +258,28 @@ fn subscribe_video(
         .channel
         .lock()
         .map_err(|_| "video IPC lock is unavailable".to_owned())? = Some(channel);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn report_video_render_metrics(
+    render_latency_ms: Option<f64>,
+    dropped_frames_per_mille: Option<u16>,
+    video_ipc: State<'_, VideoIpc>,
+) -> Result<(), String> {
+    let mut feedback = video_ipc
+        .render_feedback
+        .lock()
+        .map_err(|_| "video render feedback lock is unavailable".to_owned())?;
+    feedback.render_latency_ms = render_latency_ms
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value.round().min(f64::from(u32::MAX)) as u32);
+    feedback.dropped_frames_per_mille = dropped_frames_per_mille.map(|value| value.min(1_000));
     Ok(())
 }
 
@@ -257,9 +311,21 @@ struct AgentMessageOutcome {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StatusEvent {
     state: &'static str,
     message: String,
+    path: Option<&'static str>,
+    transport: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionMetricsEvent {
+    rtt_ms: Option<u32>,
+    packet_loss_per_mille: Option<u16>,
+    send_queue_percent: Option<u8>,
+    send_queue_estimated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -685,6 +751,7 @@ async fn run_remote_session(
     file_commands: mpsc::Receiver<ControllerFileCommand>,
     mut terminal_receiver: mpsc::Receiver<ControllerServerCommand>,
 ) -> anyhow::Result<()> {
+    reset_connection_timing(&app)?;
     if !request.control_server_url.trim().is_empty() {
         emit_status(
             &app,
@@ -693,13 +760,14 @@ async fn run_remote_session(
         );
     }
     let resolved = resolve_session(&request).await?;
+    record_connection_milestone(&app, |timing, elapsed| {
+        timing.authorization_ms = Some(elapsed);
+    });
     emit_status(&app, "connecting", "Establishing an encrypted path");
-    let relay_address: SocketAddr = resolved
-        .relay_address
-        .parse()
-        .context("parse relay address")?;
+    let relay_address = resolve_relay_address(&resolved.relay_address).await?;
     let session_id: SessionId = resolved.session_id.parse().context("parse session ID")?;
     let token = parse_token(&resolved.token_hex)?;
+    let recovery_token = parse_token(&resolved.recovery_token_hex)?;
     let end_to_end_key = parse_key(&resolved.end_to_end_key_hex)?;
     let inbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
@@ -718,7 +786,8 @@ async fn run_remote_session(
         .await
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
-    let mut relay_transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut relay_transport =
+        QuicFrameConnection::with_connection(connection, send, receive, DEFAULT_MAX_FRAME_SIZE);
     let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
         session_id,
         Role::Controller,
@@ -728,38 +797,32 @@ async fn run_remote_session(
         .send(Bytes::from(encode_wire(&hello)?))
         .await?;
     wait_for_peer(&app, &mut relay_transport).await?;
-    let (mut transport, connection_type): (Box<dyn Connection>, ConnectionType) =
-        if resolved.peer_candidates.is_empty() {
-            (Box::new(relay_transport), ConnectionType::Relay)
-        } else {
-            emit_status(
-                &app,
-                "connecting",
-                "Secure path ready · trying a faster direct connection",
-            );
-            match connect_direct_candidates(
-                &endpoint,
-                &resolved.peer_candidates,
+    record_connection_milestone(&app, |timing, elapsed| {
+        timing.relay_ready_ms = Some(elapsed);
+    });
+    let direct_candidates = resolved.peer_candidates.clone();
+    let direct_endpoint = endpoint.clone();
+    let (direct_sender, mut direct_receiver) = mpsc::channel(1);
+    let mut direct_check_open = !direct_candidates.is_empty();
+    if direct_check_open {
+        record_connection_milestone(&app, |timing, elapsed| {
+            timing.direct_attempt_ms = Some(elapsed);
+        });
+        tokio::spawn(async move {
+            let result = connect_direct_candidates(
+                &direct_endpoint,
+                &direct_candidates,
                 session_id,
                 &end_to_end_key,
                 DEFAULT_DIRECT_ATTEMPT_TIMEOUT,
             )
-            .await
-            {
-                Ok((connection, candidate_kind)) => {
-                    let connection_type = match candidate_kind {
-                        ConnectivityCandidateKind::Lan => ConnectionType::Lan,
-                        ConnectivityCandidateKind::ServerReflexive => ConnectionType::Direct,
-                    };
-                    (Box::new(connection), connection_type)
-                }
-                Err(error) => {
-                    warn!(event = "direct_connection_failed", %session_id, %error);
-                    (Box::new(relay_transport), ConnectionType::Relay)
-                }
-            }
-        };
-    emit_status(
+            .await;
+            let _result = direct_sender.send(result).await;
+        });
+    }
+    let mut transport: Box<dyn Connection> = Box::new(relay_transport);
+    let mut connection_type = ConnectionType::Relay;
+    emit_connection_status(
         &app,
         "connected",
         match connection_type {
@@ -767,6 +830,7 @@ async fn run_remote_session(
             ConnectionType::Direct => "Connected securely over a direct path",
             ConnectionType::Relay => "Connected securely through your server",
         },
+        connection_type,
     );
 
     let mut clipboard = PermissionedClipboard::new(
@@ -810,8 +874,109 @@ async fn run_remote_session(
     loop {
         tokio::select! {
             _ = &mut cancellation => break,
+            direct_result = direct_receiver.recv(), if direct_check_open => {
+                direct_check_open = false;
+                match direct_result {
+                    Some(Ok((direct, candidate_kind))) => {
+                        let nonce: u64 = rand::random();
+                        send_path_control(transport.as_mut(), PathControlMessage::SwitchRequest { nonce }).await?;
+                        let acknowledged = wait_for_path_control(
+                            &app,
+                            transport.as_mut(),
+                            PathControlMessage::SwitchAck { nonce },
+                            session_id,
+                            &inbound_cipher,
+                            &mut expected_inbound_sequence,
+                            &mut clipboard,
+                            &mut video_decoder,
+                            &remote_file_sender,
+                        ).await?;
+                        if acknowledged {
+                            send_path_control(
+                                transport.as_mut(),
+                                PathControlMessage::SwitchCommit { nonce },
+                            ).await?;
+                            let committed = wait_for_path_control(
+                                &app,
+                                transport.as_mut(),
+                                PathControlMessage::SwitchCommitted { nonce },
+                                session_id,
+                                &inbound_cipher,
+                                &mut expected_inbound_sequence,
+                                &mut clipboard,
+                                &mut video_decoder,
+                                &remote_file_sender,
+                            ).await?;
+                            if committed {
+                                record_connection_milestone(&app, |timing, elapsed| timing.direct_established_ms = Some(elapsed));
+                                transport = Box::new(direct);
+                                connection_type = match candidate_kind {
+                                    ConnectivityCandidateKind::Host => ConnectionType::Lan,
+                                    ConnectivityCandidateKind::ServerReflexive
+                                    | ConnectivityCandidateKind::ConfiguredPublic => ConnectionType::Direct,
+                                };
+                                emit_connection_status(
+                                    &app,
+                                    "connected",
+                                    "Connected securely over a direct path",
+                                    connection_type,
+                                );
+                            }
+                        }
+                    }
+                    Some(Err(error)) => warn!(event = "direct_connection_failed", %session_id, %error),
+                    None => {}
+                }
+            }
             result = transport.receive() => {
-                let relay_message = decode_wire::<RelayServerMessage>(&result?)?;
+                let incoming = match result {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        warn!(event = "session_transport_interrupted", %error);
+                        transport = Box::new(reconnect_relay_controller(
+                            &app,
+                            &endpoint,
+                            relay_address,
+                            &resolved.server_name,
+                            session_id,
+                            recovery_token.clone(),
+                            resolved.recovery_expires_at_ms,
+                            &mut cancellation,
+                        ).await?);
+                        connection_type = ConnectionType::Relay;
+                        emit_connection_status(
+                            &app,
+                            "connected",
+                            "Connection recovered through Relay",
+                            connection_type,
+                        );
+                        continue;
+                    }
+                };
+                let relay_message = decode_wire::<RelayServerMessage>(&incoming)?;
+                if let RelayServerMessage::SessionClosed { reason } = relay_message {
+                    if !is_recoverable_close(reason) {
+                        anyhow::bail!("relay session closed: {reason:?}");
+                    }
+                    transport = Box::new(reconnect_relay_controller(
+                        &app,
+                        &endpoint,
+                        relay_address,
+                        &resolved.server_name,
+                        session_id,
+                        recovery_token.clone(),
+                        resolved.recovery_expires_at_ms,
+                        &mut cancellation,
+                    ).await?);
+                    connection_type = ConnectionType::Relay;
+                    emit_connection_status(
+                        &app,
+                        "connected",
+                        "Connection recovered through Relay",
+                        connection_type,
+                    );
+                    continue;
+                }
                 let outcome = handle_relay_message(
                     &app,
                     transport.as_mut(),
@@ -827,9 +992,23 @@ async fn run_remote_session(
                         .try_send(message)
                         .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
                 }
-                if let Some(feedback) = outcome.video_feedback {
+                if let Some(mut feedback) = outcome.video_feedback {
                     let current_ms = now_ms()?;
                     if current_ms.saturating_sub(last_video_feedback_ms) >= 1_000 {
+                        if let Some(metrics) = transport.metrics() {
+                            feedback.rtt_ms = DiagnosticValue::Available {
+                                value: u32::try_from(metrics.rtt.as_millis()).unwrap_or(u32::MAX),
+                                provenance: MetricProvenance::Measured,
+                            };
+                            feedback.packet_loss_per_mille = DiagnosticValue::Available {
+                                value: packet_loss_per_mille(
+                                    metrics.lost_packets,
+                                    metrics.sent_packets,
+                                ),
+                                provenance: MetricProvenance::Measured,
+                            };
+                        }
+                        emit_connection_metrics(&app, feedback);
                         send_controller_message(
                             transport.as_mut(),
                             session_id,
@@ -900,6 +1079,72 @@ async fn run_remote_session(
     Ok(())
 }
 
+const fn is_recoverable_close(reason: remotex_protocol::SessionCloseReason) -> bool {
+    matches!(
+        reason,
+        remotex_protocol::SessionCloseReason::PeerDisconnected
+            | remotex_protocol::SessionCloseReason::HeartbeatTimeout
+            | remotex_protocol::SessionCloseReason::SlowConsumer
+            | remotex_protocol::SessionCloseReason::RelayShutdown
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_relay_controller(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    relay_address: SocketAddr,
+    server_name: &str,
+    session_id: SessionId,
+    recovery_token: SessionToken,
+    recovery_expires_at_ms: u64,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<QuicFrameConnection> {
+    for attempt in 0..remotex_transport::MAX_RECONNECT_ATTEMPTS {
+        if now_ms()? >= recovery_expires_at_ms {
+            anyhow::bail!("Session recovery credential expired");
+        }
+        emit_status(app, "reconnecting", "Reconnecting securely…");
+        let delay =
+            reconnect_delay(attempt, rand::random()).context("reconnect attempts exhausted")?;
+        tokio::select! {
+            _ = &mut *cancellation => anyhow::bail!("Disconnected by user"),
+            () = tokio::time::sleep(delay) => {}
+        }
+        let attempt_result = async {
+            let connection = endpoint
+                .connect(relay_address, server_name)
+                .context("create recovery Relay connection")?
+                .await
+                .context("connect recovery Relay")?;
+            let (send, receive) = connection
+                .open_bi()
+                .await
+                .context("open recovery Relay stream")?;
+            let mut transport = QuicFrameConnection::with_connection(
+                connection,
+                send,
+                receive,
+                DEFAULT_MAX_FRAME_SIZE,
+            );
+            let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::recovery(
+                session_id,
+                Role::Controller,
+                recovery_token.clone(),
+            ));
+            transport.send(Bytes::from(encode_wire(&hello)?)).await?;
+            wait_for_peer(app, &mut transport).await?;
+            Ok::<_, anyhow::Error>(transport)
+        }
+        .await;
+        match attempt_result {
+            Ok(transport) => return Ok(transport),
+            Err(error) => warn!(event = "session_reconnect_attempt_failed", attempt, %error),
+        }
+    }
+    anyhow::bail!("Secure reconnection attempts exhausted")
+}
+
 async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSession> {
     let requested_permissions = SessionPermissions {
         view_desktop: true,
@@ -916,6 +1161,8 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
             server_name: request.server_name.clone(),
             session_id: request.session_id.clone(),
             token_hex: request.token_hex.clone(),
+            recovery_token_hex: request.token_hex.clone(),
+            recovery_expires_at_ms: 0,
             end_to_end_key_hex: request.end_to_end_key_hex.clone(),
             permissions: requested_permissions,
             peer_candidates: Vec::new(),
@@ -927,11 +1174,10 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
     if controller_name.is_empty() {
         anyhow::bail!("controller name is required when using the control server");
     }
-    let url = format!(
-        "{}/api/sessions",
-        request.control_server_url.trim().trim_end_matches('/')
-    );
-    let response = reqwest::Client::new()
+    let control_url = remotex_control_client::normalize_control_url(&request.control_server_url);
+    let url = format!("{control_url}/api/sessions");
+    let response = server_config::control_client(&control_url, Duration::from_secs(15))
+        .context("build control client")?
         .post(url)
         .json(&CreateSessionRequest {
             device_id,
@@ -954,10 +1200,70 @@ async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSes
         server_name: response.relay_server_name,
         session_id: response.session_id.to_string(),
         token_hex: response.role_token_hex,
+        recovery_token_hex: response.recovery_token_hex,
+        recovery_expires_at_ms: response.recovery_expires_at_ms,
         end_to_end_key_hex: response.end_to_end_key_hex,
         permissions: response.permissions,
         peer_candidates: response.peer_candidates,
     })
+}
+
+async fn send_path_control(
+    transport: &mut dyn Connection,
+    message: PathControlMessage,
+) -> anyhow::Result<()> {
+    transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::PathControl(
+            message,
+        ))?))
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_path_control(
+    app: &AppHandle,
+    transport: &mut dyn Connection,
+    expected: PathControlMessage,
+    session_id: SessionId,
+    inbound_cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    video_decoder: &mut StreamDecoder,
+    remote_file_sender: &mpsc::Sender<FileTransferMessage>,
+) -> anyhow::Result<bool> {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
+            match message {
+                RelayServerMessage::PathControl(message) if message == expected => return Ok(true),
+                RelayServerMessage::PathControl(_) => {}
+                message => {
+                    let outcome = handle_relay_message(
+                        app,
+                        transport,
+                        message,
+                        session_id,
+                        inbound_cipher,
+                        expected_sequence,
+                        clipboard,
+                        video_decoder,
+                    )
+                    .await?;
+                    if let Some(file_message) = outcome.file_message {
+                        remote_file_sender
+                            .try_send(file_message)
+                            .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -990,7 +1296,8 @@ async fn handle_relay_message(
         }
         RelayServerMessage::HeartbeatAck { .. }
         | RelayServerMessage::WaitingForPeer { .. }
-        | RelayServerMessage::PeerReady => Ok(AgentMessageOutcome::default()),
+        | RelayServerMessage::PeerReady
+        | RelayServerMessage::PathControl(_) => Ok(AgentMessageOutcome::default()),
         RelayServerMessage::SessionClosed { reason } => {
             anyhow::bail!("relay session closed: {reason:?}");
         }
@@ -1108,6 +1415,11 @@ fn emit_video_frame(
     frame: &EncodedVideoFrame,
     decoder: &mut StreamDecoder,
 ) -> anyhow::Result<VideoFeedback> {
+    record_connection_milestone(app, |timing, elapsed| {
+        if timing.first_frame_ms.is_none() {
+            timing.first_frame_ms = Some(elapsed);
+        }
+    });
     let decoded_frame = decoder.decode_frame(frame)?;
     let decode_latency_ms = decoded_frame.decode_latency_ms;
     let frame_budget_ms = 1_000 / frame.frames_per_second.max(1);
@@ -1122,7 +1434,6 @@ fn emit_video_frame(
         VideoCodec::Jpeg => "JPEG",
         VideoCodec::WebP => "WebP",
     };
-    let end_to_end_latency_ms = now_ms()?.saturating_sub(frame.source_timestamp_ms);
     let mut event = VideoFrameEvent {
         sequence,
         frame_id: frame.frame_id,
@@ -1134,7 +1445,6 @@ fn emit_video_frame(
         capture_latency_ms: frame.capture_latency_ms,
         encode_latency_ms: frame.encode_latency_ms,
         decode_latency_ms,
-        end_to_end_latency_ms,
         codec,
         key_frame: frame.key_frame,
         mime_type: "application/x-remotex-rgba",
@@ -1153,13 +1463,103 @@ fn emit_video_frame(
         event.data = STANDARD.encode(decoded_frame.rgba);
         app.emit("video-frame", event)?;
     }
+    let render_feedback = *app
+        .state::<VideoIpc>()
+        .render_feedback
+        .lock()
+        .map_err(|_| anyhow::anyhow!("video render feedback lock is unavailable"))?;
     Ok(VideoFeedback {
-        rtt_ms: 0,
-        packet_loss_per_mille: 0,
-        send_queue_percent: queue_percent,
-        decoder_latency_ms: decode_latency_ms,
-        render_latency_ms: 0,
+        rtt_ms: DiagnosticValue::Unavailable,
+        packet_loss_per_mille: DiagnosticValue::Unavailable,
+        send_queue_percent: DiagnosticValue::Available {
+            value: queue_percent,
+            provenance: MetricProvenance::Estimated,
+        },
+        decoder_latency_ms: DiagnosticValue::Available {
+            value: decode_latency_ms,
+            provenance: MetricProvenance::Measured,
+        },
+        render_latency_ms: render_feedback.render_latency_ms.map_or(
+            DiagnosticValue::Unavailable,
+            |value| DiagnosticValue::Available {
+                value,
+                provenance: MetricProvenance::Measured,
+            },
+        ),
+        dropped_frames_per_mille: render_feedback.dropped_frames_per_mille.map_or(
+            DiagnosticValue::Unavailable,
+            |value| DiagnosticValue::Available {
+                value,
+                provenance: MetricProvenance::Measured,
+            },
+        ),
     })
+}
+
+fn reset_connection_timing(app: &AppHandle) -> anyhow::Result<()> {
+    *app.state::<VideoIpc>()
+        .connection_timing
+        .lock()
+        .map_err(|_| anyhow::anyhow!("connection timing lock is unavailable"))? =
+        Some(ConnectionTiming {
+            started: Instant::now(),
+            authorization_ms: None,
+            relay_ready_ms: None,
+            first_frame_ms: None,
+            direct_attempt_ms: None,
+            direct_established_ms: None,
+        });
+    Ok(())
+}
+
+fn record_connection_milestone(app: &AppHandle, update: impl FnOnce(&mut ConnectionTiming, u64)) {
+    let video_ipc = app.state::<VideoIpc>();
+    let Ok(mut timing) = video_ipc.connection_timing.lock() else {
+        return;
+    };
+    let Some(timing) = timing.as_mut() else {
+        return;
+    };
+    let elapsed = u64::try_from(timing.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    update(timing, elapsed);
+    let _result = app.emit(
+        "connection-performance",
+        ConnectionPerformanceEvent {
+            authorization_ms: timing.authorization_ms,
+            relay_ready_ms: timing.relay_ready_ms,
+            first_frame_ms: timing.first_frame_ms,
+            direct_attempt_ms: timing.direct_attempt_ms,
+            direct_established_ms: timing.direct_established_ms,
+        },
+    );
+}
+
+fn packet_loss_per_mille(lost_packets: u64, sent_packets: u64) -> u16 {
+    if sent_packets == 0 {
+        return 0;
+    }
+    let per_mille = lost_packets.saturating_mul(1_000) / sent_packets;
+    u16::try_from(per_mille.min(1_000)).unwrap_or(1_000)
+}
+
+fn emit_connection_metrics(app: &AppHandle, feedback: VideoFeedback) {
+    fn value<T: Copy>(metric: DiagnosticValue<T>) -> Option<(T, MetricProvenance)> {
+        match metric {
+            DiagnosticValue::Available { value, provenance } => Some((value, provenance)),
+            DiagnosticValue::Unavailable => None,
+        }
+    }
+    let queue = value(feedback.send_queue_percent);
+    let _result = app.emit(
+        "connection-metrics",
+        ConnectionMetricsEvent {
+            rtt_ms: value(feedback.rtt_ms).map(|metric| metric.0),
+            packet_loss_per_mille: value(feedback.packet_loss_per_mille).map(|metric| metric.0),
+            send_queue_percent: queue.map(|metric| metric.0),
+            send_queue_estimated: queue
+                .is_some_and(|metric| metric.1 == MetricProvenance::Estimated),
+        },
+    );
 }
 
 fn encode_video_packet(event: &VideoFrameEvent, rgba: &[u8]) -> Vec<u8> {
@@ -1177,7 +1577,9 @@ fn encode_video_packet(event: &VideoFrameEvent, rgba: &[u8]) -> Vec<u8> {
     packet.extend_from_slice(&event.sequence.to_le_bytes());
     packet.extend_from_slice(&event.frame_id.to_le_bytes());
     packet.extend_from_slice(&event.source_timestamp_ms.to_le_bytes());
-    packet.extend_from_slice(&event.end_to_end_latency_ms.to_le_bytes());
+    // Reserved for a future clock-calibrated frame-age measurement. Cross-host
+    // wall-clock subtraction is not a defensible latency metric.
+    packet.extend_from_slice(&0_u64.to_le_bytes());
     packet.extend_from_slice(&event.width.to_le_bytes());
     packet.extend_from_slice(&event.height.to_le_bytes());
     packet.extend_from_slice(&event.frames_per_second.to_le_bytes());
@@ -1658,6 +2060,9 @@ async fn wait_for_peer(app: &AppHandle, transport: &mut QuicFrameConnection) -> 
                     .await?;
             }
             RelayServerMessage::HeartbeatAck { .. } => {}
+            RelayServerMessage::PathControl(_) => {
+                anyhow::bail!("relay delivered path control before PeerReady");
+            }
             RelayServerMessage::SessionClosed { reason } => {
                 anyhow::bail!("relay session closed before pairing: {reason:?}");
             }
@@ -1694,6 +2099,20 @@ fn client_endpoint(certificate_path: &Path) -> anyhow::Result<Endpoint> {
     Ok(endpoint)
 }
 
+async fn resolve_relay_address(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Some(address) = remotex_control_client::known_relay_address(value) {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    tokio::net::lookup_host(value)
+        .await
+        .with_context(|| format!("resolve relay address {value}"))?
+        .find(SocketAddr::is_ipv4)
+        .with_context(|| format!("relay address {value} did not resolve to IPv4"))
+}
+
 fn parse_token(value: &str) -> anyhow::Result<SessionToken> {
     let decoded = hex::decode(value).context("decode 64-character token hex")?;
     let bytes: [u8; 32] = decoded
@@ -1722,6 +2141,29 @@ fn emit_status(app: &AppHandle, state: &'static str, message: &str) {
         StatusEvent {
             state,
             message: message.to_owned(),
+            path: None,
+            transport: None,
+        },
+    );
+}
+
+fn emit_connection_status(
+    app: &AppHandle,
+    state: &'static str,
+    message: &str,
+    connection_type: ConnectionType,
+) {
+    let path = match connection_type {
+        ConnectionType::Lan | ConnectionType::Direct => "direct",
+        ConnectionType::Relay => "relay",
+    };
+    let _result = app.emit(
+        "connection-status",
+        StatusEvent {
+            state,
+            message: message.to_owned(),
+            path: Some(path),
+            transport: Some("quic"),
         },
     );
 }
@@ -1879,6 +2321,9 @@ fn main() {
         .manage(VideoIpc::default())
         .manage(agent_management::AgentRuntime::default())
         .setup(|app| {
+            if let Err(error) = taskbar_icon::configure(app.handle()) {
+                warn!(event = "taskbar_icon_setup_failed", %error);
+            }
             setup_tray(app)?;
             if std::env::args().any(|argument| argument == "--background")
                 && let Some(window) = app.get_webview_window("main")
@@ -1915,14 +2360,18 @@ fn main() {
             close_terminal,
             request_system_info,
             subscribe_video,
+            report_video_render_metrics,
             agent_management::load_agent_settings,
             agent_management::save_agent_settings,
+            agent_management::reveal_access_password,
+            agent_management::update_access_password,
             agent_management::start_agent,
             agent_management::stop_agent,
             agent_management::agent_status,
             server_config::load_server_config,
             server_config::save_server_config,
             server_config::check_server_connection,
+            server_config::check_control_server_connection,
             server_config::reset_first_run
         ])
         .run(tauri::generate_context!())

@@ -35,7 +35,12 @@ const ZH_CN: Record<string, string> = {
   "Self-hosted coordination keeps session data under your control.": "自托管协调服务让会话数据始终由您掌控。", "Adaptive remote video balances quality and latency.": "自适应远程视频兼顾画质与延迟。", "Desktop, file, clipboard, and server tools in one app.": "集成桌面、文件、剪贴板与服务器工具。", "Reliable": "安全可靠", "Signed updates and explicit authorization protect every connection.": "签名更新和明确授权保护每一次连接。",
   "Copy device ID": "复制设备 ID", "Refresh files": "刷新文件", "Settings categories": "设置分类", "Remote desktop": "远程桌面", "Remote desktop video": "远程桌面视频", "Software update available": "有可用的软件更新",
   "Waiting for the first frame": "正在等待首帧画面", "Session ended": "会话已结束", "Return Home to connect again.": "返回主页以重新连接。",
-  "Diagnostics": "诊断", "Performance diagnostics": "性能诊断", "Connection": "连接", "Rendered": "渲染", "Frames": "帧", "Decode": "解码", "End to end": "端到端", "Received / rendered / dropped. No session content is logged.": "已接收 / 已渲染 / 已丢弃。不会记录会话内容。",
+  "Diagnostics": "诊断", "Performance diagnostics": "性能诊断", "Connection": "连接", "Transport": "传输协议", "P2P Direct": "P2P 直连", "Relay": "服务器中继", "Negotiating": "正在协商", "Rendered": "渲染", "Frames": "帧", "Decode": "解码", "End to end": "端到端", "Received / rendered / dropped. No session content is logged.": "已接收 / 已渲染 / 已丢弃。不会记录会话内容。",
+  "Connection quality": "连接质量", "Excellent": "优秀", "Good": "良好", "Fair": "一般", "Poor": "较差", "Measuring": "测量中",
+  "Video profile": "视频模式", "Auto · adaptive": "自动 · 自适应", "Quality · up to 30 FPS": "画质 · 最高 30 FPS", "Low bandwidth · up to 10 FPS": "低带宽 · 最高 10 FPS", "Auto adapts quality to current network conditions.": "自动模式会根据当前网络状况调整画质。",
+  "Bitrate": "码率", "RTT": "往返延迟", "Packet loss": "丢包率", "Send queue": "发送队列", "Capture": "采集", "Encode": "编码", "Render": "渲染", "Frame age": "画面帧龄",
+  "Public endpoint discovery": "公网端点发现", "STUN address": "STUN 地址", "Optional numeric IP:port": "可选的数字 IP:端口", "Advanced self-hosted UDP mapping discovery. Relay remains available if discovery fails.": "高级自托管 UDP 映射发现；发现失败时仍会使用服务器中继。",
+  "Reconnecting securely…": "正在安全地重新连接…", "Connection recovered through Relay": "已通过服务器中继恢复连接", "Connected securely through your server": "已通过您的服务器安全连接", "Connected securely over a direct path": "已通过 P2P 直连安全连接", "Connected securely over the local network": "已通过本地网络安全连接",
 };
 
 function translateText(value: string): string {
@@ -54,7 +59,7 @@ function localizeDocument(language: AppLanguage): () => void {
   const apply = (root: Node) => {
     const elements = root instanceof Element ? [root, ...root.querySelectorAll("*")] : root instanceof Document ? [...root.querySelectorAll("*")] : [];
     for (const element of elements) {
-      if (element.closest(".terminal")) continue;
+      if (element.closest(".terminal, [data-private]")) continue;
       for (const attribute of attributes) {
         const current = element.getAttribute(attribute);
         if (current === null) continue;
@@ -71,7 +76,7 @@ function localizeDocument(language: AppLanguage): () => void {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let node = walker.nextNode() as Text | null;
     while (node) {
-      if (!node.parentElement?.closest(".terminal, style, script") && node.data.trim()) {
+      if (!node.parentElement?.closest(".terminal, [data-private], style, script") && node.data.trim()) {
         if (!originalText.has(node)) originalText.set(node, node.data);
         let source = originalText.get(node) ?? node.data;
         const sourceTrimmed = source.trim();

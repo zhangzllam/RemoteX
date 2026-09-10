@@ -65,8 +65,8 @@ services:
       REMOTEX_DATABASE_URL_FILE: /run/secrets/database_url
       REMOTEX_RELAY_BIND: 0.0.0.0:7443
       REMOTEX_RELAY_HEALTH_BIND: 0.0.0.0:8081
-      REMOTEX_RELAY_CERT_FILE: /run/secrets/relay_certificate
-      REMOTEX_RELAY_KEY_FILE: /run/secrets/relay_private_key
+      REMOTEX_RELAY_CERT: /run/secrets/relay_certificate
+      REMOTEX_RELAY_KEY: /run/secrets/relay_private_key
     secrets:
       - database_url
       - relay_certificate

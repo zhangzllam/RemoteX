@@ -9,7 +9,6 @@ export type VideoFrame = {
   captureLatencyMs: number;
   encodeLatencyMs: number;
   decodeLatencyMs: number;
-  endToEndLatencyMs: number;
   codec: string;
   keyFrame: boolean;
   mimeType: string;
@@ -22,17 +21,29 @@ export type VideoStats = {
   rendered: number;
   dropped: number;
   renderFps: number;
+  bitrateBps: number;
+  captureLatencyMs: number;
+  encodeLatencyMs: number;
   decodeLatencyMs: number;
-  endToEndLatencyMs: number;
+  renderLatencyMs: number | null;
+  frameAgeMs: number | null;
   width: number;
   height: number;
   codec: string;
+};
+
+export type ConnectionMetrics = {
+  rttMs: number | null;
+  packetLossPerMille: number | null;
+  sendQueuePercent: number | null;
+  sendQueueEstimated: boolean;
 };
 
 export type ServerConfig = {
   controlServerUrl: string;
   relayAddress: string;
   relayServerName: string;
+  stunAddress: string;
   caCertificatePath: string;
   configured: boolean;
 };
@@ -69,7 +80,7 @@ export type AgentSettings = {
   unattendedSecret: string;
   secretConfigured: boolean;
   startWithWindows: boolean;
-  videoQuality: "low" | "balanced" | "high";
+  videoQuality: "auto" | "quality" | "balanced" | "lowBandwidth";
 };
 
 export type AgentRuntimeStatus = {
@@ -85,8 +96,10 @@ export const emptyServerConfig: ServerConfig = {
   controlServerUrl: "",
   relayAddress: "",
   relayServerName: "",
+  stunAddress: "",
   caCertificatePath: "",
   configured: false,
 };
 
 export const VIDEO_STATS_EVENT = "remotex-video-stats";
+export const CONNECTION_METRICS_EVENT = "connection-metrics";

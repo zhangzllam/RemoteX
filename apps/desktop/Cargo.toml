@@ -12,7 +12,9 @@ base64.workspace = true
 bytes.workspace = true
 hex.workspace = true
 quinn.workspace = true
+rand.workspace = true
 reqwest.workspace = true
+remotex-control-client.workspace = true
 remotex-clipboard.workspace = true
 remotex-crypto.workspace = true
 remotex-file-transfer.workspace = true
@@ -37,6 +39,10 @@ tracing.workspace = true
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }
 
 [build-dependencies]

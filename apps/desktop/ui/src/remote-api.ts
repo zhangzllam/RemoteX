@@ -15,6 +15,12 @@ export type LegacyControllerConfig = {
 };
 
 export const remoteXApi = {
+  revealAccessPassword(): Promise<string | null> {
+    return invoke("reveal_access_password");
+  },
+  updateAccessPassword(password: string | null): Promise<void> {
+    return invoke("update_access_password", { password });
+  },
   loadServerConfig(legacyController: LegacyControllerConfig): Promise<ServerConfigState> {
     return invoke("load_server_config", { legacyController });
   },
@@ -23,6 +29,9 @@ export const remoteXApi = {
   },
   checkServerConnection(config: ServerConfig): Promise<ServerCheckResult> {
     return invoke("check_server_connection", { config });
+  },
+  checkControlServerConnection(config: ServerConfig): Promise<ServerCheckResult> {
+    return invoke("check_control_server_connection", { config });
   },
   resetFirstRun(): Promise<ServerConfigState> {
     return invoke("reset_first_run");
@@ -43,4 +52,3 @@ export const remoteXApi = {
     return invoke("stop_agent");
   },
 };
-

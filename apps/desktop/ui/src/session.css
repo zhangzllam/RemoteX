@@ -43,3 +43,11 @@
 .diagnostics-overlay small { color: var(--text-tertiary); }
 .diagnostics-overlay dl { display: grid; gap: var(--space-2); margin: var(--space-3) 0; }
 .diagnostics-overlay dd { margin: 0; font-family: var(--font-mono); }
+.connection-path-pill { min-height: 30px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid var(--border-subtle); border-radius: 999px; color: var(--text-secondary); background: var(--surface-raised); font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+.connection-path-pill:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+.connection-path-pill:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.connection-path-pill > i { width: 7px; height: 7px; border-radius: 50%; background: var(--status-warning); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-warning) 14%, transparent); }
+.connection-path-pill.path-direct > i { background: var(--status-success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-success) 14%, transparent); }
+.connection-path-pill.path-relay > i { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.connection-path-pill.quality-fair > i { background: var(--status-warning); }
+.connection-path-pill.quality-poor > i { background: var(--status-danger); }

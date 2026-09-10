@@ -16,11 +16,35 @@ The target system has four deployable roles:
   session authorization, permissions, and audit records.
 - **Relay server (`servers/relay`)** pairs authenticated session peers and
   forwards opaque encrypted frames without interpreting their contents.
+- **STUN endpoint discovery** is an optional standards-compliant UDP mapping
+  observation service. It sees a binding request and public UDP mapping only;
+  it never authorizes a Session and receives no RemoteX E2EE payload.
 
 The control plane and data plane stay separate. HTTPS control-plane
 traffic creates and authorizes a session. Remote desktop, input, clipboard, and
 file-transfer data later travel through QUIC, either directly after authenticated
 candidate negotiation or through the relay fallback.
+
+## v1.3 path and recovery architecture
+
+Relay rendezvous becomes usable before Direct checks finish. The Agent gathers
+Host, short-lived ServerReflexive, and optional ConfiguredPublic candidates from
+the same persistent UDP socket used by Direct QUIC. Control associates the
+bounded candidate set with signed Agent presence and releases it only to the
+authorized Session. Candidate addresses are routing hints, never credentials.
+
+The typed path state is `Negotiating -> RelayConnected -> DirectChecking ->
+DirectConnected`, with explicit `RelayFallback`, `Reconnecting`, and `Failed`
+states. A successful initial Relay-to-Direct upgrade uses request, acknowledge,
+commit, and committed barriers. The final Agent-to-Controller barrier ensures
+all earlier Agent Relay payloads are consumed before Direct becomes active.
+
+Transient Direct or Relay failure reconnects through Relay with five bounded,
+jittered attempts and a separate short-lived recovery credential. The live
+XChaCha cipher and direction sequence counters are preserved. Exact sequence
+validation intentionally terminates recovery if an in-flight ordered payload
+was lost; RemoteX prefers a clear failure over file/input corruption. A recovered
+Relay session does not yet run another Direct upgrade in v1.3.
 
 ## Workspace modules
 

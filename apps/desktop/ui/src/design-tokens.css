@@ -1,18 +1,18 @@
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
   --font-mono: "Cascadia Mono", Consolas, "Liberation Mono", monospace;
   --font-size-caption: 11px;
-  --font-size-body: 13px;
+  --font-size-body: 14px;
   --font-size-heading: 22px;
   --line-body: 1.42;
 
-  --canvas: #0f1218;
-  --canvas-raised: #121722;
-  --sidebar: #121720;
-  --surface: #181e29;
-  --surface-raised: #1e2634;
+  --canvas: #101216;
+  --canvas-raised: #14171c;
+  --sidebar: #111419;
+  --surface: #1b1f26;
+  --surface-raised: #232831;
   --surface-hover: #252e3e;
   --surface-pressed: #2c3749;
   --field: #151b25;
@@ -22,8 +22,8 @@
   --separator: rgb(255 255 255 / 8.5%);
   --separator-strong: rgb(255 255 255 / 15%);
 
-  --accent: #0a84ff;
-  --accent-hover: #248fff;
+  --accent: #246ae8;
+  --accent-hover: #205fcc;
   --accent-soft: rgb(10 132 255 / 12%);
   --accent-strong: #3c9cff;
   --indigo: #7c6cff;
@@ -59,7 +59,8 @@
   --ambient-purple: rgb(111 63 209 / 9%);
   --hero-art: #26334d;
   --hero-art-strong: #41639e;
-  --card-shadow: 0 12px 32px rgb(0 0 0 / 15%);
+  --card-shadow: 0 2px 5px rgb(0 0 0 / 8%), 0 12px 28px rgb(0 0 0 / 7%);
+  --surface-highlight: rgb(255 255 255 / 4%);
   --shell-shadow: 0 18px 60px rgb(0 0 0 / 20%);
 
   --bg-canvas: var(--canvas);
@@ -96,9 +97,9 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --canvas: #e9edf4;
-  --canvas-raised: #f7f9fc;
-  --sidebar: #f5f7fb;
+  --canvas: #eef0f4;
+  --canvas-raised: #f5f6f8;
+  --sidebar: #eef0f4;
   --surface: #ffffff;
   --surface-raised: #f0f3f8;
   --surface-hover: #e8edf5;
@@ -109,8 +110,8 @@
   --text-tertiary: #778394;
   --separator: rgb(25 43 65 / 10%);
   --separator-strong: rgb(25 43 65 / 17%);
-  --accent: #087cf0;
-  --accent-hover: #006ddd;
+  --accent: #205ed5;
+  --accent-hover: #194fb8;
   --accent-soft: rgb(8 124 240 / 10%);
   --accent-strong: #006edc;
   --indigo: #6658dc;
@@ -149,6 +150,7 @@
   --glass: rgb(255 255 255 / 92%);
   --shadow-card: none;
   --shadow-popover: 0 16px 40px rgb(47 65 88 / 18%);
-  --card-shadow: 0 10px 28px rgb(47 65 88 / 8%);
+  --card-shadow: 0 2px 4px rgb(30 44 66 / 3%), 0 10px 24px rgb(30 44 66 / 4%);
+  --surface-highlight: rgb(255 255 255 / 70%);
   --shell-shadow: 0 18px 60px rgb(47 65 88 / 12%);
 }

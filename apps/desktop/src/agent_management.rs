@@ -2,6 +2,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -33,18 +34,21 @@ const MAX_SETTINGS_SIZE: u64 = 64 * 1024;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VideoQuality {
-    Low,
     #[default]
+    Auto,
+    #[serde(alias = "high")]
+    Quality,
     Balanced,
-    High,
+    #[serde(alias = "low")]
+    LowBandwidth,
 }
 
 impl VideoQuality {
     const fn frames_per_second(self) -> u32 {
         match self {
-            Self::Low => 10,
+            Self::Auto | Self::Quality => 30,
             Self::Balanced => 20,
-            Self::High => 30,
+            Self::LowBandwidth => 10,
         }
     }
 }
@@ -74,7 +78,7 @@ impl Default for AgentSettings {
     fn default() -> Self {
         Self {
             remote_access_enabled: false,
-            server_url: "https://control.example.com".to_owned(),
+            server_url: crate::server_config::DEFAULT_CONTROL_SERVER_URL.to_owned(),
             device_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".to_owned()),
             ca_certificate_path: String::new(),
             allow_input: false,
@@ -86,7 +90,7 @@ impl Default for AgentSettings {
             unattended_secret: String::new(),
             secret_configured: false,
             start_with_windows: false,
-            video_quality: VideoQuality::Balanced,
+            video_quality: VideoQuality::Auto,
         }
     }
 }
@@ -144,26 +148,106 @@ pub fn load_agent_settings(app: AppHandle) -> Result<AgentSettings, String> {
 #[tauri::command]
 pub fn save_agent_settings(app: AppHandle, mut settings: AgentSettings) -> Result<(), String> {
     let existing = read_settings(&app)?;
+    ensure_access_password(
+        &mut settings,
+        existing.unattended_secret_protected.is_some(),
+    )?;
     validate_settings(&settings, existing.unattended_secret_protected.is_some())?;
-    let protected = if settings.unattended_access {
-        if settings.unattended_secret.is_empty() {
-            existing.unattended_secret_protected
-        } else {
-            Some(protect_secret(&settings.unattended_secret)?)
-        }
+    let protected = if settings.unattended_secret.is_empty() {
+        existing.unattended_secret_protected
     } else {
-        None
+        Some(protect_secret(&settings.unattended_secret)?)
     };
     settings.unattended_secret.clear();
     settings.secret_configured = protected.is_some();
+    let runtime = app.state::<AgentRuntime>();
+    let was_running = runtime
+        .child
+        .lock()
+        .map_err(|_| "Agent process lock is unavailable".to_owned())?
+        .is_some();
+    if was_running && settings.remote_access_enabled && read_status_file(&app)?.session_id.is_some()
+    {
+        return Err(
+            "Disconnect the active incoming session before changing access settings.".to_owned(),
+        );
+    }
     configure_startup(&app, settings.start_with_windows)?;
-    write_settings(
+    if was_running {
+        stop_agent_inner(&runtime)?;
+    }
+    let keep_running = was_running && settings.remote_access_enabled;
+    let result = write_settings(
         &app,
         &StoredAgentSettings {
             public: settings,
             unattended_secret_protected: protected,
         },
-    )
+    );
+    if result.is_err() {
+        if was_running {
+            let _restart = start_agent_inner(&app, &runtime);
+        }
+        return result;
+    }
+    if keep_running {
+        start_agent_inner(&app, &runtime)?;
+    }
+    Ok(())
+}
+
+fn validate_access_password(password: &str) -> Result<(), String> {
+    if !(12..=128).contains(&password.len()) || password.chars().any(char::is_control) {
+        return Err(
+            "Use a connection password of 12 to 128 bytes without control characters.".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn random_access_password() -> Result<String, String> {
+    // 16 independent base-32 characters = 80 bits from the OS CSPRNG.
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| "Could not securely generate a connection password.".to_owned())?;
+    Ok(bytes
+        .iter()
+        .map(|byte| char::from(ALPHABET[usize::from(byte & 31)]))
+        .collect())
+}
+
+fn ensure_access_password(
+    settings: &mut AgentSettings,
+    existing_secret: bool,
+) -> Result<(), String> {
+    if settings.remote_access_enabled && !existing_secret && settings.unattended_secret.is_empty() {
+        settings.unattended_secret = random_access_password()?;
+        settings.unattended_access = true;
+    }
+    if !settings.unattended_secret.is_empty() {
+        validate_access_password(&settings.unattended_secret)?;
+    }
+    Ok(())
+}
+
+/// Only an explicit local reveal/copy action returns plaintext to the `WebView`.
+#[tauri::command]
+pub fn reveal_access_password(app: AppHandle) -> Result<Option<String>, String> {
+    read_settings(&app)?
+        .unattended_secret_protected
+        .as_deref()
+        .map(unprotect_secret)
+        .transpose()
+}
+
+#[tauri::command]
+pub fn update_access_password(app: AppHandle, password: Option<String>) -> Result<(), String> {
+    let mut settings = load_agent_settings(app.clone())?;
+    settings.unattended_secret = password.map_or_else(random_access_password, Ok)?;
+    validate_access_password(&settings.unattended_secret)?;
+    save_agent_settings(app, settings)
 }
 
 #[tauri::command]
@@ -346,6 +430,13 @@ fn agent_environment(
             settings.video_quality.frames_per_second().to_string(),
         ),
         (
+            "REMOTEX_VIDEO_PROFILE".to_owned(),
+            serde_json::to_value(settings.video_quality)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "auto".to_owned()),
+        ),
+        (
             "REMOTEX_ALLOW_INPUT".to_owned(),
             settings.allow_input.to_string(),
         ),
@@ -367,6 +458,13 @@ fn agent_environment(
             settings.unattended_access.to_string(),
         ),
     ]);
+    if let Some(stun_address) = unified
+        .as_ref()
+        .map(|config| config.stun_address.trim())
+        .filter(|address| !address.is_empty())
+    {
+        environment.insert("REMOTEX_STUN_ADDRESS".to_owned(), stun_address.to_owned());
+    }
     if let Some(secret) = stored.unattended_secret_protected.as_deref() {
         environment.insert(
             "REMOTEX_UNATTENDED_SECRET".to_owned(),
@@ -401,6 +499,9 @@ pub(super) fn sync_server_fields(
 }
 
 fn validate_settings(settings: &AgentSettings, existing_secret: bool) -> Result<(), String> {
+    if !settings.unattended_secret.is_empty() {
+        validate_access_password(&settings.unattended_secret)?;
+    }
     if !settings.remote_access_enabled {
         return Ok(());
     }
@@ -449,15 +550,41 @@ fn validate_settings(settings: &AgentSettings, existing_secret: bool) -> Result<
 
 fn configure_startup(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let manager = app.autolaunch();
-    if enabled {
-        manager
-            .enable()
-            .map_err(|error| format!("enable Start with Windows: {error}"))
-    } else {
-        manager
-            .disable()
-            .map_err(|error| format!("disable Start with Windows: {error}"))
+    configure_startup_with(
+        enabled,
+        || {
+            manager
+                .is_enabled()
+                .map_err(|error| format!("read Windows startup setting: {error}"))
+        },
+        |enabled| {
+            if enabled {
+                manager
+                    .enable()
+                    .map_err(|error| format!("enable Start with Windows: {error}"))
+            } else {
+                manager
+                    .disable()
+                    .map_err(|error| format!("disable Start with Windows: {error}"))
+            }
+        },
+    )
+}
+
+fn configure_startup_with(
+    enabled: bool,
+    read_enabled: impl FnOnce() -> Result<bool, String>,
+    write_enabled: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    // auto-launch deletes the Windows Run value unconditionally. A fresh
+    // installation has no value to delete: saving unrelated Agent settings
+    // must not fail just because Start with Windows is already disabled.
+    if !enabled && !read_enabled()? {
+        return Ok(());
     }
+    // Keep enable() even when already enabled, so the executable path is
+    // refreshed after moving/upgrading an installation. Do not swallow errors.
+    write_enabled(enabled)
 }
 
 fn data_directory(app: &AppHandle) -> Result<PathBuf, String> {
@@ -608,6 +735,121 @@ fn unprotect_secret(_protected: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_activation_creates_a_password_without_changing_permissions() {
+        let mut settings = AgentSettings {
+            remote_access_enabled: true,
+            ..AgentSettings::default()
+        };
+        ensure_access_password(&mut settings, false).unwrap();
+        assert!(settings.unattended_access);
+        assert_eq!(settings.unattended_secret.len(), 16);
+        assert!(!settings.allow_input && !settings.allow_file_upload && !settings.allow_clipboard);
+        assert!(
+            !serde_json::to_string(&settings)
+                .unwrap()
+                .contains(&settings.unattended_secret)
+        );
+    }
+
+    #[test]
+    fn existing_password_and_approval_only_choice_are_preserved() {
+        let mut settings = AgentSettings {
+            remote_access_enabled: true,
+            ..AgentSettings::default()
+        };
+        ensure_access_password(&mut settings, true).unwrap();
+        assert!(!settings.unattended_access);
+        assert!(settings.unattended_secret.is_empty());
+        let mut disabled = AgentSettings::default();
+        ensure_access_password(&mut disabled, false).unwrap();
+        assert!(disabled.unattended_secret.is_empty());
+    }
+
+    #[test]
+    fn generated_passwords_are_readable_and_custom_passwords_are_validated() {
+        let values = (0..128)
+            .map(|_| random_access_password().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(values.len(), 128);
+        for value in values {
+            assert_eq!(value.len(), 16);
+            validate_access_password(&value).unwrap();
+        }
+        assert!(validate_access_password("correct horse battery").is_ok());
+        assert!(validate_access_password("short").is_err());
+        assert!(validate_access_password("correct\npassword").is_err());
+        assert!(validate_access_password(&"a".repeat(129)).is_err());
+        assert!(validate_access_password(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn saving_with_startup_already_disabled_does_not_delete_a_missing_entry() {
+        for _ in 0..3 {
+            assert!(
+                configure_startup_with(
+                    false,
+                    || Ok(false),
+                    |_| panic!("must not delete an absent startup entry"),
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_enabled_startup_writes_the_requested_state() {
+        let mut written = None;
+        configure_startup_with(
+            false,
+            || Ok(true),
+            |enabled| {
+                written = Some(enabled);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(written, Some(false));
+    }
+
+    #[test]
+    fn enabling_startup_refreshes_the_entry() {
+        let mut written = None;
+        configure_startup_with(
+            true,
+            || panic!("enable does not need a read"),
+            |enabled| {
+                written = Some(enabled);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(written, Some(true));
+    }
+
+    #[test]
+    fn startup_read_and_write_failures_are_not_hidden() {
+        let error = "access denied";
+        assert_eq!(
+            configure_startup_with(false, || Err(error.to_owned()), |_| panic!("read failed")),
+            Err(error.to_owned()),
+        );
+        for enabled in [false, true] {
+            assert_eq!(
+                configure_startup_with(enabled, || Ok(true), |_| Err(error.to_owned())),
+                Err(error.to_owned()),
+            );
+        }
+    }
+
+    #[test]
+    fn new_install_uses_the_managed_control_server_by_default() {
+        assert_eq!(
+            AgentSettings::default().server_url,
+            crate::server_config::DEFAULT_CONTROL_SERVER_URL
+        );
+    }
 
     #[test]
     fn disabled_agent_does_not_require_server_settings() {

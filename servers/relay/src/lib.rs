@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use quinn::{Endpoint, RecvStream, SendStream};
 use remotex_protocol::{
     ClientHello, MAX_RELAY_HANDSHAKE_SIZE, PROTOCOL_VERSION, RelayClientMessage,
-    RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason, SessionId, SessionToken,
-    decode_wire, encode_wire,
+    RelayCredentialKind, RelayProtocolErrorCode, RelayServerMessage, Role, SessionCloseReason,
+    SessionId, SessionToken, decode_wire, encode_wire,
 };
 use remotex_transport::{TransportError, read_frame, write_frame};
 use sha2::{Digest, Sha256};
@@ -33,6 +33,9 @@ struct RoleGrant {
     token: SessionToken,
     expires_at_ms: u64,
     consumed: bool,
+    recovery_token: Option<SessionToken>,
+    recovery_expires_at_ms: u64,
+    recovery_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,10 +96,41 @@ impl InMemorySessionAuthenticator {
             token,
             expires_at_ms,
             consumed: false,
+            recovery_token: None,
+            recovery_expires_at_ms: 0,
+            recovery_enabled: false,
         });
         match role {
             Role::Controller => session.controller = grant,
             Role::Agent => session.agent = grant,
+        }
+    }
+
+    pub async fn grant_recovery(
+        &self,
+        session_id: SessionId,
+        role: Role,
+        token: SessionToken,
+        expires_at_ms: u64,
+    ) -> Result<(), AuthenticationError> {
+        let mut sessions = self.sessions.lock().await;
+        let credential = sessions
+            .get_mut(&session_id)
+            .and_then(|session| session.credential_mut(role))
+            .ok_or(AuthenticationError::UnknownSession)?;
+        credential.recovery_token = Some(token);
+        credential.recovery_expires_at_ms = expires_at_ms;
+        credential.recovery_enabled = true;
+        Ok(())
+    }
+
+    pub async fn revoke_recovery(&self, session_id: SessionId) {
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            for role in [Role::Controller, Role::Agent] {
+                if let Some(credential) = session.credential_mut(role) {
+                    credential.recovery_enabled = false;
+                }
+            }
         }
     }
 }
@@ -111,30 +145,52 @@ impl SessionAuthenticator for InMemorySessionAuthenticator {
         if hello.version != PROTOCOL_VERSION {
             return Err(AuthenticationError::UnsupportedVersion(hello.version));
         }
-
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&hello.session_id)
             .ok_or(AuthenticationError::UnknownSession)?;
         if session
             .opposite_credential(hello.role)
-            .is_some_and(|grant| bool::from(grant.token.as_bytes().ct_eq(hello.token.as_bytes())))
+            .is_some_and(|grant| {
+                let token = match hello.credential_kind {
+                    RelayCredentialKind::Initial => Some(&grant.token),
+                    RelayCredentialKind::Recovery => grant.recovery_token.as_ref(),
+                };
+                token
+                    .is_some_and(|token| bool::from(token.as_bytes().ct_eq(hello.token.as_bytes())))
+            })
         {
             return Err(AuthenticationError::RoleMismatch);
         }
         let credential = session
             .credential_mut(hello.role)
             .ok_or(AuthenticationError::InvalidToken)?;
-        if now_ms > credential.expires_at_ms {
-            return Err(AuthenticationError::ExpiredSession);
+        match hello.credential_kind {
+            RelayCredentialKind::Initial => {
+                if now_ms > credential.expires_at_ms {
+                    return Err(AuthenticationError::ExpiredSession);
+                }
+                if !bool::from(credential.token.as_bytes().ct_eq(hello.token.as_bytes())) {
+                    return Err(AuthenticationError::InvalidToken);
+                }
+                if credential.consumed {
+                    return Err(AuthenticationError::TokenAlreadyUsed);
+                }
+                credential.consumed = true;
+            }
+            RelayCredentialKind::Recovery => {
+                if !credential.recovery_enabled || now_ms > credential.recovery_expires_at_ms {
+                    return Err(AuthenticationError::ExpiredSession);
+                }
+                let expected = credential
+                    .recovery_token
+                    .as_ref()
+                    .ok_or(AuthenticationError::InvalidToken)?;
+                if !bool::from(expected.as_bytes().ct_eq(hello.token.as_bytes())) {
+                    return Err(AuthenticationError::InvalidToken);
+                }
+            }
         }
-        if !bool::from(credential.token.as_bytes().ct_eq(hello.token.as_bytes())) {
-            return Err(AuthenticationError::InvalidToken);
-        }
-        if credential.consumed {
-            return Err(AuthenticationError::TokenAlreadyUsed);
-        }
-        credential.consumed = true;
         Ok(AuthenticatedSession {
             session_id: hello.session_id,
             role: hello.role,
@@ -159,6 +215,7 @@ impl PostgresSessionAuthenticator {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl SessionAuthenticator for PostgresSessionAuthenticator {
     async fn authenticate(
         &self,
@@ -174,7 +231,7 @@ impl SessionAuthenticator for PostgresSessionAuthenticator {
             .await
             .map_err(|_| AuthenticationError::BackendUnavailable)?;
         let row = sqlx::query(
-            "SELECT controller_token_hash, agent_token_hash, controller_consumed, agent_consumed, expires_at_ms FROM sessions WHERE session_id=$1::uuid FOR UPDATE",
+            "SELECT controller_token_hash, agent_token_hash, controller_consumed, agent_consumed, expires_at_ms, controller_recovery_token_hash, agent_recovery_token_hash, recovery_expires_at_ms, authorization_status FROM sessions WHERE session_id=$1::uuid FOR UPDATE",
         )
         .bind(hello.session_id.to_string())
         .fetch_optional(&mut *transaction)
@@ -188,7 +245,7 @@ impl SessionAuthenticator for PostgresSessionAuthenticator {
             .try_get("agent_token_hash")
             .map_err(|_| AuthenticationError::BackendUnavailable)?;
         let presented: [u8; 32] = Sha256::digest(hello.token.as_bytes()).into();
-        let (expected, opposite, consumed, consumed_column) = match hello.role {
+        let (initial_expected, initial_opposite, consumed, consumed_column) = match hello.role {
             Role::Controller => (
                 controller_hash.as_slice(),
                 agent_hash.as_slice(),
@@ -204,30 +261,64 @@ impl SessionAuthenticator for PostgresSessionAuthenticator {
                 "agent_consumed",
             ),
         };
-        if bool::from(opposite.ct_eq(&presented)) {
+        let (expected, opposite, expires_at_ms, one_time) = match hello.credential_kind {
+            RelayCredentialKind::Initial => {
+                let expires_at_ms: i64 = row
+                    .try_get("expires_at_ms")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?;
+                (
+                    initial_expected.to_vec(),
+                    initial_opposite.to_vec(),
+                    expires_at_ms,
+                    true,
+                )
+            }
+            RelayCredentialKind::Recovery => {
+                let status: String = row
+                    .try_get("authorization_status")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?;
+                if status != "accepted" {
+                    return Err(AuthenticationError::InvalidToken);
+                }
+                let controller: Vec<u8> = row
+                    .try_get("controller_recovery_token_hash")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?;
+                let agent: Vec<u8> = row
+                    .try_get("agent_recovery_token_hash")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?;
+                let (expected, opposite) = match hello.role {
+                    Role::Controller => (controller, agent),
+                    Role::Agent => (agent, controller),
+                };
+                let expires_at_ms: i64 = row
+                    .try_get("recovery_expires_at_ms")
+                    .map_err(|_| AuthenticationError::BackendUnavailable)?;
+                (expected, opposite, expires_at_ms, false)
+            }
+        };
+        if bool::from(opposite.as_slice().ct_eq(&presented)) {
             return Err(AuthenticationError::RoleMismatch);
         }
-        if !bool::from(expected.ct_eq(&presented)) {
+        if !bool::from(expected.as_slice().ct_eq(&presented)) {
             return Err(AuthenticationError::InvalidToken);
         }
-        let expires_at_ms: i64 = row
-            .try_get("expires_at_ms")
-            .map_err(|_| AuthenticationError::BackendUnavailable)?;
         let expires_at_ms =
             u64::try_from(expires_at_ms).map_err(|_| AuthenticationError::BackendUnavailable)?;
         if now_ms > expires_at_ms {
             return Err(AuthenticationError::ExpiredSession);
         }
-        if consumed {
+        if one_time && consumed {
             return Err(AuthenticationError::TokenAlreadyUsed);
         }
-        let statement =
-            format!("UPDATE sessions SET {consumed_column}=TRUE WHERE session_id=$1::uuid");
-        sqlx::query(&statement)
-            .bind(hello.session_id.to_string())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        if one_time {
+            let statement =
+                format!("UPDATE sessions SET {consumed_column}=TRUE WHERE session_id=$1::uuid");
+            sqlx::query(&statement)
+                .bind(hello.session_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AuthenticationError::BackendUnavailable)?;
+        }
         transaction
             .commit()
             .await
@@ -309,6 +400,26 @@ struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
 }
 
+#[derive(Default)]
+struct RelayCounters {
+    authentication_failures: AtomicU64,
+    bytes_forwarded: AtomicU64,
+    direct_upgrades: AtomicU64,
+    peer_timeouts: AtomicU64,
+    slow_consumer_disconnects: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RelayMetricsSnapshot {
+    pub active_sessions: u64,
+    pub waiting_sessions: u64,
+    pub authentication_failures: u64,
+    pub bytes_forwarded: u64,
+    pub direct_upgrades: u64,
+    pub peer_timeouts: u64,
+    pub slow_consumer_disconnects: u64,
+}
+
 impl SessionRegistry {
     async fn register(
         &self,
@@ -378,6 +489,29 @@ impl SessionRegistry {
         queue_message(&target, RelayServerMessage::Payload(payload))
     }
 
+    async fn forward_path_control(
+        &self,
+        session_id: SessionId,
+        source_role: Role,
+        message: remotex_protocol::PathControlMessage,
+    ) -> Result<(), RelayError> {
+        let target = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(&session_id)
+                .ok_or(RelayError::SessionNotReady)?;
+            if !session.ready() {
+                return Err(RelayError::SessionNotReady);
+            }
+            session
+                .opposite(source_role)
+                .ok_or(RelayError::SessionNotReady)?
+                .outbound
+                .clone()
+        };
+        queue_message(&target, RelayServerMessage::PathControl(message))
+    }
+
     async fn disconnect(
         &self,
         session_id: SessionId,
@@ -425,6 +559,7 @@ pub struct RelayServer {
     connection_slots: Arc<Semaphore>,
     connection_sequence: Arc<AtomicU64>,
     limits: RelayLimits,
+    counters: Arc<RelayCounters>,
 }
 
 impl RelayServer {
@@ -439,6 +574,7 @@ impl RelayServer {
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
             connection_sequence: Arc::new(AtomicU64::new(1)),
             limits,
+            counters: Arc::new(RelayCounters::default()),
         }
     }
 
@@ -453,6 +589,7 @@ impl RelayServer {
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
             connection_sequence: Arc::new(AtomicU64::new(1)),
             limits,
+            counters: Arc::new(RelayCounters::default()),
         }
     }
 
@@ -467,6 +604,27 @@ impl RelayServer {
 
     pub async fn connected_peer_count(&self) -> usize {
         self.registry.peer_count().await
+    }
+
+    pub async fn metrics_snapshot(&self) -> RelayMetricsSnapshot {
+        let sessions = self.registry.sessions.lock().await;
+        let active_sessions = sessions.values().filter(|session| session.ready()).count() as u64;
+        let waiting_sessions = sessions.len() as u64 - active_sessions;
+        RelayMetricsSnapshot {
+            active_sessions,
+            waiting_sessions,
+            authentication_failures: self
+                .counters
+                .authentication_failures
+                .load(Ordering::Relaxed),
+            bytes_forwarded: self.counters.bytes_forwarded.load(Ordering::Relaxed),
+            direct_upgrades: self.counters.direct_upgrades.load(Ordering::Relaxed),
+            peer_timeouts: self.counters.peer_timeouts.load(Ordering::Relaxed),
+            slow_consumer_disconnects: self
+                .counters
+                .slow_consumer_disconnects
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Accepts connections until `shutdown` resolves and owns all peer tasks.
@@ -515,7 +673,7 @@ impl RelayServer {
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> Result<(), RelayError> {
         let connection = incoming.await?;
         let connection_id = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
-        info!(event = "connection_received", connection_id, remote = %connection.remote_address());
+        info!(event = "connection_received", connection_id);
         let Ok(_permit) = self.connection_slots.clone().try_acquire_owned() else {
             connection.close(1_u32.into(), b"relay connection capacity exceeded");
             return Err(RelayError::CapacityExceeded);
@@ -534,6 +692,9 @@ impl RelayServer {
         let client_message: RelayClientMessage = match decode_wire(&encoded) {
             Ok(message) => message,
             Err(error) => {
+                self.counters
+                    .authentication_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 let relay_error = RelayError::InvalidClientMessage(error.to_string());
                 send_rejection(&mut send, &relay_error).await;
                 connection.close(2_u32.into(), b"invalid relay handshake");
@@ -650,6 +811,17 @@ impl RelayServer {
             )
             .await;
         let peer_reason = peer_notification_reason(&outcome);
+        match peer_reason {
+            SessionCloseReason::HeartbeatTimeout => {
+                self.counters.peer_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            SessionCloseReason::SlowConsumer => {
+                self.counters
+                    .slow_consumer_disconnects
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         self.registry
             .disconnect(
                 authenticated.session_id,
@@ -696,6 +868,7 @@ impl RelayServer {
                     inactivity.as_mut().reset(Instant::now() + self.limits.peer_timeout);
                     match message {
                         RelayClientMessage::Payload(payload) => {
+                            self.counters.bytes_forwarded.fetch_add(payload.len() as u64, Ordering::Relaxed);
                             self.registry
                                 .forward(authenticated.session_id, authenticated.role, payload)
                                 .await?;
@@ -704,6 +877,18 @@ impl RelayServer {
                             queue_message(outbound, RelayServerMessage::HeartbeatAck { nonce })?;
                         }
                         RelayClientMessage::HeartbeatAck { .. } => {}
+                        RelayClientMessage::PathControl(message) => {
+                            if matches!(message, remotex_protocol::PathControlMessage::SwitchCommitted { .. }) {
+                                self.counters.direct_upgrades.fetch_add(1, Ordering::Relaxed);
+                            }
+                            self.registry
+                                .forward_path_control(
+                                    authenticated.session_id,
+                                    authenticated.role,
+                                    message,
+                                )
+                                .await?;
+                        }
                         RelayClientMessage::Close => return Ok(LoopEnd::ClientClosed),
                         RelayClientMessage::ClientHello(_) => {
                             return Err(RelayError::InvalidClientMessage(
@@ -977,5 +1162,85 @@ mod tests {
             authenticator.authenticate(&hello, 100).await,
             Err(AuthenticationError::ExpiredSession)
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_credentials_are_role_bound_expiring_and_revocable() {
+        let authenticator = InMemorySessionAuthenticator::default();
+        let session_id = SessionId::new();
+        let controller_initial = SessionToken::from_bytes([1; 32]);
+        let agent_initial = SessionToken::from_bytes([2; 32]);
+        let controller_recovery = SessionToken::from_bytes([3; 32]);
+        let agent_recovery = SessionToken::from_bytes([4; 32]);
+        authenticator
+            .grant(session_id, Role::Controller, controller_initial, 200)
+            .await;
+        authenticator
+            .grant(session_id, Role::Agent, agent_initial, 200)
+            .await;
+        authenticator
+            .grant_recovery(
+                session_id,
+                Role::Controller,
+                controller_recovery.clone(),
+                500,
+            )
+            .await
+            .expect("grant controller recovery");
+        authenticator
+            .grant_recovery(session_id, Role::Agent, agent_recovery, 500)
+            .await
+            .expect("grant agent recovery");
+
+        let wrong_role =
+            ClientHello::recovery(session_id, Role::Agent, controller_recovery.clone());
+        assert_eq!(
+            authenticator.authenticate(&wrong_role, 300).await,
+            Err(AuthenticationError::RoleMismatch)
+        );
+        let valid =
+            ClientHello::recovery(session_id, Role::Controller, controller_recovery.clone());
+        authenticator
+            .authenticate(&valid, 300)
+            .await
+            .expect("valid recovery credential");
+        assert_eq!(
+            authenticator.authenticate(&valid, 501).await,
+            Err(AuthenticationError::ExpiredSession)
+        );
+
+        authenticator.revoke_recovery(session_id).await;
+        assert_eq!(
+            authenticator.authenticate(&valid, 400).await,
+            Err(AuthenticationError::ExpiredSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_capacity_remains_bounded_for_many_idle_sessions() {
+        let registry = SessionRegistry::default();
+        for index in 0..1_000_u64 {
+            let session_id = SessionId::new();
+            let (outbound, _receiver) = mpsc::channel(1);
+            let (shutdown, _shutdown_receiver) = watch::channel(None);
+            let result = registry
+                .register(
+                    session_id,
+                    Role::Controller,
+                    PeerHandle {
+                        connection_id: index,
+                        outbound,
+                        shutdown,
+                    },
+                    500,
+                )
+                .await;
+            if index < 500 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(RelayError::CapacityExceeded)));
+            }
+        }
+        assert_eq!(registry.session_count().await, 500);
     }
 }

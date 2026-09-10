@@ -15,7 +15,7 @@ use anyhow::Context;
 #[cfg(windows)]
 use bytes::Bytes;
 #[cfg(windows)]
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
 #[cfg(windows)]
 use remotex_capture::{CaptureError, DxgiCapture, MonitorId, MonitorInfo, ScreenCapture};
 #[cfg(windows)]
@@ -37,22 +37,21 @@ use remotex_input::{
 #[cfg(windows)]
 use remotex_protocol::{
     AuthorizationDecision, ClaimAgentSessionRequest, ClaimAgentSessionResponse, ClipboardOrigin,
-    ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind, ControlMessage,
-    DeviceAuthProof, DeviceHeartbeatRequest, DeviceId, DevicePlatform, DeviceRegistrationRequest,
-    DeviceRegistrationResponse, DisplayId, FileTransferDirection, FileTransferErrorCode,
-    FileTransferMessage, IncomingSessionRequest, MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope,
-    RelayClientMessage, RelayServerMessage, ReportSessionEventRequest,
-    ResolveSessionAuthorizationRequest, ResolveSessionAuthorizationResponse, Role,
-    SessionAuditEventKind, SessionCredentials, SessionId, SessionPermissions, SessionToken,
-    TransferId, decode_wire, encode_wire,
+    ConnectionType, ConnectivityCandidate, ControlMessage, DeviceAuthProof, DeviceHeartbeatRequest,
+    DeviceId, DevicePlatform, DeviceRegistrationRequest, DeviceRegistrationResponse, DisplayId,
+    FileTransferDirection, FileTransferErrorCode, FileTransferMessage, IncomingSessionRequest,
+    MAX_FILE_CHUNK_SIZE, Message, MessageEnvelope, PathControlMessage, RelayClientMessage,
+    RelayServerMessage, ReportSessionEventRequest, ResolveSessionAuthorizationRequest,
+    ResolveSessionAuthorizationResponse, Role, SessionAuditEventKind, SessionCredentials,
+    SessionId, SessionPermissions, SessionToken, TransferId, decode_wire, encode_wire,
 };
 #[cfg(windows)]
 use remotex_transport::{
     Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, DirectPeerConnection,
-    QuicFrameConnection, authenticate_direct_server,
+    QuicFrameConnection, authenticate_direct_server, reconnect_delay,
 };
 #[cfg(windows)]
-use remotex_video::SessionVideoEncoder;
+use remotex_video::{SessionVideoEncoder, VideoPerformanceProfile};
 #[cfg(windows)]
 use rustls::RootCertStore;
 #[cfg(windows)]
@@ -68,7 +67,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(windows)]
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 #[cfg(windows)]
 use tokio::time::MissedTickBehavior;
 #[cfg(windows)]
@@ -92,6 +91,7 @@ struct ManagedAgentConfig {
     relay_certificate_path: String,
     device_name: String,
     frames_per_second: u32,
+    video_profile: VideoPerformanceProfile,
     local_permissions: SessionPermissions,
     unattended_access: bool,
     unattended_secret: Option<String>,
@@ -117,6 +117,14 @@ struct DirectServerSettings {
     certificate_path: PathBuf,
     private_key_path: PathBuf,
     candidates: Vec<ConnectivityCandidate>,
+    stun_server: Option<SocketAddr>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct DirectServer {
+    endpoint: Endpoint,
+    candidates: Vec<ConnectivityCandidate>,
 }
 
 #[cfg(windows)]
@@ -127,15 +135,18 @@ struct AgentConfig {
     certificate_path: String,
     session_id: SessionId,
     token: SessionToken,
+    recovery_token: SessionToken,
+    recovery_expires_at_ms: u64,
     end_to_end_key: [u8; 32],
     frames_per_second: u32,
+    video_profile: VideoPerformanceProfile,
     view_permission: bool,
     input_permission: bool,
     clipboard_permission: bool,
     file_upload_permission: bool,
     file_download_permission: bool,
     file_roots: Vec<AllowedRoot>,
-    direct: Option<DirectServerSettings>,
+    prepared_direct: Option<DirectServer>,
 }
 
 #[cfg(windows)]
@@ -157,6 +168,7 @@ struct AgentFileService {
 struct AgentSessionContext<'a> {
     session_id: SessionId,
     frames_per_second: u32,
+    video_profile: VideoPerformanceProfile,
     view_permission: bool,
     outbound_cipher: &'a XChaChaSessionCipher,
     inbound_cipher: &'a XChaChaSessionCipher,
@@ -195,15 +207,18 @@ async fn run_agent_session_with_report(
         certificate_path,
         session_id,
         token,
+        recovery_token,
+        recovery_expires_at_ms,
         end_to_end_key,
         frames_per_second,
+        video_profile,
         view_permission,
         input_permission,
         clipboard_permission,
         file_upload_permission,
         file_download_permission,
         file_roots,
-        direct,
+        prepared_direct,
     } = config;
     let outbound_cipher = XChaChaSessionCipher::new(
         end_to_end_key,
@@ -259,7 +274,8 @@ async fn run_agent_session_with_report(
         .await
         .context("connect to relay")?;
     let (send, receive) = connection.open_bi().await.context("open relay stream")?;
-    let mut relay_transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut relay_transport =
+        QuicFrameConnection::with_connection(connection, send, receive, DEFAULT_MAX_FRAME_SIZE);
     let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
         session_id,
         Role::Agent,
@@ -269,22 +285,16 @@ async fn run_agent_session_with_report(
         .send(Bytes::from(encode_wire(&hello)?))
         .await?;
     wait_for_peer(&mut relay_transport, session_id).await?;
-    let mut direct_endpoint = None;
-    let (mut transport, connection_type): (Box<dyn Connection>, ConnectionType) =
-        if let Some(settings) = direct {
-            match accept_direct_connection(&settings, session_id, &end_to_end_key).await {
-                Ok((endpoint, connection, connection_type)) => {
-                    direct_endpoint = Some(endpoint);
-                    (Box::new(connection), connection_type)
-                }
-                Err(error) => {
-                    warn!(event = "direct_connection_failed", %session_id, %error);
-                    (Box::new(relay_transport), ConnectionType::Relay)
-                }
-            }
-        } else {
-            (Box::new(relay_transport), ConnectionType::Relay)
-        };
+    let (direct_sender, direct_receiver) = mpsc::channel(1);
+    let direct_check_open = prepared_direct.is_some();
+    if let Some(server) = prepared_direct {
+        tokio::spawn(async move {
+            let result = accept_direct_connection(&server, session_id, &end_to_end_key).await;
+            let _result = direct_sender.send(result).await;
+        });
+    }
+    let transport: Box<dyn Connection> = Box::new(relay_transport);
+    let connection_type = ConnectionType::Relay;
     if let Some(report) = connection_report {
         let _result = report.send(connection_type);
     }
@@ -292,7 +302,14 @@ async fn run_agent_session_with_report(
     windows_authorization::set_active_session_title(Some(session_id));
 
     let session_result = run_active_session(
-        transport.as_mut(),
+        transport,
+        direct_receiver,
+        direct_check_open,
+        client_endpoint.clone(),
+        relay_address,
+        server_name.clone(),
+        recovery_token,
+        recovery_expires_at_ms,
         &mut capture,
         &mut input,
         &mut clipboard,
@@ -300,6 +317,7 @@ async fn run_agent_session_with_report(
         AgentSessionContext {
             session_id,
             frames_per_second,
+            video_profile,
             view_permission,
             outbound_cipher: &outbound_cipher,
             inbound_cipher: &inbound_cipher,
@@ -308,29 +326,19 @@ async fn run_agent_session_with_report(
     .await;
     windows_authorization::set_active_session_title(None);
     let release_result = input.release_all();
-    let _result = transport
-        .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
-        .await;
     let capture_result = capture.stop();
-    let close_result = transport.close().await;
     client_endpoint.close(0_u32.into(), b"agent stopped");
-    if let Some(endpoint) = direct_endpoint {
-        endpoint.close(0_u32.into(), b"direct Session stopped");
-    }
     let bytes_transferred = session_result?;
     release_result?;
     capture_result?;
-    close_result?;
     Ok(bytes_transferred)
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
     let identity = Arc::new(load_or_create_identity(&config.identity_path)?);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("build control client")?;
+    let client = managed_control_client(&config.control_url)?;
     let registration = DeviceRegistrationRequest {
         public_key: identity.public_bytes().to_vec(),
         device_name: config.device_name.clone(),
@@ -359,10 +367,15 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
     )?;
 
     let nonce = Arc::new(AtomicU64::new(now_ms()?));
-    let connectivity_candidates = config
+    let direct_server = config
         .direct
         .as_ref()
+        .map(prepare_direct_server)
+        .transpose()?;
+    let connectivity_candidates = direct_server
+        .as_ref()
         .map_or_else(Vec::new, |direct| direct.candidates.clone());
+    let (_candidate_sender, candidate_receiver) = watch::channel(connectivity_candidates);
     let heartbeat_task = tokio::spawn(run_managed_heartbeats(
         client.clone(),
         config.control_url.clone(),
@@ -370,7 +383,7 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
         Arc::clone(&identity),
         Arc::clone(&nonce),
         config.local_permissions,
-        connectivity_candidates,
+        candidate_receiver,
     ));
     loop {
         tokio::select! {
@@ -409,6 +422,7 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
                         &identity,
                         &nonce,
                         incoming,
+                        direct_server.clone(),
                     )
                     .await?;
                 }
@@ -416,6 +430,9 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
         }
     }
     heartbeat_task.abort();
+    if let Some(server) = direct_server {
+        server.endpoint.close(0_u32.into(), b"Agent stopped");
+    }
     write_managed_status(
         config.status_path.as_deref(),
         Some(&device_id),
@@ -426,6 +443,12 @@ async fn run_managed_agent(config: ManagedAgentConfig) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
+fn managed_control_client(control_url: &str) -> anyhow::Result<reqwest::Client> {
+    remotex_control_client::client(control_url, Duration::from_secs(15))
+        .context("build control client")
+}
+
+#[cfg(windows)]
 async fn handle_incoming_session(
     config: &ManagedAgentConfig,
     client: &reqwest::Client,
@@ -433,6 +456,7 @@ async fn handle_incoming_session(
     identity: &Ed25519DeviceIdentity,
     nonce: &AtomicU64,
     incoming: IncomingSessionRequest,
+    direct_server: Option<DirectServer>,
 ) -> anyhow::Result<()> {
     let granted_permissions = incoming
         .requested_permissions
@@ -474,7 +498,7 @@ async fn handle_incoming_session(
     };
     let session_id = credentials.session_id;
     update_managed_status(config, device_id, "connecting", Some(session_id))?;
-    let session = managed_session_config(config, credentials)?;
+    let session = managed_session_config(config, credentials, direct_server).await?;
     let (connection_sender, connection_receiver) = oneshot::channel();
     let session_future = run_agent_session_with_report(session, Some(connection_sender));
     tokio::pin!(session_future);
@@ -531,7 +555,7 @@ async fn run_managed_heartbeats(
     identity: Arc<Ed25519DeviceIdentity>,
     nonce: Arc<AtomicU64>,
     capabilities: SessionPermissions,
-    connectivity_candidates: Vec<ConnectivityCandidate>,
+    connectivity_candidates: watch::Receiver<Vec<ConnectivityCandidate>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -543,7 +567,10 @@ async fn run_managed_heartbeats(
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 platform: DevicePlatform::Windows,
                 capabilities,
-                connectivity_candidates: connectivity_candidates.clone(),
+                connectivity_candidates: heartbeat_candidates(
+                    &connectivity_candidates.borrow(),
+                    now_ms().unwrap_or_default(),
+                ),
             },
             Err(error) => {
                 warn!(event = "heartbeat_sign_failed", %error);
@@ -568,25 +595,42 @@ async fn run_managed_heartbeats(
 }
 
 #[cfg(windows)]
+fn heartbeat_candidates(
+    candidates: &[ConnectivityCandidate],
+    heartbeat_at_ms: u64,
+) -> Vec<ConnectivityCandidate> {
+    candidates
+        .iter()
+        .cloned()
+        .map(|mut candidate| {
+            if candidate.kind == remotex_protocol::ConnectivityCandidateKind::ServerReflexive {
+                candidate.gathered_at_ms = heartbeat_at_ms;
+                candidate.expires_at_ms = Some(heartbeat_at_ms.saturating_add(45_000));
+            }
+            candidate
+        })
+        .collect()
+}
+
+#[cfg(windows)]
 async fn authorize_incoming_session(
     unattended_access: bool,
     unattended_secret: Option<&str>,
     incoming: IncomingSessionRequest,
     granted_permissions: SessionPermissions,
 ) -> anyhow::Result<bool> {
-    if unattended_authorization(
+    if let Some(accepted) = unattended_authorization(
         unattended_access,
         unattended_secret,
         incoming.unattended_secret.as_deref(),
-    )
-    .is_some()
-    {
+    ) {
         info!(
             session_id = %incoming.session_id,
             controller = %incoming.controller_name,
-            "incoming Session accepted by explicitly enabled unattended access"
+            accepted,
+            "incoming Session password authorization resolved"
         );
-        return Ok(true);
+        return Ok(accepted);
     }
     tokio::task::spawn_blocking(move || {
         windows_authorization::confirm_incoming_session(&incoming, granted_permissions)
@@ -601,17 +645,12 @@ fn unattended_authorization(
     configured_secret: Option<&str>,
     presented_secret: Option<&str>,
 ) -> Option<bool> {
-    if enabled
-        && configured_secret
-            .zip(presented_secret)
-            .is_some_and(|(configured, presented)| {
-                secrets_equal(configured.as_bytes(), presented.as_bytes())
-            })
-    {
-        Some(true)
-    } else {
-        None
+    if !enabled {
+        return None;
     }
+    configured_secret
+        .zip(presented_secret)
+        .map(|(configured, presented)| secrets_equal(configured.as_bytes(), presented.as_bytes()))
 }
 
 #[cfg(windows)]
@@ -654,24 +693,25 @@ async fn report_managed_session_event(
 }
 
 #[cfg(windows)]
-fn managed_session_config(
+async fn managed_session_config(
     config: &ManagedAgentConfig,
     credentials: SessionCredentials,
+    prepared_direct: Option<DirectServer>,
 ) -> anyhow::Result<AgentConfig> {
     if credentials.expires_at_ms <= now_ms()? {
         anyhow::bail!("claimed Session credentials have expired");
     }
     Ok(AgentConfig {
-        relay_address: credentials
-            .relay_address
-            .parse()
-            .context("parse managed Relay address")?,
+        relay_address: resolve_relay_address(&credentials.relay_address).await?,
         server_name: credentials.relay_server_name,
         certificate_path: config.relay_certificate_path.clone(),
         session_id: credentials.session_id,
         token: parse_token(&credentials.role_token_hex)?,
+        recovery_token: parse_token(&credentials.recovery_token_hex)?,
+        recovery_expires_at_ms: credentials.recovery_expires_at_ms,
         end_to_end_key: parse_key(&credentials.end_to_end_key_hex)?,
         frames_per_second: config.frames_per_second,
+        video_profile: config.video_profile,
         view_permission: credentials.permissions.view_desktop
             && config.local_permissions.view_desktop,
         input_permission: credentials.permissions.control_input
@@ -683,8 +723,23 @@ fn managed_session_config(
         file_download_permission: credentials.permissions.file_download
             && config.local_permissions.file_download,
         file_roots: config.file_roots.clone(),
-        direct: config.direct.clone(),
+        prepared_direct,
     })
+}
+
+#[cfg(windows)]
+async fn resolve_relay_address(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Some(address) = remotex_control_client::known_relay_address(value) {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    tokio::net::lookup_host(value)
+        .await
+        .with_context(|| format!("resolve managed Relay address {value}"))?
+        .find(SocketAddr::is_ipv4)
+        .with_context(|| format!("managed Relay address {value} did not resolve to IPv4"))
 }
 
 #[cfg(windows)]
@@ -854,15 +909,24 @@ fn update_managed_status(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_active_session(
-    transport: &mut dyn Connection,
+    mut transport: Box<dyn Connection>,
+    mut direct_receiver: mpsc::Receiver<anyhow::Result<(DirectPeerConnection, ConnectionType)>>,
+    mut direct_check_open: bool,
+    relay_endpoint: Endpoint,
+    relay_address: SocketAddr,
+    relay_server_name: String,
+    recovery_token: SessionToken,
+    recovery_expires_at_ms: u64,
     capture: &mut DxgiCapture,
     input: &mut impl InputController,
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
     file_service: AgentFileService,
     context: AgentSessionContext<'_>,
 ) -> anyhow::Result<u64> {
-    let mut codec = SessionVideoEncoder::new(context.frames_per_second)?;
+    let mut codec =
+        SessionVideoEncoder::with_profile(context.frames_per_second, context.video_profile)?;
     let mut outbound_sequence = 0_u64;
     let mut expected_inbound_sequence = 0_u64;
     let mut capture_interval = tokio::time::interval(Duration::from_millis(
@@ -876,6 +940,9 @@ async fn run_active_session(
         mpsc::channel(FILE_RESPONSE_QUEUE_CAPACITY);
     let file_worker = tokio::spawn(file_service.run(file_command_receiver, file_response_sender));
     let mut bytes_transferred = 0_u64;
+    let mut pending_direct: Option<(DirectPeerConnection, ConnectionType)> = None;
+    let mut switch_request = None;
+    let mut acknowledged_switch = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -893,7 +960,7 @@ async fn run_active_session(
                     .unwrap_or(u32::MAX);
                 let video = codec.encode(&frame, capture_latency_ms)?;
                 bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
-                    transport,
+                    transport.as_mut(),
                     context.session_id,
                     context.outbound_cipher,
                     &mut outbound_sequence,
@@ -905,7 +972,7 @@ async fn run_active_session(
                 match clipboard.poll() {
                     Ok(Some(message)) => {
                         bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
-                            transport,
+                            transport.as_mut(),
                             context.session_id,
                             context.outbound_cipher,
                             &mut outbound_sequence,
@@ -922,7 +989,7 @@ async fn run_active_session(
                     anyhow::bail!("file service stopped unexpectedly");
                 };
                 bytes_transferred = bytes_transferred.saturating_add(send_agent_message(
-                    transport,
+                    transport.as_mut(),
                     context.session_id,
                     context.outbound_cipher,
                     &mut outbound_sequence,
@@ -930,14 +997,62 @@ async fn run_active_session(
                     Message::FileTransfer(response),
                 ).await?);
             }
+            direct_result = direct_receiver.recv(), if direct_check_open => {
+                direct_check_open = false;
+                match direct_result {
+                    Some(Ok(direct)) => pending_direct = Some(direct),
+                    Some(Err(error)) => warn!(event = "direct_connection_failed", %error),
+                    None => {}
+                }
+                if let (Some(nonce), Some((direct, connection_type))) =
+                    (switch_request.take(), pending_direct.take())
+                {
+                    send_path_control(transport.as_mut(), PathControlMessage::SwitchAck { nonce }).await?;
+                    pending_direct = Some((direct, connection_type));
+                    acknowledged_switch = Some(nonce);
+                }
+            }
             incoming = transport.receive() => {
-                let incoming = incoming?;
+                let incoming = match incoming {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        warn!(event = "session_transport_interrupted", %error);
+                        transport = Box::new(reconnect_relay_agent(
+                            &relay_endpoint,
+                            relay_address,
+                            &relay_server_name,
+                            context.session_id,
+                            recovery_token.clone(),
+                            recovery_expires_at_ms,
+                        ).await?);
+                        pending_direct = None;
+                        switch_request = None;
+                        acknowledged_switch = None;
+                        info!(event = "connection_path_changed", connection_type = ?ConnectionType::Relay);
+                        continue;
+                    }
+                };
                 bytes_transferred = bytes_transferred.saturating_add(
                     u64::try_from(incoming.len()).unwrap_or(u64::MAX)
                 );
-                handle_relay_message(
-                    transport,
-                    decode_wire(&incoming)?,
+                let decoded = decode_wire(&incoming)?;
+                if let RelayServerMessage::SessionClosed { reason } = decoded {
+                    if !is_recoverable_close(reason) {
+                        anyhow::bail!("relay session closed: {reason:?}");
+                    }
+                    transport = Box::new(reconnect_relay_agent(
+                        &relay_endpoint,
+                        relay_address,
+                        &relay_server_name,
+                        context.session_id,
+                        recovery_token.clone(),
+                        recovery_expires_at_ms,
+                    ).await?);
+                    continue;
+                }
+                let path_control = handle_relay_message(
+                    transport.as_mut(),
+                    decoded,
                     context.session_id,
                     context.inbound_cipher,
                     &mut expected_inbound_sequence,
@@ -946,12 +1061,111 @@ async fn run_active_session(
                     &file_command_sender,
                     &mut codec,
                 ).await?;
+                if let Some(PathControlMessage::SwitchRequest { nonce }) = path_control {
+                    if let Some((direct, connection_type)) = pending_direct.take() {
+                        send_path_control(transport.as_mut(), PathControlMessage::SwitchAck { nonce }).await?;
+                        pending_direct = Some((direct, connection_type));
+                        acknowledged_switch = Some(nonce);
+                    } else {
+                        switch_request = Some(nonce);
+                    }
+                }
+                if let Some(PathControlMessage::SwitchCommit { nonce }) = path_control
+                    && acknowledged_switch == Some(nonce)
+                    && let Some((direct, connection_type)) = pending_direct.take()
+                {
+                    send_path_control(
+                        transport.as_mut(),
+                        PathControlMessage::SwitchCommitted { nonce },
+                    ).await?;
+                    transport = Box::new(direct);
+                    acknowledged_switch = None;
+                    info!(event = "connection_path_changed", ?connection_type);
+                }
             }
         }
     }
+    let _result = transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
+        .await;
+    let _result = transport.close().await;
     drop(file_command_sender);
     file_worker.abort();
     Ok(bytes_transferred)
+}
+
+#[cfg(windows)]
+const fn is_recoverable_close(reason: remotex_protocol::SessionCloseReason) -> bool {
+    matches!(
+        reason,
+        remotex_protocol::SessionCloseReason::PeerDisconnected
+            | remotex_protocol::SessionCloseReason::HeartbeatTimeout
+            | remotex_protocol::SessionCloseReason::SlowConsumer
+            | remotex_protocol::SessionCloseReason::RelayShutdown
+    )
+}
+
+#[cfg(windows)]
+async fn reconnect_relay_agent(
+    endpoint: &Endpoint,
+    relay_address: SocketAddr,
+    server_name: &str,
+    session_id: SessionId,
+    recovery_token: SessionToken,
+    recovery_expires_at_ms: u64,
+) -> anyhow::Result<QuicFrameConnection> {
+    for attempt in 0..remotex_transport::MAX_RECONNECT_ATTEMPTS {
+        if now_ms()? >= recovery_expires_at_ms {
+            anyhow::bail!("Session recovery credential expired");
+        }
+        let delay =
+            reconnect_delay(attempt, rand::random()).context("reconnect attempts exhausted")?;
+        tokio::time::sleep(delay).await;
+        let attempt_result = async {
+            let connection = endpoint
+                .connect(relay_address, server_name)
+                .context("create recovery Relay connection")?
+                .await
+                .context("connect recovery Relay")?;
+            let (send, receive) = connection
+                .open_bi()
+                .await
+                .context("open recovery Relay stream")?;
+            let mut transport = QuicFrameConnection::with_connection(
+                connection,
+                send,
+                receive,
+                DEFAULT_MAX_FRAME_SIZE,
+            );
+            let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::recovery(
+                session_id,
+                Role::Agent,
+                recovery_token.clone(),
+            ));
+            transport.send(Bytes::from(encode_wire(&hello)?)).await?;
+            wait_for_peer(&mut transport, session_id).await?;
+            Ok::<_, anyhow::Error>(transport)
+        }
+        .await;
+        match attempt_result {
+            Ok(transport) => return Ok(transport),
+            Err(error) => warn!(event = "session_reconnect_attempt_failed", attempt, %error),
+        }
+    }
+    anyhow::bail!("Secure reconnection attempts exhausted")
+}
+
+#[cfg(windows)]
+async fn send_path_control(
+    transport: &mut dyn Connection,
+    message: PathControlMessage,
+) -> anyhow::Result<()> {
+    transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::PathControl(
+            message,
+        ))?))
+        .await?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1009,22 +1223,25 @@ fn load_config() -> anyhow::Result<AgentConfig> {
         certificate_path: required("REMOTEX_RELAY_CA_CERT")?,
         session_id,
         token: parse_token(&required("REMOTEX_AGENT_TOKEN_HEX")?)?,
+        recovery_token: parse_token(&required("REMOTEX_AGENT_TOKEN_HEX")?)?,
+        recovery_expires_at_ms: 0,
         end_to_end_key: parse_key(&required("REMOTEX_E2E_KEY_HEX")?)?,
         frames_per_second,
+        video_profile: VideoPerformanceProfile::Auto,
         view_permission: true,
         input_permission: parse_switch("REMOTEX_ALLOW_INPUT", false)?,
         clipboard_permission: parse_switch("REMOTEX_ALLOW_CLIPBOARD", false)?,
         file_upload_permission,
         file_download_permission,
         file_roots,
-        direct: None,
+        prepared_direct: None,
     })
 }
 
 #[cfg(windows)]
 fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
     let control_url = match std::env::var("REMOTEX_CONTROL_URL") {
-        Ok(value) => value.trim_end_matches('/').to_owned(),
+        Ok(value) => remotex_control_client::normalize_control_url(&value),
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(error) => return Err(error).context("read REMOTEX_CONTROL_URL"),
     };
@@ -1038,6 +1255,9 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
     if !(1..=30).contains(&frames_per_second) {
         anyhow::bail!("REMOTEX_VIDEO_FPS must be between 1 and 30");
     }
+    let video_profile = parse_video_profile(
+        &std::env::var("REMOTEX_VIDEO_PROFILE").unwrap_or_else(|_| "auto".to_owned()),
+    )?;
     let local_permissions = SessionPermissions {
         view_desktop: true,
         control_input: parse_switch("REMOTEX_ALLOW_INPUT", false)?,
@@ -1071,6 +1291,7 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         device_name: std::env::var("REMOTEX_DEVICE_NAME")
             .unwrap_or_else(|_| "Windows PC".to_owned()),
         frames_per_second,
+        video_profile,
         local_permissions,
         unattended_access,
         unattended_secret,
@@ -1078,6 +1299,19 @@ fn load_managed_config() -> anyhow::Result<Option<ManagedAgentConfig>> {
         direct,
         status_path: std::env::var_os("REMOTEX_STATUS_PATH").map(PathBuf::from),
     }))
+}
+
+#[cfg(windows)]
+fn parse_video_profile(value: &str) -> anyhow::Result<VideoPerformanceProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(VideoPerformanceProfile::Auto),
+        "quality" | "high" => Ok(VideoPerformanceProfile::Quality),
+        "balanced" => Ok(VideoPerformanceProfile::Balanced),
+        "lowbandwidth" | "low_bandwidth" | "low" => Ok(VideoPerformanceProfile::LowBandwidth),
+        _ => {
+            anyhow::bail!("REMOTEX_VIDEO_PROFILE must be auto, quality, balanced, or lowBandwidth")
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1101,6 +1335,11 @@ fn load_direct_settings() -> anyhow::Result<Option<DirectServerSettings>> {
         anyhow::bail!("REMOTEX_DIRECT_BIND must use a fixed nonzero port");
     }
     let server_name = required("REMOTEX_DIRECT_SERVER_NAME")?;
+    let stun_server = std::env::var("REMOTEX_STUN_ADDRESS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse().context("parse REMOTEX_STUN_ADDRESS"))
+        .transpose()?;
     let mut candidates = Vec::new();
     let lan_address = match std::env::var("REMOTEX_DIRECT_LAN_ADDRESS") {
         Ok(value) => Some(value.parse().context("parse REMOTEX_DIRECT_LAN_ADDRESS")?),
@@ -1108,24 +1347,22 @@ fn load_direct_settings() -> anyhow::Result<Option<DirectServerSettings>> {
         Err(error) => return Err(error).context("read REMOTEX_DIRECT_LAN_ADDRESS"),
     };
     if let Some(address) = lan_address {
-        candidates.push(ConnectivityCandidate {
-            kind: ConnectivityCandidateKind::Lan,
-            address: address.to_string(),
-            server_name: server_name.clone(),
-            priority: 200,
-        });
+        candidates.push(ConnectivityCandidate::host(
+            address.to_string(),
+            server_name.clone(),
+            200,
+        ));
     }
     match std::env::var("REMOTEX_DIRECT_PUBLIC_ADDRESS") {
         Ok(value) => {
             let address: SocketAddr = value
                 .parse()
                 .context("parse REMOTEX_DIRECT_PUBLIC_ADDRESS")?;
-            candidates.push(ConnectivityCandidate {
-                kind: ConnectivityCandidateKind::ServerReflexive,
-                address: address.to_string(),
-                server_name,
-                priority: 100,
-            });
+            candidates.push(ConnectivityCandidate::configured_public(
+                address.to_string(),
+                server_name.clone(),
+                100,
+            ));
         }
         Err(std::env::VarError::NotPresent) => {}
         Err(error) => return Err(error).context("read REMOTEX_DIRECT_PUBLIC_ADDRESS"),
@@ -1143,6 +1380,7 @@ fn load_direct_settings() -> anyhow::Result<Option<DirectServerSettings>> {
         certificate_path: PathBuf::from(certificate),
         private_key_path: PathBuf::from(private_key),
         candidates,
+        stun_server,
     }))
 }
 
@@ -1196,6 +1434,9 @@ async fn wait_for_peer(
                     .await?;
             }
             RelayServerMessage::HeartbeatAck { .. } => {}
+            RelayServerMessage::PathControl(_) => {
+                anyhow::bail!("relay delivered path control before PeerReady");
+            }
             RelayServerMessage::SessionClosed { reason } => {
                 anyhow::bail!("relay session closed before pairing: {reason:?}");
             }
@@ -1221,7 +1462,7 @@ async fn handle_relay_message(
     clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
     file_commands: &mpsc::Sender<FileTransferMessage>,
     video: &mut SessionVideoEncoder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<PathControlMessage>> {
     match message {
         RelayServerMessage::Heartbeat { nonce } => {
             let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
@@ -1232,6 +1473,7 @@ async fn handle_relay_message(
         RelayServerMessage::HeartbeatAck { .. }
         | RelayServerMessage::WaitingForPeer { .. }
         | RelayServerMessage::PeerReady => {}
+        RelayServerMessage::PathControl(message) => return Ok(Some(message)),
         RelayServerMessage::Payload(payload) => {
             if let Some(file_message) = apply_controller_payload(
                 &payload,
@@ -1254,7 +1496,7 @@ async fn handle_relay_message(
             anyhow::bail!("relay protocol error {code:?}: {message}");
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -1731,19 +1973,72 @@ fn client_endpoint(certificate_path: &Path) -> anyhow::Result<Endpoint> {
 }
 
 #[cfg(windows)]
-async fn accept_direct_connection(
-    settings: &DirectServerSettings,
-    session_id: SessionId,
-    session_key: &[u8; 32],
-) -> anyhow::Result<(Endpoint, DirectPeerConnection, ConnectionType)> {
+fn prepare_direct_server(settings: &DirectServerSettings) -> anyhow::Result<DirectServer> {
+    let socket = UdpSocket::bind(settings.bind).context("bind persistent direct UDP socket")?;
+    let mut candidates = settings.candidates.clone();
+    if let Some(stun_server) = settings.stun_server {
+        let mut client = stunclient::StunClient::new(stun_server);
+        client
+            .set_timeout(Duration::from_secs(3))
+            .set_retry_interval(Duration::from_millis(500))
+            .set_software(Some("RemoteX/1.3"));
+        match client.query_external_address(&socket) {
+            Ok(address) => {
+                let gathered_at_ms = now_ms()?;
+                candidates.push(ConnectivityCandidate::server_reflexive(
+                    address.to_string(),
+                    settings
+                        .candidates
+                        .first()
+                        .map_or("localhost", |candidate| candidate.server_name.as_str()),
+                    150,
+                    gathered_at_ms,
+                    gathered_at_ms.saturating_add(120_000),
+                ));
+                info!(
+                    event = "stun_candidate_gathered",
+                    candidate_kind = "server_reflexive"
+                );
+            }
+            Err(error) => warn!(
+                event = "stun_discovery_failed",
+                %error,
+                "Relay remains available"
+            ),
+        }
+    }
+    socket
+        .set_nonblocking(true)
+        .context("set persistent direct UDP socket nonblocking")?;
     let server_config =
         direct_server_config(&settings.certificate_path, &settings.private_key_path)?;
-    let endpoint =
-        Endpoint::server(server_config, settings.bind).context("bind direct endpoint")?;
+    let endpoint = Endpoint::new(
+        EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(TokioRuntime),
+    )
+    .context("create persistent direct QUIC endpoint")?;
+    Ok(DirectServer {
+        endpoint,
+        candidates,
+    })
+}
+
+#[cfg(windows)]
+async fn accept_direct_connection(
+    server: &DirectServer,
+    session_id: SessionId,
+    session_key: &[u8; 32],
+) -> anyhow::Result<(DirectPeerConnection, ConnectionType)> {
     let (connection, remote_address) =
         tokio::time::timeout(DEFAULT_DIRECT_ATTEMPT_TIMEOUT, async {
             for _ in 0..8 {
-                let incoming = endpoint.accept().await.context("direct endpoint closed")?;
+                let incoming = server
+                    .endpoint
+                    .accept()
+                    .await
+                    .context("direct endpoint closed")?;
                 let connection = match incoming.await {
                     Ok(connection) => connection,
                     Err(error) => {
@@ -1759,7 +2054,12 @@ async fn accept_direct_connection(
                         continue;
                     }
                 };
-                let mut framed = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+                let mut framed = QuicFrameConnection::with_connection(
+                    connection,
+                    send,
+                    receive,
+                    DEFAULT_MAX_FRAME_SIZE,
+                );
                 match authenticate_direct_server(&mut framed, session_id, session_key).await {
                     Ok(()) => return Ok((framed, remote_address)),
                     Err(error) => warn!(event = "direct_peer_authentication_failed", %error),
@@ -1774,11 +2074,7 @@ async fn accept_direct_connection(
     } else {
         ConnectionType::Direct
     };
-    Ok((
-        endpoint,
-        DirectPeerConnection::new(connection),
-        connection_type,
-    ))
+    Ok((DirectPeerConnection::new(connection), connection_type))
 }
 
 #[cfg(windows)]
@@ -1949,7 +2245,7 @@ mod tests {
         assert_eq!(unattended_authorization(true, None, None), None);
         assert_eq!(
             unattended_authorization(true, Some("correct secret"), Some("wrong secret")),
-            None
+            Some(false)
         );
         assert_eq!(
             unattended_authorization(true, Some("correct secret"), Some("correct secret")),

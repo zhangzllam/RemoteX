@@ -4,9 +4,12 @@ export type IconName =
   | "home" | "devices" | "files" | "settings" | "about" | "monitor"
   | "copy" | "shield" | "terminal" | "server" | "wifi" | "power"
   | "plus" | "trash" | "folder" | "upload" | "download" | "refresh"
-  | "disconnect" | "chevron" | "check" | "warning" | "sun" | "moon" | "transfer";
+  | "disconnect" | "chevron" | "check" | "warning" | "sun" | "moon" | "transfer" | "eye" | "key" | "edit";
 
 const paths: Record<IconName, ReactNode> = {
+  eye: <><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></>,
+  key: <><circle cx="8" cy="9" r="5"/><path d="m12 13 8 8m-4-4 3-3m-6 0 3-3"/></>,
+  edit: <><path d="m14 4 6 6M4 20l5-1L21 7a2 2 0 0 0-4-4L5 15Z"/></>,
   home: <><path d="m3 10 9-7 9 7"/><path d="M5 9v11h14V9"/><path d="M9 20v-6h6v6"/></>,
   devices: <><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></>,
   files: <><path d="M3 7h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 7V5a2 2 0 0 1 2-2h5l2 2h4"/></>,

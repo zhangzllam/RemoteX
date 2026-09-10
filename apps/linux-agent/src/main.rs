@@ -109,10 +109,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 async fn run(config: Config) -> anyhow::Result<()> {
     let identity = Arc::new(load_or_create_identity(&config.identity_path)?);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("build control client")?;
+    let client = managed_control_client(&config.control_url)?;
     let registration = client
         .post(format!("{}/api/devices/register", config.control_url))
         .json(&DeviceRegistrationRequest {
@@ -153,6 +150,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     heartbeat.abort();
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn managed_control_client(control_url: &str) -> anyhow::Result<reqwest::Client> {
+    remotex_control_client::client(control_url, Duration::from_secs(15))
+        .context("build control client")
 }
 
 #[cfg(target_os = "linux")]
@@ -382,14 +385,27 @@ async fn report_event(
 }
 
 #[cfg(target_os = "linux")]
+async fn resolve_relay_address(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Some(address) = remotex_control_client::known_relay_address(value) {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(value))
+        .await
+        .context("Relay DNS lookup timed out")?
+        .context("resolve Relay address")?
+        .next()
+        .context("Relay DNS lookup returned no addresses")
+}
+
+#[cfg(target_os = "linux")]
 async fn run_session(config: &Config, credentials: SessionCredentials) -> anyhow::Result<u64> {
     if credentials.expires_at_ms <= now_ms()? {
         anyhow::bail!("Linux Session credentials expired");
     }
-    let relay_address: SocketAddr = credentials
-        .relay_address
-        .parse()
-        .context("parse Relay address")?;
+    let relay_address = resolve_relay_address(&credentials.relay_address).await?;
     let session_id = credentials.session_id;
     let session_key = parse_key(&credentials.end_to_end_key_hex)?;
     let outbound_cipher = XChaChaSessionCipher::new(
@@ -409,7 +425,8 @@ async fn run_session(config: &Config, credentials: SessionCredentials) -> anyhow
         .await
         .context("connect to Relay")?;
     let (send, receive) = connection.open_bi().await.context("open Relay stream")?;
-    let mut transport = QuicFrameConnection::new(send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let mut transport =
+        QuicFrameConnection::with_connection(connection, send, receive, DEFAULT_MAX_FRAME_SIZE);
     transport
         .send(Bytes::from(encode_wire(&RelayClientMessage::ClientHello(
             remotex_protocol::ClientHello::new(
@@ -1057,9 +1074,9 @@ fn load_config() -> anyhow::Result<Config> {
         None
     };
     Ok(Config {
-        control_url: required("REMOTEX_CONTROL_URL")?
-            .trim_end_matches('/')
-            .to_owned(),
+        control_url: remotex_control_client::normalize_control_url(&required(
+            "REMOTEX_CONTROL_URL",
+        )?),
         identity_path: PathBuf::from(required("REMOTEX_IDENTITY_PATH")?),
         relay_certificate_path: PathBuf::from(required("REMOTEX_RELAY_CA_CERT")?),
         device_name: std::env::var("REMOTEX_DEVICE_NAME")

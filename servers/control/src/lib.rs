@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 
 pub const DEFAULT_DEVICE_OFFLINE_AFTER_MS: u64 = 45_000;
 pub const DEFAULT_SESSION_LIFETIME_MS: u64 = 5 * 60 * 1_000;
+pub const DEFAULT_RECOVERY_LIFETIME_MS: u64 = 10 * 60 * 1_000;
 pub const DEVICE_AUTH_CLOCK_SKEW_MS: u64 = 60_000;
 pub const MAX_CONTROL_REQUEST_SIZE: usize = 64 * 1024;
 pub const MAX_PENDING_SESSIONS_PER_DEVICE: usize = 32;
@@ -55,10 +56,14 @@ pub struct NewSession {
     pub controller_token_hash: [u8; 32],
     pub agent_token_hash: [u8; 32],
     pub agent_token_wrapped: Vec<u8>,
+    pub controller_recovery_token_hash: [u8; 32],
+    pub agent_recovery_token_hash: [u8; 32],
+    pub agent_recovery_token_wrapped: Vec<u8>,
     pub e2e_key_wrapped: Vec<u8>,
     pub unattended_secret_wrapped: Option<Vec<u8>>,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
+    pub recovery_expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -67,9 +72,11 @@ pub struct ClaimableSession {
     pub controller_name: String,
     pub permissions: SessionPermissions,
     pub agent_token_wrapped: Vec<u8>,
+    pub agent_recovery_token_wrapped: Vec<u8>,
     pub e2e_key_wrapped: Vec<u8>,
     pub unattended_secret_wrapped: Option<Vec<u8>>,
     pub expires_at_ms: u64,
+    pub recovery_expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -185,7 +192,7 @@ impl ControlService {
         request: DeviceHeartbeatRequest,
         now_ms: u64,
     ) -> Result<(), ControlError> {
-        validate_candidates(&request.connectivity_candidates)?;
+        validate_candidates(&request.connectivity_candidates, now_ms)?;
         self.authenticate_device(device_id, "heartbeat", &request.proof, now_ms)
             .await?;
         self.repository.heartbeat(device_id, &request, now_ms).await
@@ -218,9 +225,14 @@ impl ControlService {
         let controller_token: [u8; 32] = rand::random();
         let agent_token: [u8; 32] = rand::random();
         let end_to_end_key: [u8; 32] = rand::random();
+        let controller_recovery_token: [u8; 32] = rand::random();
+        let agent_recovery_token: [u8; 32] = rand::random();
         let session_id = SessionId::new();
         let expires_at_ms = now_ms
             .checked_add(self.config.session_lifetime_ms)
+            .ok_or(ControlError::ClockOverflow)?;
+        let recovery_expires_at_ms = now_ms
+            .checked_add(DEFAULT_RECOVERY_LIFETIME_MS)
             .ok_or(ControlError::ClockOverflow)?;
         let new_session = NewSession {
             session_id,
@@ -230,6 +242,9 @@ impl ControlService {
             controller_token_hash: secret_hash(&controller_token),
             agent_token_hash: secret_hash(&agent_token),
             agent_token_wrapped: self.secrets.seal(&agent_token)?,
+            controller_recovery_token_hash: secret_hash(&controller_recovery_token),
+            agent_recovery_token_hash: secret_hash(&agent_recovery_token),
+            agent_recovery_token_wrapped: self.secrets.seal(&agent_recovery_token)?,
             e2e_key_wrapped: self.secrets.seal(&end_to_end_key)?,
             unattended_secret_wrapped: request
                 .unattended_secret
@@ -238,6 +253,7 @@ impl ControlService {
                 .transpose()?,
             created_at_ms: now_ms,
             expires_at_ms,
+            recovery_expires_at_ms,
         };
         self.repository.create_session(new_session).await?;
         self.repository
@@ -256,6 +272,8 @@ impl ControlService {
             session_id,
             controller_token,
             end_to_end_key,
+            controller_recovery_token,
+            recovery_expires_at_ms,
             expires_at_ms,
             permissions,
             device.record.connectivity_candidates,
@@ -335,10 +353,14 @@ impl ControlService {
         let credentials = if let Some(permissions) = granted_permissions {
             let agent_token = fixed_secret(self.secrets.open(&resolved.agent_token_wrapped)?)?;
             let e2e_key = fixed_secret(self.secrets.open(&resolved.e2e_key_wrapped)?)?;
+            let recovery_token =
+                fixed_secret(self.secrets.open(&resolved.agent_recovery_token_wrapped)?)?;
             Some(self.credentials(
                 session_id,
                 agent_token,
                 e2e_key,
+                recovery_token,
+                resolved.recovery_expires_at_ms,
                 resolved.expires_at_ms,
                 permissions,
                 Vec::new(),
@@ -418,11 +440,14 @@ impl ControlService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn credentials(
         &self,
         session_id: SessionId,
         role_token: [u8; 32],
         end_to_end_key: [u8; 32],
+        recovery_token: [u8; 32],
+        recovery_expires_at_ms: u64,
         expires_at_ms: u64,
         permissions: SessionPermissions,
         peer_candidates: Vec<remotex_protocol::ConnectivityCandidate>,
@@ -433,6 +458,8 @@ impl ControlService {
             relay_server_name: self.config.relay_server_name.clone(),
             role_token_hex: hex::encode(role_token),
             end_to_end_key_hex: hex::encode(end_to_end_key),
+            recovery_token_hex: hex::encode(recovery_token),
+            recovery_expires_at_ms,
             expires_at_ms,
             permissions,
             peer_candidates,
@@ -811,7 +838,7 @@ impl ControlRepository for PostgresRepository {
         {
             return Err(ControlError::TooManySessions);
         }
-        sqlx::query("INSERT INTO sessions (session_id, device_id, controller_name, permissions_json, controller_token_hash, agent_token_hash, agent_token_wrapped, e2e_key_wrapped, created_at_ms, expires_at_ms, unattended_secret_wrapped) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+        sqlx::query("INSERT INTO sessions (session_id, device_id, controller_name, permissions_json, controller_token_hash, agent_token_hash, agent_token_wrapped, e2e_key_wrapped, created_at_ms, expires_at_ms, unattended_secret_wrapped, controller_recovery_token_hash, agent_recovery_token_hash, agent_recovery_token_wrapped, recovery_expires_at_ms) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)")
             .bind(session.session_id.to_string())
             .bind(session.device_id.as_str())
             .bind(session.controller_name)
@@ -823,6 +850,10 @@ impl ControlRepository for PostgresRepository {
             .bind(i64_value(session.created_at_ms)?)
             .bind(i64_value(session.expires_at_ms)?)
             .bind(session.unattended_secret_wrapped)
+            .bind(session.controller_recovery_token_hash.as_slice())
+            .bind(session.agent_recovery_token_hash.as_slice())
+            .bind(session.agent_recovery_token_wrapped)
+            .bind(i64_value(session.recovery_expires_at_ms)?)
             .execute(&mut *transaction)
             .await
             .map_err(|_| ControlError::Persistence)?;
@@ -838,7 +869,7 @@ impl ControlRepository for PostgresRepository {
         device_id: &DeviceId,
         now_ms: u64,
     ) -> Result<Option<ClaimableSession>, ControlError> {
-        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped FROM sessions WHERE device_id=$1 AND authorization_status='pending' AND expires_at_ms >= $2 ORDER BY created_at_ms LIMIT 1")
+        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped, agent_recovery_token_wrapped, recovery_expires_at_ms FROM sessions WHERE device_id=$1 AND authorization_status='pending' AND expires_at_ms >= $2 ORDER BY created_at_ms LIMIT 1")
             .bind(device_id.as_str())
             .bind(i64_value(now_ms)?)
             .fetch_optional(&self.pool)
@@ -859,7 +890,7 @@ impl ControlRepository for PostgresRepository {
             .begin()
             .await
             .map_err(|_| ControlError::Persistence)?;
-        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped FROM sessions WHERE session_id=$1::uuid AND device_id=$2 AND authorization_status='pending' AND expires_at_ms >= $3 FOR UPDATE")
+        let row = sqlx::query("SELECT session_id::text, controller_name, permissions_json, agent_token_wrapped, e2e_key_wrapped, expires_at_ms, unattended_secret_wrapped, agent_recovery_token_wrapped, recovery_expires_at_ms FROM sessions WHERE session_id=$1::uuid AND device_id=$2 AND authorization_status='pending' AND expires_at_ms >= $3 FOR UPDATE")
             .bind(session_id.to_string())
             .bind(device_id.as_str())
             .bind(i64_value(now_ms)?)
@@ -964,6 +995,8 @@ fn claimable_session_from_row(
         e2e_key_wrapped: row.try_get(4).map_err(|_| ControlError::Persistence)?,
         expires_at_ms: u64_value(row.try_get(5).map_err(|_| ControlError::Persistence)?)?,
         unattended_secret_wrapped: row.try_get(6).map_err(|_| ControlError::Persistence)?,
+        agent_recovery_token_wrapped: row.try_get(7).map_err(|_| ControlError::Persistence)?,
+        recovery_expires_at_ms: u64_value(row.try_get(8).map_err(|_| ControlError::Persistence)?)?,
     })
 }
 
@@ -1177,8 +1210,10 @@ impl ControlRepository for MemoryRepository {
             controller_name: entry.session.controller_name.clone(),
             permissions: entry.session.permissions,
             agent_token_wrapped: entry.session.agent_token_wrapped.clone(),
+            agent_recovery_token_wrapped: entry.session.agent_recovery_token_wrapped.clone(),
             e2e_key_wrapped: entry.session.e2e_key_wrapped.clone(),
             expires_at_ms: entry.session.expires_at_ms,
+            recovery_expires_at_ms: entry.session.recovery_expires_at_ms,
             unattended_secret_wrapped: entry.session.unattended_secret_wrapped.clone(),
         }))
     }
@@ -1209,8 +1244,10 @@ impl ControlRepository for MemoryRepository {
             controller_name: entry.session.controller_name.clone(),
             permissions: granted_permissions.unwrap_or_default(),
             agent_token_wrapped: entry.session.agent_token_wrapped.clone(),
+            agent_recovery_token_wrapped: entry.session.agent_recovery_token_wrapped.clone(),
             e2e_key_wrapped: entry.session.e2e_key_wrapped.clone(),
             expires_at_ms: entry.session.expires_at_ms,
+            recovery_expires_at_ms: entry.session.recovery_expires_at_ms,
             unattended_secret_wrapped: entry.session.unattended_secret_wrapped.clone(),
         }))
     }
@@ -1267,11 +1304,12 @@ fn validate_name(name: &str) -> Result<(), ControlError> {
 
 fn validate_candidates(
     candidates: &[remotex_protocol::ConnectivityCandidate],
+    now_ms: u64,
 ) -> Result<(), ControlError> {
     if candidates.len() > remotex_protocol::MAX_CONNECTIVITY_CANDIDATES
         || candidates
             .iter()
-            .any(|candidate| candidate.validate().is_err())
+            .any(|candidate| candidate.validate_at(now_ms).is_err())
     {
         return Err(ControlError::InvalidCandidate);
     }
@@ -1475,12 +1513,11 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_candidates_are_validated_and_issued_to_controller() {
         let (service, identity, device_id) = enrolled().await;
-        let candidate = remotex_protocol::ConnectivityCandidate {
-            kind: remotex_protocol::ConnectivityCandidateKind::Lan,
-            address: "192.168.1.20:7444".to_owned(),
-            server_name: "direct.example.test".to_owned(),
-            priority: 200,
-        };
+        let candidate = remotex_protocol::ConnectivityCandidate::host(
+            "192.168.1.20:7444",
+            "direct.example.test",
+            200,
+        );
         service
             .heartbeat(
                 &device_id,

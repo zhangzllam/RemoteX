@@ -1,0 +1,22 @@
+[Unit]
+Description=RemoteX Linux Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remotex
+Group=remotex
+EnvironmentFile=/etc/remotex/agent.env
+ExecStart=/usr/local/bin/remotex-linux-agent
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/remotex /srv/remotex
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

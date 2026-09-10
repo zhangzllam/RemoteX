@@ -1,0 +1,14 @@
+changelog:
+  exclude:
+    labels: [skip-changelog]
+  categories:
+    - title: Highlights
+      labels: [highlight]
+    - title: Performance and reliability
+      labels: [performance, reliability]
+    - title: User interface
+      labels: [ui, ux]
+    - title: Security
+      labels: [security]
+    - title: Other changes
+      labels: ['*']

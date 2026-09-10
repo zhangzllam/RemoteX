@@ -1,0 +1,42 @@
+[package]
+name = "remotex-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+hex.workspace = true
+quinn.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+remotex-control-client.workspace = true
+remotex-capture.workspace = true
+remotex-clipboard.workspace = true
+remotex-crypto.workspace = true
+remotex-file-transfer.workspace = true
+remotex-input.workspace = true
+remotex-protocol.workspace = true
+remotex-transport.workspace = true
+remotex-video.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+stunclient.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+/target/
+*.log
+.env
+.idea/
+.vscode/
+node_modules/
+dist/
+/apps/desktop/gen/

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/ui/pnpm-lock.yaml
+      - name: Install desktop UI dependencies
+        run: pnpm --dir apps/desktop/ui install --frozen-lockfile
+      - name: Build desktop UI
+        run: pnpm --dir apps/desktop/ui build
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-features
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Audit production UI dependencies
+        run: pnpm --dir apps/desktop/ui audit --prod
+
+  linux:
+    name: Linux Agent and server images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint Linux Agent
+        run: cargo clippy -p remotex-linux-agent --all-targets --all-features -- -D warnings
+      - name: Test Linux PTY and system capabilities
+        run: cargo test -p remotex-linux-agent --all-features
+      - name: Build production server containers
+        run: |
+          docker build --target control --tag remotex-control:ci .
+          docker build --target relay --tag remotex-relay:ci .

@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validation:
+    name: Validate source and signed tag
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify signed annotated tag
+        shell: bash
+        env:
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_SIGNING_PUBLIC_KEY"
+          printf '%s' "$RELEASE_SIGNING_PUBLIC_KEY" | gpg --batch --import
+          tag_ref="refs/tags/${GITHUB_REF_NAME}"
+          git fetch --force origin "${tag_ref}:${tag_ref}"
+          test "$(git cat-file -t "${tag_ref}")" = tag
+          git verify-tag "${tag_ref}"
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/ui/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/desktop/ui install --frozen-lockfile
+      - name: Check version consistency
+        shell: powershell
+        run: ./scripts/validate-release.ps1
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-features
+      - name: Build desktop frontend
+        run: pnpm --dir apps/desktop/ui build
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    env:
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/ui/pnpm-lock.yaml
+      - name: Import optional Authenticode certificate
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: powershell
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "remotex-code-signing.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          "REMOTEX_WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $timestampUrl = if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { "https://timestamp.sectigo.com" }
+          "REMOTEX_WINDOWS_TIMESTAMP_URL=$timestampUrl" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          Remove-Item -LiteralPath $certificatePath -Force
+      - name: Build NSIS installer
+        shell: powershell
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: ./packaging/windows/build-installer.ps1
+      - name: Create installer checksum
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem target/release/bundle/nsis/RemoteX_*_x64-setup.exe -File
+          if ($installer.Count -ne 1) { throw "Expected exactly one RemoteX installer" }
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -Encoding ascii "$($installer.FullName).sha256"
+      - name: Validate versioned artifacts
+        shell: powershell
+        run: ./scripts/validate-release.ps1 -Artifacts
+      - name: Verify optional Authenticode signature
+        if: env.REMOTEX_WINDOWS_CERTIFICATE_THUMBPRINT != ''
+        shell: powershell
+        run: |
+          Get-AuthenticodeSignature target/release/bundle/nsis/RemoteX_*_x64-setup.exe |
+            Where-Object Status -ne Valid |
+            ForEach-Object { throw "Invalid Authenticode signature: $($_.StatusMessage)" }
+      - name: Upload Windows assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: |
+            target/release/bundle/nsis/RemoteX_*_x64-setup.exe
+            target/release/bundle/nsis/RemoteX_*_x64-setup.exe.sig
+            target/release/bundle/nsis/RemoteX_*_x64-setup.exe.sha256
+          if-no-files-found: error
+
+  linux:
+    name: Linux Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+      - name: Install release Rust 1.97.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Test Linux Agent
+        run: cargo test --locked -p remotex-linux-agent
+      - name: Build Linux Agent
+        run: cargo build --locked --release -p remotex-linux-agent
+      - name: Package Linux Agent
+        run: |
+          mkdir release-linux
+          cp target/release/remotex-linux-agent release-linux/
+          cp packaging/linux/remotex-agent.service packaging/linux/agent.env.example release-linux/
+          tar -C release-linux -czf RemoteX-linux-agent-x86_64.tar.gz .
+          sha256sum RemoteX-linux-agent-x86_64.tar.gz > RemoteX-linux-agent-x86_64.tar.gz.sha256
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: |
+            RemoteX-linux-agent-x86_64.tar.gz
+            RemoteX-linux-agent-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validation, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create signed updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$(find release-assets -maxdepth 1 -type f -name 'RemoteX_*_x64-setup.exe' -print -quit)"
+          test -n "$installer"
+          test -f "$installer.sig"
+          version="${GITHUB_REF_NAME#v}"
+          asset="$(basename "$installer")"
+          signature="$(cat "$installer.sig")"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${asset}"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "RemoteX ${GITHUB_REF_NAME}. See the GitHub release notes for details." \
+            --arg pub_date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg signature "$signature" \
+            --arg url "$url" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
+            > release-assets/latest.json
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --title "RemoteX ${GITHUB_REF_NAME}"
+          --generate-notes
+          release-assets/*

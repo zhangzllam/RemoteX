@@ -1,0 +1,18 @@
+{
+	email {$REMOTEX_ACME_EMAIL}
+}
+
+{$REMOTEX_CONTROL_DOMAIN} {
+	encode zstd gzip
+	request_body {
+		max_size 1MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	reverse_proxy control:8080
+}

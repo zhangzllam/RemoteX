@@ -1,0 +1,17 @@
+[package]
+name = "remotex-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "webp"] }
+openh264.workspace = true
+remotex-capture.workspace = true
+remotex-protocol.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

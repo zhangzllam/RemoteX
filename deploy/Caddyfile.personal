@@ -1,0 +1,16 @@
+{
+	admin off
+	auto_https disable_redirects
+	default_sni 39.96.68.170
+	servers {
+		protocols h1 h2
+	}
+}
+
+https://39.96.68.170:7443 {
+	tls internal
+	request_body {
+		max_size 1MB
+	}
+	reverse_proxy control:8080
+}

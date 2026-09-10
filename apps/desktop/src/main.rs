@@ -1,0 +1,2449 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
+//! `RemoteX` Tauri Controller and visible Windows Agent host.
+
+mod agent_management;
+mod server_config;
+mod taskbar_icon;
+
+use anyhow::Context;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
+use quinn::{ClientConfig, Endpoint};
+use remotex_clipboard::{ClipboardError, PermissionedClipboard, WindowsClipboardBackend};
+use remotex_crypto::{SessionCipher, SessionDirection, XChaChaSessionCipher};
+use remotex_file_transfer::{
+    FileTransferError, IncomingTransfer, OutgoingTransfer, TransferRegistry,
+};
+use remotex_input::normalize_unit_coordinate;
+use remotex_protocol::{
+    ClipboardOrigin, ConnectionType, ConnectivityCandidate, ConnectivityCandidateKind,
+    ControlMessage, CreateSessionRequest, DeviceId, DiagnosticValue, DisplayId, EncodedVideoFrame,
+    FileEntry, FileEntryKind, FileTransferDirection, FileTransferMessage, InputEvent, KeyCode,
+    MAX_FILE_CHUNK_SIZE, MAX_TERMINAL_DATA_SIZE, Message, MessageEnvelope, MetricProvenance,
+    MouseButton, PathControlMessage, RelayClientMessage, RelayServerMessage, Role,
+    SessionCredentials, SessionId, SessionPermissions, SessionToken, SystemMessage, TerminalId,
+    TerminalMessage, TransferId, VideoCodec, VideoFeedback, WheelAxis, decode_wire, encode_wire,
+};
+use remotex_transport::{
+    Connection, DEFAULT_DIRECT_ATTEMPT_TIMEOUT, DEFAULT_MAX_FRAME_SIZE, QuicFrameConnection,
+    connect_direct_candidates, reconnect_delay,
+};
+use remotex_video::{StreamDecoder, VideoDecoder};
+use rustls::RootCertStore;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tauri::{
+    AppHandle, Emitter, Manager, State,
+    ipc::Channel as IpcChannel,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
+use tracing::warn;
+
+const INPUT_QUEUE_CAPACITY: usize = 128;
+const FILE_COMMAND_QUEUE_CAPACITY: usize = 8;
+const FILE_RESPONSE_QUEUE_CAPACITY: usize = 2;
+
+#[derive(Default)]
+struct StreamControl {
+    active: std::sync::Mutex<Option<ActiveStream>>,
+}
+
+#[derive(Default)]
+struct VideoIpc {
+    channel: std::sync::Mutex<Option<IpcChannel<Vec<u8>>>>,
+    render_feedback: std::sync::Mutex<RenderFeedback>,
+    connection_timing: std::sync::Mutex<Option<ConnectionTiming>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionTiming {
+    started: Instant,
+    authorization_ms: Option<u64>,
+    relay_ready_ms: Option<u64>,
+    first_frame_ms: Option<u64>,
+    direct_attempt_ms: Option<u64>,
+    direct_established_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)]
+struct ConnectionPerformanceEvent {
+    authorization_ms: Option<u64>,
+    relay_ready_ms: Option<u64>,
+    first_frame_ms: Option<u64>,
+    direct_attempt_ms: Option<u64>,
+    direct_established_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderFeedback {
+    render_latency_ms: Option<u32>,
+    dropped_frames_per_mille: Option<u16>,
+}
+
+struct ActiveStream {
+    cancellation: oneshot::Sender<()>,
+    input: mpsc::Sender<InputEvent>,
+    files: mpsc::Sender<ControllerFileCommand>,
+    server: mpsc::Sender<ControllerServerCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectRequest {
+    #[serde(default)]
+    control_server_url: String,
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    controller_name: String,
+    #[serde(default)]
+    unattended_secret: String,
+    relay_address: String,
+    server_name: String,
+    ca_certificate_path: String,
+    session_id: String,
+    token_hex: String,
+    end_to_end_key_hex: String,
+    clipboard_enabled: bool,
+    file_upload_enabled: bool,
+    file_download_enabled: bool,
+}
+
+struct ResolvedSession {
+    relay_address: String,
+    server_name: String,
+    session_id: String,
+    token_hex: String,
+    recovery_token_hex: String,
+    recovery_expires_at_ms: u64,
+    end_to_end_key_hex: String,
+    permissions: SessionPermissions,
+    peer_candidates: Vec<ConnectivityCandidate>,
+}
+
+#[derive(Debug)]
+enum ControllerFileCommand {
+    List {
+        path: String,
+    },
+    CreateDirectory {
+        path: String,
+    },
+    Upload {
+        transfer_id: Option<TransferId>,
+        local_path: PathBuf,
+        destination_path: String,
+    },
+    Download {
+        transfer_id: Option<TransferId>,
+        source_path: String,
+        local_path: PathBuf,
+    },
+    Cancel {
+        transfer_id: TransferId,
+    },
+}
+
+#[derive(Debug)]
+enum ControllerServerCommand {
+    Terminal(TerminalMessage),
+    SystemInfo,
+}
+
+#[derive(Debug)]
+struct ControllerFileService {
+    upload_permission: bool,
+    download_permission: bool,
+    next_request_id: u64,
+    uploads: TransferRegistry<OutgoingTransfer>,
+    downloads: TransferRegistry<IncomingTransfer>,
+    pending_downloads: HashMap<TransferId, PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteFileEntryEvent {
+    name: String,
+    path: String,
+    entry_type: &'static str,
+    size: u64,
+    modified_ms: Option<u64>,
+}
+
+impl From<FileEntry> for RemoteFileEntryEvent {
+    fn from(entry: FileEntry) -> Self {
+        Self {
+            name: entry.name,
+            path: entry.path,
+            entry_type: match entry.kind {
+                FileEntryKind::File => "file",
+                FileEntryKind::Directory => "directory",
+            },
+            size: entry.size,
+            modified_ms: entry.modified_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum FileEvent {
+    Directory {
+        path: String,
+        entries: Vec<RemoteFileEntryEvent>,
+    },
+    DirectoryCreated {
+        path: String,
+    },
+    Progress {
+        transfer_id: String,
+        direction: &'static str,
+        transferred: u64,
+        total: u64,
+        state: &'static str,
+    },
+    Error {
+        transfer_id: Option<String>,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoFrameEvent {
+    sequence: u64,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    frames_per_second: u32,
+    bitrate_bps: u32,
+    source_timestamp_ms: u64,
+    capture_latency_ms: u32,
+    encode_latency_ms: u32,
+    decode_latency_ms: u32,
+    codec: &'static str,
+    key_frame: bool,
+    mime_type: &'static str,
+    data: String,
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn subscribe_video(
+    channel: IpcChannel<Vec<u8>>,
+    video_ipc: State<'_, VideoIpc>,
+) -> Result<(), String> {
+    *video_ipc
+        .channel
+        .lock()
+        .map_err(|_| "video IPC lock is unavailable".to_owned())? = Some(channel);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn report_video_render_metrics(
+    render_latency_ms: Option<f64>,
+    dropped_frames_per_mille: Option<u16>,
+    video_ipc: State<'_, VideoIpc>,
+) -> Result<(), String> {
+    let mut feedback = video_ipc
+        .render_feedback
+        .lock()
+        .map_err(|_| "video render feedback lock is unavailable".to_owned())?;
+    feedback.render_latency_ms = render_latency_ms
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value.round().min(f64::from(u32::MAX)) as u32);
+    feedback.dropped_frames_per_mille = dropped_frames_per_mille.map(|value| value.min(1_000));
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum TerminalEvent {
+    Output {
+        terminal_id: String,
+        data: String,
+    },
+    Closed {
+        terminal_id: String,
+        exit_code: Option<u32>,
+    },
+    Error {
+        terminal_id: Option<String>,
+        message: String,
+    },
+}
+
+#[derive(Default)]
+struct AgentMessageOutcome {
+    file_message: Option<FileTransferMessage>,
+    video_feedback: Option<VideoFeedback>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusEvent {
+    state: &'static str,
+    message: String,
+    path: Option<&'static str>,
+    transport: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionMetricsEvent {
+    rtt_ms: Option<u32>,
+    packet_loss_per_mille: Option<u16>,
+    send_queue_percent: Option<u8>,
+    send_queue_estimated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MouseButtonRequest {
+    Left,
+    Right,
+    Middle,
+}
+
+impl From<MouseButtonRequest> for MouseButton {
+    fn from(value: MouseButtonRequest) -> Self {
+        match value {
+            MouseButtonRequest::Left => Self::Left,
+            MouseButtonRequest::Right => Self::Right,
+            MouseButtonRequest::Middle => Self::Middle,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum MouseInputRequest {
+    Move {
+        display_id: Option<String>,
+        x: f64,
+        y: f64,
+    },
+    ButtonDown {
+        button: MouseButtonRequest,
+        x: f64,
+        y: f64,
+    },
+    ButtonUp {
+        button: MouseButtonRequest,
+    },
+    Wheel {
+        horizontal_delta: i32,
+        vertical_delta: i32,
+    },
+}
+
+impl MouseInputRequest {
+    fn into_events(self) -> anyhow::Result<Vec<InputEvent>> {
+        match self {
+            Self::Move { display_id, x, y } => Ok(vec![InputEvent::MouseMove {
+                display_id: display_id.map(DisplayId::new).transpose()?,
+                normalized_x: normalize_unit_coordinate(x)?,
+                normalized_y: normalize_unit_coordinate(y)?,
+            }]),
+            Self::ButtonDown { button, x, y } => Ok(vec![
+                InputEvent::MouseMove {
+                    display_id: None,
+                    normalized_x: normalize_unit_coordinate(x)?,
+                    normalized_y: normalize_unit_coordinate(y)?,
+                },
+                InputEvent::MouseButtonDown {
+                    button: button.into(),
+                },
+            ]),
+            Self::ButtonUp { button } => Ok(vec![InputEvent::MouseButtonUp {
+                button: button.into(),
+            }]),
+            Self::Wheel {
+                horizontal_delta,
+                vertical_delta,
+            } => {
+                let mut events = Vec::with_capacity(2);
+                if horizontal_delta != 0 {
+                    events.push(InputEvent::MouseWheel {
+                        axis: WheelAxis::Horizontal,
+                        delta: horizontal_delta,
+                    });
+                }
+                if vertical_delta != 0 {
+                    events.push(InputEvent::MouseWheel {
+                        axis: WheelAxis::Vertical,
+                        delta: vertical_delta,
+                    });
+                }
+                Ok(events)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum KeyboardInputRequest {
+    KeyDown { key: KeyCode },
+    KeyUp { key: KeyCode },
+}
+
+impl From<KeyboardInputRequest> for InputEvent {
+    fn from(value: KeyboardInputRequest) -> Self {
+        match value {
+            KeyboardInputRequest::KeyDown { key } => Self::KeyDown { key },
+            KeyboardInputRequest::KeyUp { key } => Self::KeyUp { key },
+        }
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn connect_remote(
+    app: AppHandle,
+    control: State<'_, StreamControl>,
+    request: ConnectRequest,
+) -> Result<(), String> {
+    let mut active = control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?;
+    if let Some(previous) = active.take() {
+        let _result = previous.cancellation.send(());
+    }
+    let (cancel_sender, cancel_receiver) = oneshot::channel();
+    let (input_sender, input_receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+    let (file_sender, file_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
+    let (terminal_sender, terminal_receiver) = mpsc::channel(32);
+    *active = Some(ActiveStream {
+        cancellation: cancel_sender,
+        input: input_sender,
+        files: file_sender,
+        server: terminal_sender,
+    });
+    drop(active);
+
+    tauri::async_runtime::spawn(async move {
+        if request.control_server_url.trim().is_empty() {
+            emit_status(&app, "connecting", "Establishing a secure connection");
+        } else {
+            emit_status(&app, "contacting", "Contacting your RemoteX server");
+        }
+        let result = run_remote_session(
+            app.clone(),
+            request,
+            cancel_receiver,
+            input_receiver,
+            file_receiver,
+            terminal_receiver,
+        )
+        .await;
+        match result {
+            Ok(()) => emit_status(&app, "disconnected", "Remote session ended"),
+            Err(error) => {
+                warn!(event = "remote_session_failed", %error);
+                emit_status(&app, "error", friendly_connection_error(&error));
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn disconnect_remote(app: AppHandle, control: State<'_, StreamControl>) -> Result<(), String> {
+    let mut active = control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?;
+    if let Some(stream) = active.take() {
+        let _result = stream.cancellation.send(());
+    }
+    emit_status(&app, "disconnected", "Disconnected by user");
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_mouse_input(
+    control: State<'_, StreamControl>,
+    request: MouseInputRequest,
+) -> Result<(), String> {
+    let sender = control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.input.clone())
+        .ok_or_else(|| "remote session is not connected".to_owned())?;
+    for event in request.into_events().map_err(|error| error.to_string())? {
+        sender
+            .send(event)
+            .await
+            .map_err(|_| "remote session input channel is closed".to_owned())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_keyboard_input(
+    control: State<'_, StreamControl>,
+    request: KeyboardInputRequest,
+) -> Result<(), String> {
+    let sender = control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.input.clone())
+        .ok_or_else(|| "remote session is not connected".to_owned())?;
+    sender
+        .send(request.into())
+        .await
+        .map_err(|_| "remote session input channel is closed".to_owned())
+}
+
+fn active_file_sender(
+    control: &State<'_, StreamControl>,
+) -> Result<mpsc::Sender<ControllerFileCommand>, String> {
+    control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.files.clone())
+        .ok_or_else(|| "remote session is not connected".to_owned())
+}
+
+#[tauri::command]
+async fn list_remote_files(control: State<'_, StreamControl>, path: String) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::List { path })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn create_remote_directory(
+    control: State<'_, StreamControl>,
+    path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::CreateDirectory { path })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn upload_remote_file(
+    control: State<'_, StreamControl>,
+    local_path: String,
+    destination_path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Upload {
+            transfer_id: None,
+            local_path: PathBuf::from(local_path),
+            destination_path,
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn download_remote_file(
+    control: State<'_, StreamControl>,
+    source_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Download {
+            transfer_id: None,
+            source_path,
+            local_path: PathBuf::from(local_path),
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resume_file_upload(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+    local_path: String,
+    destination_path: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Upload {
+            transfer_id: Some(transfer_id),
+            local_path: PathBuf::from(local_path),
+            destination_path,
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resume_file_download(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+    source_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Download {
+            transfer_id: Some(transfer_id),
+            source_path,
+            local_path: PathBuf::from(local_path),
+        })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+#[tauri::command]
+async fn cancel_file_transfer(
+    control: State<'_, StreamControl>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let transfer_id = transfer_id
+        .parse()
+        .map_err(|_| "transfer ID is invalid".to_owned())?;
+    active_file_sender(&control)?
+        .send(ControllerFileCommand::Cancel { transfer_id })
+        .await
+        .map_err(|_| "remote file service is closed".to_owned())
+}
+
+fn active_terminal_sender(
+    control: &State<'_, StreamControl>,
+) -> Result<mpsc::Sender<ControllerServerCommand>, String> {
+    control
+        .active
+        .lock()
+        .map_err(|_| "stream control lock is unavailable".to_owned())?
+        .as_ref()
+        .map(|stream| stream.server.clone())
+        .ok_or_else(|| "remote Session is not connected".to_owned())
+}
+
+#[tauri::command]
+async fn open_terminal(control: State<'_, StreamControl>) -> Result<String, String> {
+    let terminal_id = TerminalId::new();
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Open {
+            terminal_id,
+            columns: 120,
+            rows: 32,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())?;
+    Ok(terminal_id.to_string())
+}
+
+#[tauri::command]
+async fn send_terminal_input(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+    data: String,
+) -> Result<(), String> {
+    if data.is_empty() || data.len() > MAX_TERMINAL_DATA_SIZE {
+        return Err("terminal input is empty or too large".to_owned());
+    }
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Input {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+            data: data.into_bytes(),
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn resize_terminal(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+    columns: u16,
+    rows: u16,
+) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Resize {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+            columns,
+            rows,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn close_terminal(
+    control: State<'_, StreamControl>,
+    terminal_id: String,
+) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::Terminal(TerminalMessage::Close {
+            terminal_id: terminal_id
+                .parse()
+                .map_err(|_| "terminal ID is invalid".to_owned())?,
+        }))
+        .await
+        .map_err(|_| "terminal channel is closed".to_owned())
+}
+
+#[tauri::command]
+async fn request_system_info(control: State<'_, StreamControl>) -> Result<(), String> {
+    active_terminal_sender(&control)?
+        .send(ControllerServerCommand::SystemInfo)
+        .await
+        .map_err(|_| "system information channel is closed".to_owned())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_remote_session(
+    app: AppHandle,
+    request: ConnectRequest,
+    mut cancellation: oneshot::Receiver<()>,
+    mut input_receiver: mpsc::Receiver<InputEvent>,
+    file_commands: mpsc::Receiver<ControllerFileCommand>,
+    mut terminal_receiver: mpsc::Receiver<ControllerServerCommand>,
+) -> anyhow::Result<()> {
+    reset_connection_timing(&app)?;
+    if !request.control_server_url.trim().is_empty() {
+        emit_status(
+            &app,
+            "authorizing",
+            "Waiting for authorization on the remote device",
+        );
+    }
+    let resolved = resolve_session(&request).await?;
+    record_connection_milestone(&app, |timing, elapsed| {
+        timing.authorization_ms = Some(elapsed);
+    });
+    emit_status(&app, "connecting", "Establishing an encrypted path");
+    let relay_address = resolve_relay_address(&resolved.relay_address).await?;
+    let session_id: SessionId = resolved.session_id.parse().context("parse session ID")?;
+    let token = parse_token(&resolved.token_hex)?;
+    let recovery_token = parse_token(&resolved.recovery_token_hex)?;
+    let end_to_end_key = parse_key(&resolved.end_to_end_key_hex)?;
+    let inbound_cipher = XChaChaSessionCipher::new(
+        end_to_end_key,
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::AgentToController,
+    );
+    let outbound_cipher = XChaChaSessionCipher::new(
+        end_to_end_key,
+        *session_id.as_uuid().as_bytes(),
+        SessionDirection::ControllerToAgent,
+    );
+    let endpoint = client_endpoint(Path::new(&request.ca_certificate_path))?;
+    let connection = endpoint
+        .connect(relay_address, &resolved.server_name)
+        .context("create relay connection")?
+        .await
+        .context("connect to relay")?;
+    let (send, receive) = connection.open_bi().await.context("open relay stream")?;
+    let mut relay_transport =
+        QuicFrameConnection::with_connection(connection, send, receive, DEFAULT_MAX_FRAME_SIZE);
+    let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::new(
+        session_id,
+        Role::Controller,
+        token,
+    ));
+    relay_transport
+        .send(Bytes::from(encode_wire(&hello)?))
+        .await?;
+    wait_for_peer(&app, &mut relay_transport).await?;
+    record_connection_milestone(&app, |timing, elapsed| {
+        timing.relay_ready_ms = Some(elapsed);
+    });
+    let direct_candidates = resolved.peer_candidates.clone();
+    let direct_endpoint = endpoint.clone();
+    let (direct_sender, mut direct_receiver) = mpsc::channel(1);
+    let mut direct_check_open = !direct_candidates.is_empty();
+    if direct_check_open {
+        record_connection_milestone(&app, |timing, elapsed| {
+            timing.direct_attempt_ms = Some(elapsed);
+        });
+        tokio::spawn(async move {
+            let result = connect_direct_candidates(
+                &direct_endpoint,
+                &direct_candidates,
+                session_id,
+                &end_to_end_key,
+                DEFAULT_DIRECT_ATTEMPT_TIMEOUT,
+            )
+            .await;
+            let _result = direct_sender.send(result).await;
+        });
+    }
+    let mut transport: Box<dyn Connection> = Box::new(relay_transport);
+    let mut connection_type = ConnectionType::Relay;
+    emit_connection_status(
+        &app,
+        "connected",
+        match connection_type {
+            ConnectionType::Lan => "Connected securely over the local network",
+            ConnectionType::Direct => "Connected securely over a direct path",
+            ConnectionType::Relay => "Connected securely through your server",
+        },
+        connection_type,
+    );
+
+    let mut clipboard = PermissionedClipboard::new(
+        WindowsClipboardBackend,
+        ClipboardOrigin::Controller,
+        resolved.permissions.clipboard,
+    );
+    let mut outbound_sequence = 0_u64;
+    let mut expected_inbound_sequence = 0_u64;
+    let mut video_decoder = StreamDecoder::new()?;
+    let mut last_video_feedback_ms = 0_u64;
+    send_controller_message(
+        transport.as_mut(),
+        session_id,
+        &outbound_cipher,
+        &mut outbound_sequence,
+        Message::Control(ControlMessage::VideoCapabilities {
+            codecs: vec![VideoCodec::H264, VideoCodec::Jpeg, VideoCodec::WebP],
+        }),
+    )
+    .await?;
+    let mut clipboard_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    clipboard_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let file_service = ControllerFileService {
+        upload_permission: resolved.permissions.file_upload,
+        download_permission: resolved.permissions.file_download,
+        next_request_id: 1,
+        uploads: TransferRegistry::default(),
+        downloads: TransferRegistry::default(),
+        pending_downloads: HashMap::new(),
+    };
+    let (remote_file_sender, remote_file_receiver) = mpsc::channel(FILE_COMMAND_QUEUE_CAPACITY);
+    let (file_response_sender, mut file_response_receiver) =
+        mpsc::channel(FILE_RESPONSE_QUEUE_CAPACITY);
+    let file_worker = tokio::spawn(file_service.run(
+        app.clone(),
+        file_commands,
+        remote_file_receiver,
+        file_response_sender,
+    ));
+    loop {
+        tokio::select! {
+            _ = &mut cancellation => break,
+            direct_result = direct_receiver.recv(), if direct_check_open => {
+                direct_check_open = false;
+                match direct_result {
+                    Some(Ok((direct, candidate_kind))) => {
+                        let nonce: u64 = rand::random();
+                        send_path_control(transport.as_mut(), PathControlMessage::SwitchRequest { nonce }).await?;
+                        let acknowledged = wait_for_path_control(
+                            &app,
+                            transport.as_mut(),
+                            PathControlMessage::SwitchAck { nonce },
+                            session_id,
+                            &inbound_cipher,
+                            &mut expected_inbound_sequence,
+                            &mut clipboard,
+                            &mut video_decoder,
+                            &remote_file_sender,
+                        ).await?;
+                        if acknowledged {
+                            send_path_control(
+                                transport.as_mut(),
+                                PathControlMessage::SwitchCommit { nonce },
+                            ).await?;
+                            let committed = wait_for_path_control(
+                                &app,
+                                transport.as_mut(),
+                                PathControlMessage::SwitchCommitted { nonce },
+                                session_id,
+                                &inbound_cipher,
+                                &mut expected_inbound_sequence,
+                                &mut clipboard,
+                                &mut video_decoder,
+                                &remote_file_sender,
+                            ).await?;
+                            if committed {
+                                record_connection_milestone(&app, |timing, elapsed| timing.direct_established_ms = Some(elapsed));
+                                transport = Box::new(direct);
+                                connection_type = match candidate_kind {
+                                    ConnectivityCandidateKind::Host => ConnectionType::Lan,
+                                    ConnectivityCandidateKind::ServerReflexive
+                                    | ConnectivityCandidateKind::ConfiguredPublic => ConnectionType::Direct,
+                                };
+                                emit_connection_status(
+                                    &app,
+                                    "connected",
+                                    "Connected securely over a direct path",
+                                    connection_type,
+                                );
+                            }
+                        }
+                    }
+                    Some(Err(error)) => warn!(event = "direct_connection_failed", %session_id, %error),
+                    None => {}
+                }
+            }
+            result = transport.receive() => {
+                let incoming = match result {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        warn!(event = "session_transport_interrupted", %error);
+                        transport = Box::new(reconnect_relay_controller(
+                            &app,
+                            &endpoint,
+                            relay_address,
+                            &resolved.server_name,
+                            session_id,
+                            recovery_token.clone(),
+                            resolved.recovery_expires_at_ms,
+                            &mut cancellation,
+                        ).await?);
+                        connection_type = ConnectionType::Relay;
+                        emit_connection_status(
+                            &app,
+                            "connected",
+                            "Connection recovered through Relay",
+                            connection_type,
+                        );
+                        continue;
+                    }
+                };
+                let relay_message = decode_wire::<RelayServerMessage>(&incoming)?;
+                if let RelayServerMessage::SessionClosed { reason } = relay_message {
+                    if !is_recoverable_close(reason) {
+                        anyhow::bail!("relay session closed: {reason:?}");
+                    }
+                    transport = Box::new(reconnect_relay_controller(
+                        &app,
+                        &endpoint,
+                        relay_address,
+                        &resolved.server_name,
+                        session_id,
+                        recovery_token.clone(),
+                        resolved.recovery_expires_at_ms,
+                        &mut cancellation,
+                    ).await?);
+                    connection_type = ConnectionType::Relay;
+                    emit_connection_status(
+                        &app,
+                        "connected",
+                        "Connection recovered through Relay",
+                        connection_type,
+                    );
+                    continue;
+                }
+                let outcome = handle_relay_message(
+                    &app,
+                    transport.as_mut(),
+                    relay_message,
+                    session_id,
+                    &inbound_cipher,
+                    &mut expected_inbound_sequence,
+                    &mut clipboard,
+                    &mut video_decoder,
+                ).await?;
+                if let Some(message) = outcome.file_message {
+                    remote_file_sender
+                        .try_send(message)
+                        .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+                }
+                if let Some(mut feedback) = outcome.video_feedback {
+                    let current_ms = now_ms()?;
+                    if current_ms.saturating_sub(last_video_feedback_ms) >= 1_000 {
+                        if let Some(metrics) = transport.metrics() {
+                            feedback.rtt_ms = DiagnosticValue::Available {
+                                value: u32::try_from(metrics.rtt.as_millis()).unwrap_or(u32::MAX),
+                                provenance: MetricProvenance::Measured,
+                            };
+                            feedback.packet_loss_per_mille = DiagnosticValue::Available {
+                                value: packet_loss_per_mille(
+                                    metrics.lost_packets,
+                                    metrics.sent_packets,
+                                ),
+                                provenance: MetricProvenance::Measured,
+                            };
+                        }
+                        emit_connection_metrics(&app, feedback);
+                        send_controller_message(
+                            transport.as_mut(),
+                            session_id,
+                            &outbound_cipher,
+                            &mut outbound_sequence,
+                            Message::Control(ControlMessage::VideoFeedback(feedback)),
+                        ).await?;
+                        last_video_feedback_ms = current_ms;
+                    }
+                }
+            }
+            event = input_receiver.recv(), if resolved.permissions.control_input => {
+                let Some(event) = event else { break; };
+                send_controller_message(
+                    transport.as_mut(),
+                    session_id,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    Message::Input(event),
+                ).await?;
+            }
+            command = terminal_receiver.recv() => {
+                let Some(command) = command else { break; };
+                let message = match command {
+                    ControllerServerCommand::Terminal(message) => Message::Terminal(message),
+                    ControllerServerCommand::SystemInfo => Message::System(SystemMessage::Request),
+                };
+                send_controller_message(
+                    transport.as_mut(),
+                    session_id,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    message,
+                ).await?;
+            }
+            _ = clipboard_interval.tick(), if clipboard.is_enabled() => {
+                match clipboard.poll() {
+                    Ok(Some(message)) => send_controller_message(
+                        transport.as_mut(),
+                        session_id,
+                        &outbound_cipher,
+                        &mut outbound_sequence,
+                        Message::Clipboard(message),
+                    ).await?,
+                    Ok(None) => {}
+                    Err(error) => warn!(event = "clipboard_poll_failed", %error),
+                }
+            }
+            response = file_response_receiver.recv() => {
+                let Some(response) = response else {
+                    anyhow::bail!("file service stopped unexpectedly");
+                };
+                send_controller_message(
+                    transport.as_mut(),
+                    session_id,
+                    &outbound_cipher,
+                    &mut outbound_sequence,
+                    Message::FileTransfer(response),
+                ).await?;
+            }
+        }
+    }
+    file_worker.abort();
+    let _result = transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::Close)?))
+        .await;
+    endpoint.close(0_u32.into(), b"controller disconnected");
+    Ok(())
+}
+
+const fn is_recoverable_close(reason: remotex_protocol::SessionCloseReason) -> bool {
+    matches!(
+        reason,
+        remotex_protocol::SessionCloseReason::PeerDisconnected
+            | remotex_protocol::SessionCloseReason::HeartbeatTimeout
+            | remotex_protocol::SessionCloseReason::SlowConsumer
+            | remotex_protocol::SessionCloseReason::RelayShutdown
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_relay_controller(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    relay_address: SocketAddr,
+    server_name: &str,
+    session_id: SessionId,
+    recovery_token: SessionToken,
+    recovery_expires_at_ms: u64,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<QuicFrameConnection> {
+    for attempt in 0..remotex_transport::MAX_RECONNECT_ATTEMPTS {
+        if now_ms()? >= recovery_expires_at_ms {
+            anyhow::bail!("Session recovery credential expired");
+        }
+        emit_status(app, "reconnecting", "Reconnecting securely…");
+        let delay =
+            reconnect_delay(attempt, rand::random()).context("reconnect attempts exhausted")?;
+        tokio::select! {
+            _ = &mut *cancellation => anyhow::bail!("Disconnected by user"),
+            () = tokio::time::sleep(delay) => {}
+        }
+        let attempt_result = async {
+            let connection = endpoint
+                .connect(relay_address, server_name)
+                .context("create recovery Relay connection")?
+                .await
+                .context("connect recovery Relay")?;
+            let (send, receive) = connection
+                .open_bi()
+                .await
+                .context("open recovery Relay stream")?;
+            let mut transport = QuicFrameConnection::with_connection(
+                connection,
+                send,
+                receive,
+                DEFAULT_MAX_FRAME_SIZE,
+            );
+            let hello = RelayClientMessage::ClientHello(remotex_protocol::ClientHello::recovery(
+                session_id,
+                Role::Controller,
+                recovery_token.clone(),
+            ));
+            transport.send(Bytes::from(encode_wire(&hello)?)).await?;
+            wait_for_peer(app, &mut transport).await?;
+            Ok::<_, anyhow::Error>(transport)
+        }
+        .await;
+        match attempt_result {
+            Ok(transport) => return Ok(transport),
+            Err(error) => warn!(event = "session_reconnect_attempt_failed", attempt, %error),
+        }
+    }
+    anyhow::bail!("Secure reconnection attempts exhausted")
+}
+
+async fn resolve_session(request: &ConnectRequest) -> anyhow::Result<ResolvedSession> {
+    let requested_permissions = SessionPermissions {
+        view_desktop: true,
+        control_input: true,
+        clipboard: request.clipboard_enabled,
+        file_upload: request.file_upload_enabled,
+        file_download: request.file_download_enabled,
+        terminal: true,
+        system_info: true,
+    };
+    if request.control_server_url.trim().is_empty() {
+        return Ok(ResolvedSession {
+            relay_address: request.relay_address.clone(),
+            server_name: request.server_name.clone(),
+            session_id: request.session_id.clone(),
+            token_hex: request.token_hex.clone(),
+            recovery_token_hex: request.token_hex.clone(),
+            recovery_expires_at_ms: 0,
+            end_to_end_key_hex: request.end_to_end_key_hex.clone(),
+            permissions: requested_permissions,
+            peer_candidates: Vec::new(),
+        });
+    }
+
+    let device_id = DeviceId::new(request.device_id.trim()).context("validate device ID")?;
+    let controller_name = request.controller_name.trim();
+    if controller_name.is_empty() {
+        anyhow::bail!("controller name is required when using the control server");
+    }
+    let control_url = remotex_control_client::normalize_control_url(&request.control_server_url);
+    let url = format!("{control_url}/api/sessions");
+    let response = server_config::control_client(&control_url, Duration::from_secs(15))
+        .context("build control client")?
+        .post(url)
+        .json(&CreateSessionRequest {
+            device_id,
+            controller_name: controller_name.to_owned(),
+            requested_permissions,
+            unattended_secret: (!request.unattended_secret.is_empty())
+                .then(|| request.unattended_secret.clone()),
+        })
+        .send()
+        .await
+        .context("request a managed session")?
+        .error_for_status()
+        .context("control server rejected the session request")?
+        .json::<SessionCredentials>()
+        .await
+        .context("decode managed session credentials")?;
+
+    Ok(ResolvedSession {
+        relay_address: response.relay_address,
+        server_name: response.relay_server_name,
+        session_id: response.session_id.to_string(),
+        token_hex: response.role_token_hex,
+        recovery_token_hex: response.recovery_token_hex,
+        recovery_expires_at_ms: response.recovery_expires_at_ms,
+        end_to_end_key_hex: response.end_to_end_key_hex,
+        permissions: response.permissions,
+        peer_candidates: response.peer_candidates,
+    })
+}
+
+async fn send_path_control(
+    transport: &mut dyn Connection,
+    message: PathControlMessage,
+) -> anyhow::Result<()> {
+    transport
+        .send(Bytes::from(encode_wire(&RelayClientMessage::PathControl(
+            message,
+        ))?))
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_path_control(
+    app: &AppHandle,
+    transport: &mut dyn Connection,
+    expected: PathControlMessage,
+    session_id: SessionId,
+    inbound_cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    video_decoder: &mut StreamDecoder,
+    remote_file_sender: &mpsc::Sender<FileTransferMessage>,
+) -> anyhow::Result<bool> {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
+            match message {
+                RelayServerMessage::PathControl(message) if message == expected => return Ok(true),
+                RelayServerMessage::PathControl(_) => {}
+                message => {
+                    let outcome = handle_relay_message(
+                        app,
+                        transport,
+                        message,
+                        session_id,
+                        inbound_cipher,
+                        expected_sequence,
+                        clipboard,
+                        video_decoder,
+                    )
+                    .await?;
+                    if let Some(file_message) = outcome.file_message {
+                        remote_file_sender
+                            .try_send(file_message)
+                            .map_err(|_| anyhow::anyhow!("file command queue is full or closed"))?;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_relay_message(
+    app: &AppHandle,
+    transport: &mut dyn Connection,
+    message: RelayServerMessage,
+    session_id: SessionId,
+    inbound_cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    video_decoder: &mut StreamDecoder,
+) -> anyhow::Result<AgentMessageOutcome> {
+    match message {
+        RelayServerMessage::Payload(payload) => handle_agent_payload(
+            app,
+            &payload,
+            session_id,
+            inbound_cipher,
+            expected_sequence,
+            clipboard,
+            video_decoder,
+        ),
+        RelayServerMessage::Heartbeat { nonce } => {
+            let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+            transport
+                .send(Bytes::from(encode_wire(&acknowledgement)?))
+                .await?;
+            Ok(AgentMessageOutcome::default())
+        }
+        RelayServerMessage::HeartbeatAck { .. }
+        | RelayServerMessage::WaitingForPeer { .. }
+        | RelayServerMessage::PeerReady
+        | RelayServerMessage::PathControl(_) => Ok(AgentMessageOutcome::default()),
+        RelayServerMessage::SessionClosed { reason } => {
+            anyhow::bail!("relay session closed: {reason:?}");
+        }
+        RelayServerMessage::ProtocolError { code, message } => {
+            anyhow::bail!("relay protocol error {code:?}: {message}");
+        }
+    }
+}
+
+fn handle_agent_payload(
+    app: &AppHandle,
+    bytes: &[u8],
+    session_id: SessionId,
+    cipher: &XChaChaSessionCipher,
+    expected_sequence: &mut u64,
+    clipboard: &mut PermissionedClipboard<WindowsClipboardBackend>,
+    video_decoder: &mut StreamDecoder,
+) -> anyhow::Result<AgentMessageOutcome> {
+    if bytes.len() > MAX_FILE_CHUNK_SIZE as usize + 64 * 1024 {
+        anyhow::bail!("Agent data payload exceeds the M7 limit");
+    }
+    if bytes.len() < 8 {
+        anyhow::bail!("encrypted Agent payload is missing its sequence number");
+    }
+    let sequence = u64::from_be_bytes(
+        bytes[..8]
+            .try_into()
+            .context("read encrypted Agent sequence")?,
+    );
+    if sequence != *expected_sequence {
+        anyhow::bail!(
+            "unexpected Agent sequence {sequence}; expected {}",
+            *expected_sequence
+        );
+    }
+    let plaintext = cipher
+        .open(sequence, &bytes[8..])
+        .context("authenticate and decrypt Agent envelope")?;
+    let envelope: MessageEnvelope = decode_wire(&plaintext).context("decode protocol envelope")?;
+    envelope.validate()?;
+    if envelope.session_id != session_id {
+        anyhow::bail!("received an Agent message for a different session");
+    }
+    if envelope.sequence != sequence {
+        anyhow::bail!("encrypted Agent sequence does not match its envelope");
+    }
+    let mut outcome = AgentMessageOutcome::default();
+    match envelope.message {
+        Message::Video(frame) => {
+            outcome.video_feedback = Some(emit_video_frame(app, sequence, &frame, video_decoder)?);
+        }
+        Message::Clipboard(message) => match clipboard.apply(message) {
+            Ok(_) => {}
+            Err(ClipboardError::PermissionDenied) => {
+                warn!(event = "clipboard_permission_denied", %session_id);
+            }
+            Err(error) => return Err(error.into()),
+        },
+        Message::FileTransfer(message) => outcome.file_message = Some(message),
+        Message::Terminal(message) => emit_terminal_event(app, message)?,
+        Message::System(SystemMessage::Snapshot(snapshot)) => {
+            app.emit("system-info", snapshot)?;
+        }
+        Message::System(SystemMessage::Error { message }) => {
+            app.emit(
+                "terminal-event",
+                TerminalEvent::Error {
+                    terminal_id: None,
+                    message,
+                },
+            )?;
+        }
+        _ => anyhow::bail!("Agent sent a message not allowed in its data direction"),
+    }
+    *expected_sequence = expected_sequence
+        .checked_add(1)
+        .context("Agent inbound sequence space exhausted")?;
+    Ok(outcome)
+}
+
+fn emit_terminal_event(app: &AppHandle, message: TerminalMessage) -> anyhow::Result<()> {
+    let event = match message {
+        TerminalMessage::Output { terminal_id, data } => TerminalEvent::Output {
+            terminal_id: terminal_id.to_string(),
+            data: String::from_utf8_lossy(&data).into_owned(),
+        },
+        TerminalMessage::Closed {
+            terminal_id,
+            exit_code,
+        } => TerminalEvent::Closed {
+            terminal_id: terminal_id.to_string(),
+            exit_code,
+        },
+        TerminalMessage::Error {
+            terminal_id,
+            message,
+        } => TerminalEvent::Error {
+            terminal_id: terminal_id.map(|id| id.to_string()),
+            message,
+        },
+        TerminalMessage::Open { .. }
+        | TerminalMessage::Input { .. }
+        | TerminalMessage::Resize { .. }
+        | TerminalMessage::Close { .. } => {
+            anyhow::bail!("Agent sent a Controller-only terminal message")
+        }
+    };
+    app.emit("terminal-event", event)?;
+    Ok(())
+}
+
+fn emit_video_frame(
+    app: &AppHandle,
+    sequence: u64,
+    frame: &EncodedVideoFrame,
+    decoder: &mut StreamDecoder,
+) -> anyhow::Result<VideoFeedback> {
+    record_connection_milestone(app, |timing, elapsed| {
+        if timing.first_frame_ms.is_none() {
+            timing.first_frame_ms = Some(elapsed);
+        }
+    });
+    let decoded_frame = decoder.decode_frame(frame)?;
+    let decode_latency_ms = decoded_frame.decode_latency_ms;
+    let frame_budget_ms = 1_000 / frame.frames_per_second.max(1);
+    let queue_percent = decoded_frame
+        .decode_latency_ms
+        .saturating_mul(100)
+        .checked_div(frame_budget_ms)
+        .unwrap_or(100)
+        .min(100) as u8;
+    let codec = match frame.codec {
+        VideoCodec::H264 => "H.264",
+        VideoCodec::Jpeg => "JPEG",
+        VideoCodec::WebP => "WebP",
+    };
+    let mut event = VideoFrameEvent {
+        sequence,
+        frame_id: frame.frame_id,
+        width: frame.width,
+        height: frame.height,
+        frames_per_second: frame.frames_per_second,
+        bitrate_bps: frame.bitrate_bps,
+        source_timestamp_ms: frame.source_timestamp_ms,
+        capture_latency_ms: frame.capture_latency_ms,
+        encode_latency_ms: frame.encode_latency_ms,
+        decode_latency_ms,
+        codec,
+        key_frame: frame.key_frame,
+        mime_type: "application/x-remotex-rgba",
+        data: String::new(),
+    };
+    let channel = app
+        .state::<VideoIpc>()
+        .channel
+        .lock()
+        .map_err(|_| anyhow::anyhow!("video IPC lock is unavailable"))?
+        .clone();
+    if let Some(channel) = channel {
+        let packet = encode_video_packet(&event, &decoded_frame.rgba);
+        channel.send(packet)?;
+    } else {
+        event.data = STANDARD.encode(decoded_frame.rgba);
+        app.emit("video-frame", event)?;
+    }
+    let render_feedback = *app
+        .state::<VideoIpc>()
+        .render_feedback
+        .lock()
+        .map_err(|_| anyhow::anyhow!("video render feedback lock is unavailable"))?;
+    Ok(VideoFeedback {
+        rtt_ms: DiagnosticValue::Unavailable,
+        packet_loss_per_mille: DiagnosticValue::Unavailable,
+        send_queue_percent: DiagnosticValue::Available {
+            value: queue_percent,
+            provenance: MetricProvenance::Estimated,
+        },
+        decoder_latency_ms: DiagnosticValue::Available {
+            value: decode_latency_ms,
+            provenance: MetricProvenance::Measured,
+        },
+        render_latency_ms: render_feedback.render_latency_ms.map_or(
+            DiagnosticValue::Unavailable,
+            |value| DiagnosticValue::Available {
+                value,
+                provenance: MetricProvenance::Measured,
+            },
+        ),
+        dropped_frames_per_mille: render_feedback.dropped_frames_per_mille.map_or(
+            DiagnosticValue::Unavailable,
+            |value| DiagnosticValue::Available {
+                value,
+                provenance: MetricProvenance::Measured,
+            },
+        ),
+    })
+}
+
+fn reset_connection_timing(app: &AppHandle) -> anyhow::Result<()> {
+    *app.state::<VideoIpc>()
+        .connection_timing
+        .lock()
+        .map_err(|_| anyhow::anyhow!("connection timing lock is unavailable"))? =
+        Some(ConnectionTiming {
+            started: Instant::now(),
+            authorization_ms: None,
+            relay_ready_ms: None,
+            first_frame_ms: None,
+            direct_attempt_ms: None,
+            direct_established_ms: None,
+        });
+    Ok(())
+}
+
+fn record_connection_milestone(app: &AppHandle, update: impl FnOnce(&mut ConnectionTiming, u64)) {
+    let video_ipc = app.state::<VideoIpc>();
+    let Ok(mut timing) = video_ipc.connection_timing.lock() else {
+        return;
+    };
+    let Some(timing) = timing.as_mut() else {
+        return;
+    };
+    let elapsed = u64::try_from(timing.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    update(timing, elapsed);
+    let _result = app.emit(
+        "connection-performance",
+        ConnectionPerformanceEvent {
+            authorization_ms: timing.authorization_ms,
+            relay_ready_ms: timing.relay_ready_ms,
+            first_frame_ms: timing.first_frame_ms,
+            direct_attempt_ms: timing.direct_attempt_ms,
+            direct_established_ms: timing.direct_established_ms,
+        },
+    );
+}
+
+fn packet_loss_per_mille(lost_packets: u64, sent_packets: u64) -> u16 {
+    if sent_packets == 0 {
+        return 0;
+    }
+    let per_mille = lost_packets.saturating_mul(1_000) / sent_packets;
+    u16::try_from(per_mille.min(1_000)).unwrap_or(1_000)
+}
+
+fn emit_connection_metrics(app: &AppHandle, feedback: VideoFeedback) {
+    fn value<T: Copy>(metric: DiagnosticValue<T>) -> Option<(T, MetricProvenance)> {
+        match metric {
+            DiagnosticValue::Available { value, provenance } => Some((value, provenance)),
+            DiagnosticValue::Unavailable => None,
+        }
+    }
+    let queue = value(feedback.send_queue_percent);
+    let _result = app.emit(
+        "connection-metrics",
+        ConnectionMetricsEvent {
+            rtt_ms: value(feedback.rtt_ms).map(|metric| metric.0),
+            packet_loss_per_mille: value(feedback.packet_loss_per_mille).map(|metric| metric.0),
+            send_queue_percent: queue.map(|metric| metric.0),
+            send_queue_estimated: queue
+                .is_some_and(|metric| metric.1 == MetricProvenance::Estimated),
+        },
+    );
+}
+
+fn encode_video_packet(event: &VideoFrameEvent, rgba: &[u8]) -> Vec<u8> {
+    const HEADER_SIZE: usize = 68;
+    let mut packet = Vec::with_capacity(HEADER_SIZE + rgba.len());
+    packet.extend_from_slice(b"RXVF");
+    packet.push(1);
+    packet.push(match event.codec {
+        "H.264" => 1,
+        "JPEG" => 2,
+        _ => 3,
+    });
+    packet.push(u8::from(event.key_frame));
+    packet.push(0);
+    packet.extend_from_slice(&event.sequence.to_le_bytes());
+    packet.extend_from_slice(&event.frame_id.to_le_bytes());
+    packet.extend_from_slice(&event.source_timestamp_ms.to_le_bytes());
+    // Reserved for a future clock-calibrated frame-age measurement. Cross-host
+    // wall-clock subtraction is not a defensible latency metric.
+    packet.extend_from_slice(&0_u64.to_le_bytes());
+    packet.extend_from_slice(&event.width.to_le_bytes());
+    packet.extend_from_slice(&event.height.to_le_bytes());
+    packet.extend_from_slice(&event.frames_per_second.to_le_bytes());
+    packet.extend_from_slice(&event.bitrate_bps.to_le_bytes());
+    packet.extend_from_slice(&event.capture_latency_ms.to_le_bytes());
+    packet.extend_from_slice(&event.encode_latency_ms.to_le_bytes());
+    packet.extend_from_slice(&event.decode_latency_ms.to_le_bytes());
+    debug_assert_eq!(packet.len(), HEADER_SIZE);
+    packet.extend_from_slice(rgba);
+    packet
+}
+
+impl ControllerFileService {
+    async fn run(
+        mut self,
+        app: AppHandle,
+        mut local_commands: mpsc::Receiver<ControllerFileCommand>,
+        mut remote_commands: mpsc::Receiver<FileTransferMessage>,
+        responses: mpsc::Sender<FileTransferMessage>,
+    ) {
+        loop {
+            let response = tokio::select! {
+                command = local_commands.recv() => {
+                    let Some(command) = command else { break; };
+                    self.handle_local(&app, command).await
+                }
+                message = remote_commands.recv() => {
+                    let Some(message) = message else { break; };
+                    self.handle_remote(&app, message).await
+                }
+            };
+            if let Some(response) = response
+                && responses.send(response).await.is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_local(
+        &mut self,
+        app: &AppHandle,
+        command: ControllerFileCommand,
+    ) -> Option<FileTransferMessage> {
+        match command {
+            ControllerFileCommand::List { path } => {
+                if !self.upload_permission && !self.download_permission {
+                    emit_file_error(app, None, "file browsing is disabled");
+                    return None;
+                }
+                let request_id = self.take_request_id(app)?;
+                Some(FileTransferMessage::ListDirectoryRequest { request_id, path })
+            }
+            ControllerFileCommand::CreateDirectory { path } => {
+                if !self.upload_permission {
+                    emit_file_error(app, None, "file upload permission is disabled");
+                    return None;
+                }
+                let request_id = self.take_request_id(app)?;
+                Some(FileTransferMessage::CreateDirectoryRequest { request_id, path })
+            }
+            ControllerFileCommand::Upload {
+                transfer_id,
+                local_path,
+                destination_path,
+            } => {
+                if !self.upload_permission {
+                    emit_file_error(app, None, "file upload permission is disabled");
+                    return None;
+                }
+                let transfer_id = transfer_id.unwrap_or_default();
+                match OutgoingTransfer::open(local_path, remotex_protocol::DEFAULT_FILE_CHUNK_SIZE)
+                    .await
+                {
+                    Ok(transfer) => {
+                        let filename = match transfer.filename() {
+                            Ok(filename) => filename,
+                            Err(error) => {
+                                emit_local_file_error(app, Some(transfer_id), &error);
+                                return None;
+                            }
+                        };
+                        let message = FileTransferMessage::Start {
+                            transfer_id,
+                            direction: FileTransferDirection::Upload,
+                            filename,
+                            source_path: String::new(),
+                            destination_path,
+                            total_size: transfer.total_size(),
+                            chunk_size: transfer.chunk_size(),
+                            sha256: transfer.sha256(),
+                        };
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "upload",
+                            0,
+                            transfer.total_size(),
+                            "starting",
+                        );
+                        if let Err(error) = self.uploads.insert(transfer_id, transfer) {
+                            emit_local_file_error(app, Some(transfer_id), &error);
+                            return None;
+                        }
+                        Some(message)
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        None
+                    }
+                }
+            }
+            ControllerFileCommand::Download {
+                transfer_id,
+                source_path,
+                local_path,
+            } => {
+                if !self.download_permission {
+                    emit_file_error(app, None, "file download permission is disabled");
+                    return None;
+                }
+                let transfer_id = transfer_id.unwrap_or_default();
+                self.pending_downloads.insert(transfer_id, local_path);
+                emit_file_progress(app, transfer_id, "download", 0, 0, "starting");
+                Some(FileTransferMessage::DownloadRequest {
+                    transfer_id,
+                    source_path,
+                })
+            }
+            ControllerFileCommand::Cancel { transfer_id } => {
+                if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                }
+                if self.pending_downloads.remove(&transfer_id).is_some() {
+                    emit_file_progress(app, transfer_id, "download", 0, 0, "cancelled");
+                }
+                if self.downloads.contains(&transfer_id) {
+                    match self.downloads.remove(&transfer_id) {
+                        Ok(transfer) => {
+                            if let Err(error) = transfer.cancel().await {
+                                emit_local_file_error(app, Some(transfer_id), &error);
+                            }
+                        }
+                        Err(error) => emit_local_file_error(app, Some(transfer_id), &error),
+                    }
+                }
+                emit_file_progress(app, transfer_id, "transfer", 0, 0, "cancelled");
+                Some(FileTransferMessage::Cancel { transfer_id })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_remote(
+        &mut self,
+        app: &AppHandle,
+        message: FileTransferMessage,
+    ) -> Option<FileTransferMessage> {
+        match message {
+            FileTransferMessage::ListDirectoryResponse { path, entries, .. } => {
+                let _ = app.emit(
+                    "file-event",
+                    FileEvent::Directory {
+                        path,
+                        entries: entries.into_iter().map(Into::into).collect(),
+                    },
+                );
+                None
+            }
+            FileTransferMessage::CreateDirectoryResponse { path, .. } => {
+                let _ = app.emit("file-event", FileEvent::DirectoryCreated { path });
+                None
+            }
+            FileTransferMessage::Start {
+                transfer_id,
+                direction: FileTransferDirection::Download,
+                total_size,
+                chunk_size,
+                sha256,
+                ..
+            } => {
+                let Some(local_path) = self.pending_downloads.remove(&transfer_id) else {
+                    emit_file_error(
+                        app,
+                        Some(transfer_id),
+                        "download destination is unavailable",
+                    );
+                    return Some(FileTransferMessage::Cancel { transfer_id });
+                };
+                match IncomingTransfer::open(
+                    transfer_id,
+                    local_path,
+                    total_size,
+                    chunk_size,
+                    sha256,
+                )
+                .await
+                {
+                    Ok(transfer) => {
+                        let next_offset = transfer.next_offset();
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            next_offset,
+                            total_size,
+                            "transferring",
+                        );
+                        if let Err(error) = self.downloads.insert(transfer_id, transfer) {
+                            emit_local_file_error(app, Some(transfer_id), &error);
+                            return Some(FileTransferMessage::Cancel { transfer_id });
+                        }
+                        Some(FileTransferMessage::Accept {
+                            transfer_id,
+                            next_offset,
+                        })
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        Some(FileTransferMessage::Cancel { transfer_id })
+                    }
+                }
+            }
+            FileTransferMessage::Accept {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::ChunkAck {
+                transfer_id,
+                next_offset,
+            }
+            | FileTransferMessage::Resume {
+                transfer_id,
+                next_offset,
+            } => self.upload_chunk(app, transfer_id, next_offset).await,
+            FileTransferMessage::Chunk {
+                transfer_id,
+                offset,
+                checksum,
+                payload,
+            } => {
+                let result = match self.downloads.get_mut(&transfer_id) {
+                    Ok(transfer) => {
+                        let total = transfer.total_size();
+                        match transfer.write_chunk(offset, checksum, &payload).await {
+                            Ok(next_offset) => Ok((next_offset, total)),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok((next_offset, total)) => {
+                        emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            next_offset,
+                            total,
+                            "transferring",
+                        );
+                        Some(FileTransferMessage::ChunkAck {
+                            transfer_id,
+                            next_offset,
+                        })
+                    }
+                    Err(error) => {
+                        emit_local_file_error(app, Some(transfer_id), &error);
+                        Some(FileTransferMessage::Cancel { transfer_id })
+                    }
+                }
+            }
+            FileTransferMessage::Complete {
+                transfer_id,
+                total_size,
+                sha256,
+            } => {
+                if self.downloads.contains(&transfer_id) {
+                    let result = match self.downloads.remove(&transfer_id) {
+                        Ok(transfer) => transfer.complete(total_size, sha256).await,
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(()) => emit_file_progress(
+                            app,
+                            transfer_id,
+                            "download",
+                            total_size,
+                            total_size,
+                            "completed",
+                        ),
+                        Err(error) => emit_local_file_error(app, Some(transfer_id), &error),
+                    }
+                } else if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                    emit_file_progress(
+                        app,
+                        transfer_id,
+                        "upload",
+                        total_size,
+                        total_size,
+                        "completed",
+                    );
+                }
+                None
+            }
+            FileTransferMessage::Cancel { transfer_id } => {
+                if self.uploads.contains(&transfer_id) {
+                    let _ = self.uploads.remove(&transfer_id);
+                }
+                if self.downloads.contains(&transfer_id) {
+                    let _ = self.downloads.remove(&transfer_id);
+                }
+                self.pending_downloads.remove(&transfer_id);
+                emit_file_progress(app, transfer_id, "transfer", 0, 0, "cancelled");
+                None
+            }
+            FileTransferMessage::Error {
+                transfer_id,
+                message,
+                ..
+            } => {
+                if let Some(transfer_id) = transfer_id {
+                    if self.uploads.contains(&transfer_id) {
+                        let _ = self.uploads.remove(&transfer_id);
+                    }
+                    if self.downloads.contains(&transfer_id) {
+                        let _ = self.downloads.remove(&transfer_id);
+                    }
+                    self.pending_downloads.remove(&transfer_id);
+                }
+                emit_file_error(app, transfer_id, &message);
+                None
+            }
+            FileTransferMessage::Progress {
+                transfer_id,
+                next_offset,
+            } => {
+                emit_file_progress(app, transfer_id, "transfer", next_offset, 0, "transferring");
+                None
+            }
+            FileTransferMessage::ListDirectoryRequest { .. }
+            | FileTransferMessage::CreateDirectoryRequest { .. }
+            | FileTransferMessage::DownloadRequest { .. }
+            | FileTransferMessage::Start { .. } => None,
+        }
+    }
+
+    async fn upload_chunk(
+        &mut self,
+        app: &AppHandle,
+        transfer_id: TransferId,
+        offset: u64,
+    ) -> Option<FileTransferMessage> {
+        let result = match self.uploads.get_mut(&transfer_id) {
+            Ok(transfer) => {
+                let total = transfer.total_size();
+                let sha256 = transfer.sha256();
+                match transfer.read_chunk(offset).await {
+                    Ok(chunk) => Ok((chunk, total, sha256)),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((Some((offset, checksum, payload)), total, _)) => {
+                let next = offset + payload.len() as u64;
+                emit_file_progress(app, transfer_id, "upload", next, total, "transferring");
+                Some(FileTransferMessage::Chunk {
+                    transfer_id,
+                    offset,
+                    checksum,
+                    payload,
+                })
+            }
+            Ok((None, total, sha256)) => Some(FileTransferMessage::Complete {
+                transfer_id,
+                total_size: total,
+                sha256,
+            }),
+            Err(error) => {
+                emit_local_file_error(app, Some(transfer_id), &error);
+                Some(FileTransferMessage::Cancel { transfer_id })
+            }
+        }
+    }
+
+    fn take_request_id(&mut self, app: &AppHandle) -> Option<u64> {
+        let request_id = self.next_request_id;
+        if let Some(next) = request_id.checked_add(1) {
+            self.next_request_id = next;
+            Some(request_id)
+        } else {
+            emit_file_error(app, None, "file request sequence is exhausted");
+            None
+        }
+    }
+}
+
+fn emit_file_progress(
+    app: &AppHandle,
+    transfer_id: TransferId,
+    direction: &'static str,
+    transferred: u64,
+    total: u64,
+    state: &'static str,
+) {
+    let _ = app.emit(
+        "file-event",
+        FileEvent::Progress {
+            transfer_id: transfer_id.to_string(),
+            direction,
+            transferred,
+            total,
+            state,
+        },
+    );
+}
+
+fn emit_local_file_error(
+    app: &AppHandle,
+    transfer_id: Option<TransferId>,
+    error: &FileTransferError,
+) {
+    emit_file_error(app, transfer_id, &error.to_string());
+}
+
+fn emit_file_error(app: &AppHandle, transfer_id: Option<TransferId>, message: &str) {
+    let _ = app.emit(
+        "file-event",
+        FileEvent::Error {
+            transfer_id: transfer_id.map(|id| id.to_string()),
+            message: message.to_owned(),
+        },
+    );
+}
+
+async fn send_controller_message(
+    transport: &mut dyn Connection,
+    session_id: SessionId,
+    cipher: &XChaChaSessionCipher,
+    sequence: &mut u64,
+    message: Message,
+) -> anyhow::Result<()> {
+    let envelope = MessageEnvelope::new(session_id, *sequence, now_ms()?, message);
+    let plaintext = encode_wire(&envelope)?;
+    let ciphertext = cipher
+        .seal(*sequence, &plaintext)
+        .context("encrypt Controller envelope")?;
+    let mut payload = Vec::with_capacity(8 + ciphertext.len());
+    payload.extend_from_slice(&(*sequence).to_be_bytes());
+    payload.extend_from_slice(&ciphertext);
+    let relay_message = RelayClientMessage::Payload(payload);
+    transport
+        .send(Bytes::from(encode_wire(&relay_message)?))
+        .await?;
+    *sequence = sequence
+        .checked_add(1)
+        .context("Controller outbound sequence space exhausted")?;
+    Ok(())
+}
+
+async fn wait_for_peer(app: &AppHandle, transport: &mut QuicFrameConnection) -> anyhow::Result<()> {
+    loop {
+        let message: RelayServerMessage = decode_wire(&transport.receive().await?)?;
+        match message {
+            RelayServerMessage::WaitingForPeer { role } => {
+                let _ = role;
+                emit_status(app, "connecting", "Waiting for the remote device");
+            }
+            RelayServerMessage::PeerReady => return Ok(()),
+            RelayServerMessage::Heartbeat { nonce } => {
+                let acknowledgement = RelayClientMessage::HeartbeatAck { nonce };
+                transport
+                    .send(Bytes::from(encode_wire(&acknowledgement)?))
+                    .await?;
+            }
+            RelayServerMessage::HeartbeatAck { .. } => {}
+            RelayServerMessage::PathControl(_) => {
+                anyhow::bail!("relay delivered path control before PeerReady");
+            }
+            RelayServerMessage::SessionClosed { reason } => {
+                anyhow::bail!("relay session closed before pairing: {reason:?}");
+            }
+            RelayServerMessage::ProtocolError { code, message } => {
+                anyhow::bail!("relay protocol error {code:?}: {message}");
+            }
+            RelayServerMessage::Payload(_) => {
+                anyhow::bail!("relay delivered a payload before PeerReady");
+            }
+        }
+    }
+}
+
+fn client_endpoint(certificate_path: &Path) -> anyhow::Result<Endpoint> {
+    let mut reader =
+        BufReader::new(File::open(certificate_path).with_context(|| {
+            format!("open relay CA certificate {}", certificate_path.display())
+        })?);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("read relay CA certificate")?;
+    if certificates.is_empty() {
+        anyhow::bail!("relay CA certificate file contains no certificates");
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .context("trust relay CA certificate")?;
+    }
+    let config = ClientConfig::with_root_certificates(Arc::new(roots))?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(config);
+    Ok(endpoint)
+}
+
+async fn resolve_relay_address(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Some(address) = remotex_control_client::known_relay_address(value) {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    tokio::net::lookup_host(value)
+        .await
+        .with_context(|| format!("resolve relay address {value}"))?
+        .find(SocketAddr::is_ipv4)
+        .with_context(|| format!("relay address {value} did not resolve to IPv4"))
+}
+
+fn parse_token(value: &str) -> anyhow::Result<SessionToken> {
+    let decoded = hex::decode(value).context("decode 64-character token hex")?;
+    let bytes: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("session token must contain exactly 32 bytes"))?;
+    Ok(SessionToken::from_bytes(bytes))
+}
+
+fn parse_key(value: &str) -> anyhow::Result<[u8; 32]> {
+    let decoded = hex::decode(value).context("decode 64-character end-to-end key hex")?;
+    decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("end-to-end key must contain exactly 32 bytes"))
+}
+
+fn now_ms() -> anyhow::Result<u64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    u64::try_from(duration.as_millis()).context("system timestamp is out of range")
+}
+
+fn emit_status(app: &AppHandle, state: &'static str, message: &str) {
+    let _result = app.emit(
+        "connection-status",
+        StatusEvent {
+            state,
+            message: message.to_owned(),
+            path: None,
+            transport: None,
+        },
+    );
+}
+
+fn emit_connection_status(
+    app: &AppHandle,
+    state: &'static str,
+    message: &str,
+    connection_type: ConnectionType,
+) {
+    let path = match connection_type {
+        ConnectionType::Lan | ConnectionType::Direct => "direct",
+        ConnectionType::Relay => "relay",
+    };
+    let _result = app.emit(
+        "connection-status",
+        StatusEvent {
+            state,
+            message: message.to_owned(),
+            path: Some(path),
+            transport: Some("quic"),
+        },
+    );
+}
+
+fn friendly_connection_error(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("certificate")
+        || message.contains("tls")
+        || message.contains("unknown issuer")
+    {
+        "The server certificate could not be verified. Check Network settings and the CA certificate."
+    } else if message.contains("timed out")
+        || message.contains("connect")
+        || message.contains("dns")
+    {
+        "The server could not be reached. Check your network and try again."
+    } else if message.contains("reject")
+        || message.contains("authoriz")
+        || message.contains("approval")
+    {
+        "The remote device did not approve this request. Ask someone there to try again."
+    } else if message.contains("device")
+        && (message.contains("offline") || message.contains("not found"))
+    {
+        "That device is unavailable. Check its ID and make sure RemoteX is open there."
+    } else if message.contains("relay")
+        || message.contains("peer")
+        || message.contains("session closed")
+    {
+        "The secure connection was interrupted. Try again or check the server's Relay settings."
+    } else {
+        "RemoteX could not complete the secure connection. Try again or open Diagnostics for details."
+    }
+}
+
+struct TrayUi {
+    agent_status: MenuItem<tauri::Wry>,
+    device_id: MenuItem<tauri::Wry>,
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _result = window.unminimize();
+        let _result = window.show();
+        let _result = window.set_focus();
+    }
+}
+
+fn disconnect_from_tray(app: &AppHandle) {
+    if let Ok(mut active) = app.state::<StreamControl>().active.lock()
+        && let Some(stream) = active.take()
+    {
+        let _result = stream.cancellation.send(());
+    }
+    let _result = agent_management::stop_configured_agent(app);
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let agent_status =
+        MenuItem::with_id(app, "agent_status", "Status: Offline", false, None::<&str>)?;
+    let device_id = MenuItem::with_id(app, "device_id", "Device ID: —", false, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open RemoteX", true, None::<&str>)?;
+    let disable = MenuItem::with_id(
+        app,
+        "disable_remote_access",
+        "Disable Remote Access",
+        true,
+        None::<&str>,
+    )?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &agent_status,
+            &device_id,
+            &separator,
+            &open,
+            &disable,
+            &disconnect,
+            &settings,
+            &quit,
+        ],
+    )?;
+    TrayIconBuilder::with_id("remotex-tray")
+        .icon(
+            app.default_window_icon()
+                .context("RemoteX application icon is missing")?
+                .clone(),
+        )
+        .tooltip("RemoteX · Remote Access visible")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "settings" => {
+                show_main_window(app);
+                let _result = app.emit("open-settings", ());
+            }
+            "disable_remote_access" => {
+                let _result = agent_management::disable_remote_access(app);
+            }
+            "disconnect" => disconnect_from_tray(app),
+            "quit" => {
+                disconnect_from_tray(app);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .build(app)?;
+    app.manage(TrayUi {
+        agent_status,
+        device_id,
+    });
+    Ok(())
+}
+
+fn monitor_agent_status(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Ok(status) = agent_management::runtime_status(&app) {
+                let tray = app.state::<TrayUi>();
+                let label = if status.session_id.is_some() {
+                    "Status: Remote session active".to_owned()
+                } else {
+                    format!("Status: {}", status.state)
+                };
+                let _result = tray.agent_status.set_text(label);
+                let _result = tray.device_id.set_text(format!(
+                    "Device ID: {}",
+                    status.device_id.as_deref().unwrap_or("—")
+                ));
+            }
+        }
+    });
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--background")
+                .build(),
+        )
+        .manage(StreamControl::default())
+        .manage(VideoIpc::default())
+        .manage(agent_management::AgentRuntime::default())
+        .setup(|app| {
+            if let Err(error) = taskbar_icon::configure(app.handle()) {
+                warn!(event = "taskbar_icon_setup_failed", %error);
+            }
+            setup_tray(app)?;
+            if std::env::args().any(|argument| argument == "--background")
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.hide()?;
+            }
+            if let Err(error) = agent_management::start_configured_agent(app.handle()) {
+                warn!(event = "packaged_agent_start_failed", %error);
+            }
+            monitor_agent_status(app.handle().clone());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _result = window.hide();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            connect_remote,
+            disconnect_remote,
+            send_mouse_input,
+            send_keyboard_input,
+            list_remote_files,
+            create_remote_directory,
+            upload_remote_file,
+            download_remote_file,
+            resume_file_upload,
+            resume_file_download,
+            cancel_file_transfer,
+            open_terminal,
+            send_terminal_input,
+            resize_terminal,
+            close_terminal,
+            request_system_info,
+            subscribe_video,
+            report_video_render_metrics,
+            agent_management::load_agent_settings,
+            agent_management::save_agent_settings,
+            agent_management::reveal_access_password,
+            agent_management::update_access_password,
+            agent_management::start_agent,
+            agent_management::stop_agent,
+            agent_management::agent_status,
+            server_config::load_server_config,
+            server_config::save_server_config,
+            server_config::check_server_connection,
+            server_config::check_control_server_connection,
+            server_config::reset_first_run
+        ])
+        .run(tauri::generate_context!())
+        .expect("run RemoteX desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_down_moves_before_pressing() {
+        let events = MouseInputRequest::ButtonDown {
+            button: MouseButtonRequest::Right,
+            x: 0.25,
+            y: 0.75,
+        }
+        .into_events()
+        .expect("translate pointer down");
+
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::MouseMove {
+                    display_id: None,
+                    normalized_x: 16_384,
+                    normalized_y: 49_151,
+                },
+                InputEvent::MouseButtonDown {
+                    button: MouseButton::Right,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn wheel_axes_are_translated_independently() {
+        let events = MouseInputRequest::Wheel {
+            horizontal_delta: -30,
+            vertical_delta: 120,
+        }
+        .into_events()
+        .expect("translate wheel");
+
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::MouseWheel {
+                    axis: WheelAxis::Horizontal,
+                    delta: -30,
+                },
+                InputEvent::MouseWheel {
+                    axis: WheelAxis::Vertical,
+                    delta: 120,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_requests_preserve_physical_keys_and_state() {
+        assert_eq!(
+            InputEvent::from(KeyboardInputRequest::KeyDown {
+                key: KeyCode::ControlLeft,
+            }),
+            InputEvent::KeyDown {
+                key: KeyCode::ControlLeft,
+            }
+        );
+        assert_eq!(
+            InputEvent::from(KeyboardInputRequest::KeyUp { key: KeyCode::KeyV }),
+            InputEvent::KeyUp { key: KeyCode::KeyV }
+        );
+    }
+}
